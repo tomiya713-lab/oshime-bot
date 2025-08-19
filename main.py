@@ -366,8 +366,10 @@ def is_trading_time_jst(dt: datetime):
 
 def main():
     now = datetime.now(TZ)
-    if not is_trading_day_jst(now) or not is_trading_time_jst(now):
-        print(f"[SKIP] {now} 非取引時間"); return
+    force = os.getenv("FORCE_RUN") == "1"  # ← 手動実行のとき強制
+    if not force:
+        if not is_trading_day_jst(now) or not is_trading_time_jst(now):
+            print(f"[SKIP] {now} 非取引時間"); return
     best = run_pipeline()
     notify(best, top_n=15)
 
