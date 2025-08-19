@@ -222,8 +222,8 @@ ticker_name_map = {
 
 
 # ===== LINE送信 =====
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-LINE_USER_ID = os.environ.get("LINE_USER_ID", "")  # 自分宛Push
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("Zn2YLPBO3I+h/FV1VvqXW3r6jIqHhA+4yG+AiH9sY/W0897hWh7j+6ygB5seVL2a2ffrFesVXr1r9BD++imX8Ad73X1eWXQivwTTfVVjOnApFOXwq7ruIgiyIc3gaDhtapHXf9uIP33J4qq/UVkjrwdB04t89/1O/w1cDnyilFU=", "")
+LINE_USER_ID = os.environ.get("Ue13530d24be78d8ab21dd82feeefb137", "")  # 自分宛Push
 
 def line_send(text: str, to_user_id: str | None = LINE_USER_ID):
     assert LINE_CHANNEL_ACCESS_TOKEN, "LINE_CHANNEL_ACCESS_TOKEN is missing"
