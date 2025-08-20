@@ -1,0 +1,47 @@
+name: Run GoldenCross Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "強制実行（取引時間チェック無視）"
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0,30 0-6 * * 1-5'   # JST 9:00–15:30 の毎時0/30分
+    - cron: '5,35 0-5 * * 1-5'   # 冗長（5分ずらし）
+    - cron: '5 6 * * 1-5'        # 06:05 (=15:05 JST)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: golden-bot
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Upgrade pip
+        run: python -m pip install -U pip
+
+      - name: Install deps
+        run: |
+          pip install yfinance pandas numpy requests jpholiday
+
+      - name: Check envs
+        run: |
+          test -n "${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}" || (echo "Missing LINE_CHANNEL_ACCESS_TOKEN" && exit 1)
+          test -n "${{ secrets.LINE_USER_ID }}" || (echo "Missing LINE_USER_ID" && exit 1)
+
+      - name: Run python
+        env:
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force && '1' || '' }}
+        run: python golden.py
