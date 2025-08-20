@@ -73,18 +73,23 @@ ticker_name_map = {
 }
 
 # ==============================
-# LINE通知
+# LINE通知 ＆ 実行エントリ（golden.py の末尾にそのまま貼り替え）
 # ==============================
 import os, requests
 from datetime import datetime
 import pandas as pd
+import pytz, jpholiday
+
+TZ = pytz.timezone("Asia/Tokyo")
 
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_USER_ID = os.environ.get("LINE_USER_ID", "")
 
 def line_send(text: str):
+    """LINE Push。失敗は例外で止める／ログ出力もする"""
     assert LINE_CHANNEL_ACCESS_TOKEN, "LINE_CHANNEL_ACCESS_TOKEN missing"
     assert LINE_USER_ID, "LINE_USER_ID missing"
+
     headers = {
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
@@ -92,8 +97,9 @@ def line_send(text: str):
     payload = {"to": LINE_USER_ID, "messages": [{"type": "text", "text": text}]}
     r = requests.post("https://api.line.me/v2/bot/message/push",
                       headers=headers, json=payload, timeout=20)
+    print(f"[LINE] status={r.status_code} len={len(text)}")
     if r.status_code >= 300:
-        print("LINE error:", r.status_code, r.text)
+        print("BODY:", r.text)
         raise RuntimeError(f"LINE push failed: {r.status_code}")
 
 def send_long(text: str, chunk: int = 900):
@@ -102,8 +108,8 @@ def send_long(text: str, chunk: int = 900):
         line_send(text[i:i+chunk])
 
 def notify(hits_df: pd.DataFrame, top_n: int = 15):
-    """ゴールデンクロス検出結果をLINE通知"""
-    ts = datetime.now().strftime("%m/%d %H:%M")
+    """ゴールデンクロス検出結果をLINE通知（0件でも送る）"""
+    ts = datetime.now(TZ).strftime("%m/%d %H:%M")
     if hits_df is None or hits_df.empty:
         line_send(f"📈【GCスクリーナー】{ts}\n本日は該当なし")
         return
@@ -113,10 +119,59 @@ def notify(hits_df: pd.DataFrame, top_n: int = 15):
 
     cards = []
     for _, r in hits_df.head(top_n).iterrows():
-        line1 = f"{r['Ticker']} {ticker_name_map.get(r['Ticker'],'')}"
-        line2 = f"短{r['MA_S']:.1f} 長{r['MA_L']:.1f} 乖離{r['Kairi_%']:+.1f}%"
-        line3 = f"今 {r['Latest_Close']:,.0f} 出来高比×{r['Vol_Ratio']:.2f}"
+        name = ticker_name_map.get(r["Ticker"], "")
+        line1 = f"{r['Ticker']} {name}".rstrip()
+        # rに存在しない列があっても落ちないようにgetで読む
+        ma_s = r.get("MA_S"); ma_l = r.get("MA_L")
+        kairi = r.get("Kairi_%"); latest = r.get("Latest_Close")
+        vr = r.get("Vol_Ratio")
+        try_ma_s = f"{float(ma_s):.1f}" if pd.notna(ma_s) else "-"
+        try_ma_l = f"{float(ma_l):.1f}" if pd.notna(ma_l) else "-"
+        try_kairi = f"{float(kairi):+.1f}%" if pd.notna(kairi) else "-"
+        try_latest = f"{float(latest):,.0f}" if pd.notna(latest) else "-"
+        try_vr = f"×{float(vr):.2f}" if pd.notna(vr) else "-"
+
+        line2 = f"短{try_ma_s} 長{try_ma_l} 乖離{try_kairi}"
+        line3 = f"今 {try_latest} 出来高比{try_vr}"
         cards.append("\n".join([line1, line2, line3]))
 
     for i in range(0, len(cards), 5):
         send_long(("\n— — — — —\n").join(cards[i:i+5]))
+
+# ---------- 取引日/時間ガード ----------
+def is_trading_day_jst(dt):
+    if dt.weekday() >= 5:  # 土日
+        return False
+    if jpholiday.is_holiday(dt.date()):
+        return False
+    return True
+
+def is_trading_time_jst(dt):
+    h, m = dt.hour, dt.minute
+    # 9:00〜15:30 (JST)
+    return (h > 9 or (h == 9 and m >= 0)) and (h < 15 or (h == 15 and m <= 30))
+
+# ---------- エントリポイント ----------
+def main():
+    now = datetime.now(TZ)
+    force = os.getenv("FORCE_RUN") == "1"
+
+    # 取引時間外はスキップ（手動 or 強制時は実行）
+    if not force:
+        if not is_trading_day_jst(now) or not is_trading_time_jst(now):
+            print(f"[SKIP] {now} 非取引時間（GC）")
+            return
+
+    # ここから先はあなたの検出処理に合わせて呼び出し
+    # 例：fetch -> detect_golden_cross -> notify
+    # close, open_, vol = fetch_market_data(nikkei225_tickers, lookback_days=220)
+    # hits = detect_golden_cross(close, vol, open_, short=5, long=25,
+    #                            within_days=3, min_price=300, vol_ratio=1.2,
+    #                            include_near=True, near_thresh=0.98, max_kairi=6.0)
+    # notify(hits, top_n=15)
+
+    # ※↑ 上の3行は既に作っているデータ取得＆検出関数名に置き換えてください。
+    #    少なくとも「最終的に notify(hits_df) を必ず呼ぶ」ことが重要です。
+
+if __name__ == "__main__":
+    main()
