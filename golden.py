@@ -75,105 +75,48 @@ ticker_name_map = {
 # ==============================
 # LINE通知
 # ==============================
-def line_send(msg: str):
-    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
-    to    = os.environ.get("LINE_USER_ID")
-    if not token or not to: return
-    headers = {"Authorization": f"Bearer {token}"}
-    data = {"to": to, "messages": [{"type": "text", "text": msg}]}
-    requests.post("https://api.line.me/v2/bot/message/push",
-                  headers=headers, json=data)
+import os, requests
+from datetime import datetime
+import pandas as pd
 
-def send_long_text(text, limit=480):
-    for i in range(0, len(text), limit):
-        line_send(text[i:i+limit])
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_USER_ID = os.environ.get("LINE_USER_ID", "")
 
-# ==============================
-# ゴールデンクロス検出
-# ==============================
-def detect_golden_cross(close, vol, open_, short=5, long=25,
-                        within_days=3, min_price=300,
-                        vol_ratio=1.2, include_near=True,
-                        near_thresh=0.98, max_kairi=6.0):
+def line_send(text: str):
+    assert LINE_CHANNEL_ACCESS_TOKEN, "LINE_CHANNEL_ACCESS_TOKEN missing"
+    assert LINE_USER_ID, "LINE_USER_ID missing"
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {"to": LINE_USER_ID, "messages": [{"type": "text", "text": text}]}
+    r = requests.post("https://api.line.me/v2/bot/message/push",
+                      headers=headers, json=payload, timeout=20)
+    if r.status_code >= 300:
+        print("LINE error:", r.status_code, r.text)
+        raise RuntimeError(f"LINE push failed: {r.status_code}")
 
-    results = []
-    short_ma = close.rolling(short).mean()
-    long_ma  = close.rolling(long).mean()
-    vol_ma20 = vol.rolling(20).mean()
+def send_long(text: str, chunk: int = 900):
+    """長文を分割して送信"""
+    for i in range(0, len(text), chunk):
+        line_send(text[i:i+chunk])
 
-    for t in close.columns:
-        c, s, l, v, v20, o = close[t], short_ma[t], long_ma[t], vol[t], vol_ma20[t], open_[t]
-        if len(c.dropna()) < long + 5: continue
-
-        latest = c.iloc[-1]; prev = c.iloc[-2]
-        s_now, l_now = s.iloc[-1], l.iloc[-1]
-        s_prev, l_prev = s.iloc[-2], l.iloc[-2]
-
-        # 価格帯
-        if latest < min_price: continue
-        # 出来高増加
-        if v.iloc[-1] < vol_ratio * v20.iloc[-1]: continue
-        # 陰線NG
-        if latest < o.iloc[-1]: continue
-        # 乖離上限
-        kairi = abs((s_now - l_now)/l_now)*100 if l_now>0 else 999
-        if kairi > max_kairi: continue
-
-        hit = False
-        # クロス判定
-        if s_prev < l_prev and s_now >= l_now:
-            hit = True
-        # 交差しかけ
-        elif include_near and s_now >= near_thresh * l_now:
-            hit = True
-
-        if hit:
-            results.append({
-                "Ticker": t,
-                "Latest_Close": latest,
-                "Short_MA": s_now,
-                "Long_MA": l_now,
-                "Volume": v.iloc[-1],
-                "Avg20_Vol": v20.iloc[-1]
-            })
-    return pd.DataFrame(results)
-
-# ==============================
-# パイプライン
-# ==============================
-def run_golden_pipeline(top_n=15):
-    end   = datetime.now(TZ)
-    start = end - timedelta(days=60)
-
-    data = yf.download(nikkei225_tickers, start=start, end=end,
-                       interval="1d", auto_adjust=False, progress=False,
-                       group_by="column")
-    close = data["Close"]; open_ = data["Open"]; vol = data["Volume"]
-
-    df = detect_golden_cross(close, vol, open_,
-                             short=5, long=25, within_days=3,
-                             min_price=300, vol_ratio=1.2,
-                             include_near=True, near_thresh=0.98,
-                             max_kairi=6.0)
-
-    if df.empty:
-        line_send("【ゴールデンクロス】該当なし")
+def notify(hits_df: pd.DataFrame, top_n: int = 15):
+    """ゴールデンクロス検出結果をLINE通知"""
+    ts = datetime.now().strftime("%m/%d %H:%M")
+    if hits_df is None or hits_df.empty:
+        line_send(f"📈【GCスクリーナー】{ts}\n本日は該当なし")
         return
 
-    header = (
-        f"📈【ゴールデンクロス検出】{datetime.now(TZ).strftime('%m/%d %H:%M')}\n"
-        f"抽出: {len(df)} 銘柄\n"
-        f"条件: SMA5≥SMA25(交差or近接)・出来高増・陰線NG・価格帯≥300円・乖離≤6%\n"
-        f"——————————————\n"
-    )
-    send_long_text(header)
+    header = f"📈【GCスクリーナー】{ts}\n抽出: {len(hits_df)} 銘柄\n——————————————"
+    send_long(header)
 
     cards = []
-    for _, r in df.head(top_n).iterrows():
-        t = r["Ticker"]; name = ticker_name_map.get(t, "")
-        line1 = f"{t} {name}".rstrip()
-        line2 = f"短期 {r['Short_MA']:.1f}   長期 {r['Long_MA']:.1f}"
-        line3 = f"終値 {r['Latest_Close']:.1f}   出来高 {int(r['Volume']):,}"
+    for _, r in hits_df.head(top_n).iterrows():
+        line1 = f"{r['Ticker']} {ticker_name_map.get(r['Ticker'],'')}"
+        line2 = f"短{r['MA_S']:.1f} 長{r['MA_L']:.1f} 乖離{r['Kairi_%']:+.1f}%"
+        line3 = f"今 {r['Latest_Close']:,.0f} 出来高比×{r['Vol_Ratio']:.2f}"
         cards.append("\n".join([line1, line2, line3]))
 
-    send_long_text("\n\n".join(cards))
+    for i in range(0, len(cards), 5):
+        send_long(("\n— — — — —\n").join(cards[i:i+5]))
