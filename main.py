@@ -239,23 +239,23 @@ def notify(best_df: pd.DataFrame, top_n=15):
         block = ("\n— — — — —\n").join(cards[i:i+5])
         send_long_text(block)
 
-# ===== 取引日/時間判定（JST）=====
+# 取引日/時間判定（JST）
 def is_trading_day_jst(dt: datetime):
-    if dt.weekday() >= 5: return False
-    if jpholiday.is_holiday(dt.date()): return False
+    if dt.weekday() >= 5:  # 土日
+        return False
+    if jpholiday.is_holiday(dt.date()):  # 祝日
+        return False
     return True
-
-def is_trading_time_jst(dt: datetime):
-    h, m = dt.hour, dt.minute
-    return (h > 9 or (h == 9 and m >= 0)) and (h < 15 or (h == 15 and m <= 30))
-
+    
 def main():
     now = datetime.now(TZ)
-    force = os.getenv("FORCE_RUN") == "1"  # 手動実行のとき強制
-    if not force:
-        if not is_trading_day_jst(now) or not is_trading_time_jst(now):
-            print(f"[SKIP] {now} 非取引時間")
-            return
+    force = os.getenv("FORCE_RUN") == "1"  # 手動実行時の強制フラグ
+
+    # 時間チェックは削除（cronに任せる）。祝日/週末だけスキップ。
+    if not force and not is_trading_day_jst(now):
+        print(f"[SKIP] {now:%F %R} 祝日/週末"); 
+        return
+
     best = run_pipeline()
     notify(best, top_n=15)
 
