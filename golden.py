@@ -155,8 +155,10 @@ def detect_golden_cross(close: pd.DataFrame, vol: pd.DataFrame | None,
             })
 
     if not out: return pd.DataFrame()
-    return pd.DataFrame(out).sort_values(["S_S_vs_L_L_%","Latest_Close"], ascending=[False, False]).reset_index(index=False)
-
+return (
+    pd.DataFrame(out)
+      .sort_values(["S_S_vs_L_L_%", "Latest_Close"], ascending=[False, False])
+      .reset_index(drop=True) )
 # ===== 通知 =====
 def notify(df: pd.DataFrame, top_n=15):
     if df is None or df.empty:
