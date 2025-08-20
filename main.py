@@ -8,7 +8,7 @@ TZ = ZoneInfo("Asia/Tokyo")
 # ===== 日経225ティッカー =====
 nikkei225_tickers = [ '4151.T','4502.T','4503.T','4506.T','4507.T','4519.T','4523.T','4568.T','4578.T','6479.T','6501.T','6503.T','6504.T','6506.T','6526.T','6594.T','6645.T','6674.T','6701.T','6702.T','6723.T','6724.T','6752.T','6753.T','6758.T','6762.T','6770.T','6841.T','6857.T','6861.T','6902.T','6920.T','6952.T','6954.T','6971.T','6976.T','6981.T','7735.T','7751.T','7752.T','8035.T','7201.T','7202.T','7203.T','7205.T','7211.T','7261.T','7267.T','7269.T','7270.T','7272.T','4543.T','4902.T','6146.T','7731.T','7733.T','7741.T','7762.T','9432.T','9433.T','9434.T','9613.T','9984.T','5831.T','7186.T','8304.T','8306.T','8308.T','8309.T','8316.T','8331.T','8354.T','8411.T','8253.T','8591.T','8697.T','8601.T','8604.T','8630.T','8725.T','8750.T','8766.T','8795.T','1332.T','2002.T','2269.T','2282.T','2501.T','2502.T','2503.T','2801.T','2802.T','2871.T','2914.T','3086.T','3092.T','3099.T','3382.T','7453.T','8233.T','8252.T','8267.T','9843.T','9983.T','2413.T','2432.T','3659.T','4307.T','4324.T','4385.T','4661.T','4689.T','4704.T','4751.T','4755.T','6098.T','6178.T','7974.T','9602.T','9735.T','9766.T','1605.T','3401.T','3402.T','3861.T','3405.T','3407.T','4004.T','4005.T','4021.T','4042.T','4043.T','4061.T','4063.T','4183.T','4188.T','4208.T','4452.T','4901.T','4911.T','6988.T','5019.T','5020.T','5101.T','5108.T','5201.T','5214.T','5233.T','5301.T','5332.T','5333.T','5401.T','5406.T','5411.T','3436.T','5706.T','5711.T','5713.T','5714.T','5801.T','5802.T','5803.T','2768.T','8001.T','8002.T','8015.T','8031.T','8053.T','8058.T','1721.T','1801.T','1802.T','1803.T','1808.T','1812.T','1925.T','1928.T','1963.T','5631.T','6103.T','6113.T','6273.T','6301.T','6302.T','6305.T','6326.T','6361.T','6367.T','6471.T','6472.T','6473.T','7004.T','7011.T','7013.T','7012.T','7832.T','7911.T','7912.T','7951.T','3289.T','8801.T','8802.T','8804.T','8830.T','9001.T','9005.T','9007.T','9008.T','9009.T','9020.T','9021.T','9022.T','9064.T','9147.T','9101.T','9104.T','9107.T','9201.T','9202.T','9301.T','9501.T','9502.T','9503.T','9531.T','9532.T' ]
 
-# ===== 短縮名マップ（省略なし）=====
+# ===== 短縮名マップ =====
 ticker_name_map = {
     "1332.T": "日水", "1333.T": "マルハニチロ", "1605.T": "INPEX", "1801.T": "大成建",
     "1802.T": "清水建", "1803.T": "飛島建", "1808.T": "長谷工", "1812.T": "鹿島",
@@ -69,9 +69,11 @@ ticker_name_map = {
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_USER_ID = os.environ.get("LINE_USER_ID", "")  # 自分宛Push
 
-def line_send(text: str, to_user_id: str | None = LINE_USER_ID):
+def line_send(text: str, to_user_id: str | None = None):
     assert LINE_CHANNEL_ACCESS_TOKEN, "LINE_CHANNEL_ACCESS_TOKEN is missing"
     headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    if to_user_id is None:
+        to_user_id = LINE_USER_ID
     if to_user_id:
         url = "https://api.line.me/v2/bot/message/push"
         payload = {"to": to_user_id, "messages": [{"type": "text", "text": text}]}
@@ -88,7 +90,7 @@ def send_long_text(text: str, chunk=900):
 
 # ===== 押し目ロジック（CSVなし版） =====
 def fetch_market_data(tickers, lookback_days=180):
-    end_dt = datetime.now(tz=TZ).date() + timedelta(days=1)  # ここで改行しないこと！
+    end_dt = datetime.now(tz=TZ).date() + timedelta(days=1)  # 翌日までで欠損回避
     start_dt = end_dt - timedelta(days=lookback_days)
     data = yf.download(
         tickers,
@@ -125,7 +127,7 @@ def find_pullback_candidates(close, high, low, window_days=30):
         w_sma25 = s_sma25.iloc[-window_days:]
 
         latest_close = float(w_close.iloc[-1])
-        prev_close   = float(w_close.iloc[-2]) if len(w_close) >= 2 else np.nan  # 追加
+        prev_close   = float(w_close.iloc[-2]) if len(w_close) >= 2 else np.nan
         latest_sma25 = float(w_sma25.iloc[-1])
 
         peak_pos  = int(np.argmax(w_high.values))
@@ -157,7 +159,7 @@ def find_pullback_candidates(close, high, low, window_days=30):
                 "Expected_Upper": round(peak_high, 2),
                 "Pullback_Low": round(pullback_low, 2),
                 "Latest_Close": round(latest_close, 2),
-                "Prev_Close": round(prev_close, 2),          # 追加
+                "Prev_Close": round(prev_close, 2),
                 "Expected_Rise_%": round(expected_rise_pct, 2),
                 "Return_%": round(expected_rise_pct, 2),
             })
@@ -179,50 +181,60 @@ def run_pipeline():
     best = cat.groupby("Ticker", as_index=False).first().sort_values("Return_%", ascending=False).reset_index(drop=True)
     return best
 
-# ===== 通知（4行レイアウト：最後に変動率/底値比較）=====
+# ===== 通知（4行レイアウト：変動率/底値比較は符号付き％）=====
 def notify(best_df: pd.DataFrame, top_n=15):
     if best_df is None or best_df.empty:
-        line_send("【押し目スクリーニング】本日は抽出なしでした。"); return
+        line_send("【押し目スクリーニング】本日は抽出なしでした。")
+        return
 
+    # フォーマッタ群
     def fnum(x):
         try: return f"{float(x):,.0f}"
         except: return "-"
     def fpct(x):
         try: return f"{float(x):.1f}%"
         except: return "-"
-    def fratio(x):
+    def fpct_signed(x):
         try:
             x = float(x)
-            if not np.isfinite(x) or x == 0: return "-"
-            return f"×{x:.3f}"
+            if not np.isfinite(x): return "-"
+            return f"{x:+.1f}%"
         except:
             return "-"
 
+    # ヘッダ
     header = (
         f"📊【押し目スクリーニング】{datetime.now(TZ).strftime('%m/%d %H:%M')}\n"
         f"抽出: {len(best_df)} 銘柄（重複統合）\n"
         f"条件: 反発≥5%・下落≤15%・SMA25上・期待≥3%・2日経過\n"
-        f"——————————————\n"
+        f"------------------------------\n"
     )
     send_long_text(header)
 
     cards = []
     for _, r in best_df.head(top_n).iterrows():
         ticker = r["Ticker"]; name = ticker_name_map.get(ticker, "")
-        upper  = r.get("Expected_Upper"); latest = r.get("Latest_Close")
-        low    = r.get("Pullback_Low");   rise_p = r.get("Expected_Rise_%")
+        upper  = r.get("Expected_Upper")
+        latest = r.get("Latest_Close")
+        low    = r.get("Pullback_Low")
+        rise_p = r.get("Expected_Rise_%")
         prev   = r.get("Prev_Close")
 
+        # 期待額
         expect_amt = (float(upper) - float(latest)) if pd.notna(upper) and pd.notna(latest) else None
-        chg_ratio  = (float(latest) / float(prev)) if (pd.notna(latest) and pd.notna(prev) and float(prev)!=0.0) else None
-        bot_ratio  = (float(latest) / float(low))  if (pd.notna(latest) and pd.notna(low)  and float(low)!=0.0)  else None
+        # 変動率: (今/前日 - 1) * 100
+        chg_pct = ((float(latest) / float(prev)) - 1) * 100 if (pd.notna(latest) and pd.notna(prev) and float(prev) != 0.0) else None
+        # 底値比較: (今/底値 - 1) * 100
+        bot_pct = ((float(latest) / float(low)) - 1) * 100 if (pd.notna(latest) and pd.notna(low) and float(low) != 0.0) else None
 
         line1 = f"{ticker} {name}".rstrip()
         line2 = f"↗ {fpct(rise_p)}   🎯 上 {fnum(upper)}   下 {fnum(low)}"
         line3 = f"今 {fnum(latest)}   🎯 期待額 {fnum(expect_amt)}"
-        line4 = f"変動率 {fratio(chg_ratio)}   底値比較 {fratio(bot_ratio)}"
+        line4 = f"変動率 {fpct_signed(chg_pct)}   底値比較 {fpct_signed(bot_pct)}"
+
         cards.append("\n".join([line1, line2, line3, line4]))
 
+    # 5銘柄ずつ送信
     for i in range(0, len(cards), 5):
         block = ("\n— — — — —\n").join(cards[i:i+5])
         send_long_text(block)
@@ -242,7 +254,8 @@ def main():
     force = os.getenv("FORCE_RUN") == "1"  # 手動実行のとき強制
     if not force:
         if not is_trading_day_jst(now) or not is_trading_time_jst(now):
-            print(f"[SKIP] {now} 非取引時間"); return
+            print(f"[SKIP] {now} 非取引時間")
+            return
     best = run_pipeline()
     notify(best, top_n=15)
 
