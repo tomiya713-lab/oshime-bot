@@ -98,67 +98,103 @@ def fetch_market_data(tickers, lookback_days=300):
 def sma(s, w): return s.rolling(window=w, min_periods=1).mean()
 
 # ===== 検出ロジック：ゴールデンクロス =====
-def detect_golden_cross(close: pd.DataFrame, vol: pd.DataFrame | None,
-                        short=50, long=200, within_days=3,
-                        min_price=100, vol_ratio=1.0):
+
+def detect_golden_cross(
+    close: pd.DataFrame,
+    vol: pd.DataFrame | None,
+    open_: pd.DataFrame,                  # ★ 追加：当日始値
+    short: int = 5,
+    long: int = 25,
+    within_days: int = 3,
+    min_price: float = 100.0,             # ★ 価格帯フィルタ（終値の下限）
+    vol_ratio: float = 1.2,               # ★ 出来高増加（直近出来高 / 20日平均）
+    include_near: bool = True,
+    near_thresh: float = 0.98,            # ★ 交差しかけ判定（short/long >= 0.98）
+    max_kairi: float = 6.0                # ★ 乖離の上限（|short/long -1|*100 <= max_kairi）
+):
     """
-    条件（例）:
-      - 直近 within_days 日のどこかで SMA(short) が SMA(long) を下→上にクロス
-      - 最新終値が両方のSMAより上
-      - オプション: 出来高が直近20日平均の vol_ratio 倍以上（volがあれば）
-      - 最低株価フィルタ（整数）
+    直近ゴールデンクロス(GC) と 交差しかけ(NEAR) を検出。
+    フィルタ：価格帯、出来高増加、陰線NG、乖離上限 を採用。
     """
     out = []
-    sma_s = sma(close, short)
-    sma_l = sma(close, long)
-    vol_ok = None
-    if vol is not None:
-        v20 = vol.rolling(20, min_periods=1).mean()
-        vol_ok = (vol.iloc[-1] >= v20.iloc[-1] * vol_ratio)
 
-    for t in close.columns:
-        s = close[t].dropna()
-        if len(s) < long + within_days + 5:  # データ不足
+    for ticker in close.columns:
+        if ticker not in open_.columns:
             continue
 
-        ss = sma_s[t].reindex(s.index)
-        ll = sma_l[t].reindex(s.index)
+        s = close[ticker].dropna()
+        if len(s) < long + within_days + 5:
+            continue
 
-        # 直近区間
-        ss_w = ss.iloc[-(within_days+1):]
-        ll_w = ll.iloc[-(within_days+1):]
+        o = open_[ticker].reindex(s.index)
+        if pd.isna(o.iloc[-1]) or pd.isna(s.iloc[-1]):
+            continue
 
-        # クロス判定（符号変化：前日まで ss<ll、翌日 ss>=ll）
-        cross = ((ss_w.shift(1) < ll_w.shift(1)) & (ss_w >= ll_w)).any()
+        # 価格帯フィルタ
+        if float(s.iloc[-1]) < float(min_price):
+            continue
 
-        latest = float(s.iloc[-1])
-        conds = [
-            cross,
-            latest >= float(ss.iloc[-1]),
-            latest >= float(ll.iloc[-1]),
-            latest >= min_price,
-        ]
-        if vol_ok is not None:
-            conds.append(bool(vol_ok.get(t, True)))
+        sma_s = s.rolling(short, min_periods=short).mean()
+        sma_l = s.rolling(long,  min_periods=long).mean()
+        if pd.isna(sma_l.iloc[-1]) or sma_l.iloc[-1] == 0:
+            continue
 
-        if all(conds):
-            name = ticker_name_map.get(t, "")
-            latest_ss = float(ss.iloc[-1]); latest_ll = float(ll.iloc[-1])
-            gap_pct = (latest_ss/latest_ll - 1) * 100.0 if latest_ll else np.nan
-            out.append({
-                "Ticker": t,
-                "Name": name,
-                "Latest_Close": round(latest,2),
-                "SMA_Short": round(latest_ss,2),
-                "SMA_Long": round(latest_ll,2),
-                "S_S_vs_L_L_%": round(gap_pct,2),
-            })
+        # 出来高フィルタ（20日平均比）
+        if vol is not None and ticker in vol.columns:
+            v = vol[ticker].reindex(s.index)
+            v20 = v.rolling(20, min_periods=1).mean()
+            vr = float(v.iloc[-1]) / float(v20.iloc[-1]) if v20.iloc[-1] else 0.0
+            if vr < vol_ratio:
+                continue
 
-    if not out: return pd.DataFrame()
-    return (
-    pd.DataFrame(out)
-      .sort_values(["S_S_vs_L_L_%", "Latest_Close"], ascending=[False, False])
-      .reset_index(drop=True) )
+        # 陰線NG（当日）
+        if float(s.iloc[-1]) < float(o.iloc[-1]):
+            continue
+
+        # 乖離（短期/長期 - 1）*100 の絶対値が大きすぎるのを除外
+        kairi_now = (sma_s.iloc[-1] / sma_l.iloc[-1] - 1.0) * 100.0
+        if abs(kairi_now) > max_kairi:
+            continue
+
+        # -------------------------
+        sig = sma_s - sma_l
+
+        # 直近GC（確定上抜け）
+        cross_up = (sig.shift(1) <= 0) & (sig > 0)
+        cross_dates = sig.index[cross_up]
+        if len(cross_dates) > 0:
+            last_cross = cross_dates[-1]
+            if last_cross >= s.index[-within_days]:
+                out.append({
+                    "Type": "GC",
+                    "Ticker": ticker,
+                    "Latest_Close": round(float(s.iloc[-1]), 2),
+                    "Cross_Date": last_cross.strftime("%Y-%m-%d"),
+                    "S_S_vs_L_L_%": round(kairi_now, 2)
+                })
+
+        # 交差しかけ（Near）
+        if include_near and sig.iloc[-1] <= 0:
+            cond_near = (
+                (sma_s.iloc[-1] / sma_l.iloc[-1] >= near_thresh) and  # 2%差以内
+                (sma_s.iloc[-1] > sma_s.iloc[-2]) and                 # 短期上向き
+                (sig.diff().iloc[-1] > 0) and                         # 差が改善中
+                (s.iloc[-1] >= sma_s.iloc[-1])                        # 価格が短期線以上
+            )
+            if cond_near:
+                out.append({
+                    "Type": "NEAR",
+                    "Ticker": ticker,
+                    "Latest_Close": round(float(s.iloc[-1]), 2),
+                    "Cross_Date": "",
+                    "S_S_vs_L_L_%": round(kairi_now, 2)
+                })
+
+    return (pd.DataFrame(out)
+              .sort_values(["Type", "S_S_vs_L_L_%", "Latest_Close"],
+                           ascending=[True, False, False])
+              .reset_index(drop=True))
+
 # ===== 通知 =====
 def notify(df: pd.DataFrame, top_n=15):
     if df is None or df.empty:
