@@ -1,9 +1,16 @@
 # golden.py
-import os, requests, numpy as np, pandas as pd, yfinance as yf, jpholiday
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
-TZ = ZoneInfo("Asia/Tokyo")
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import requests
+import jpholiday
+import pytz
+import os
+
+# タイムゾーン
+TZ = pytz.timezone("Asia/Tokyo")
 
 # ===== 日経225ティッカー =====
 nikkei225_tickers = [ '4151.T','4502.T','4503.T','4506.T','4507.T','4519.T','4523.T','4568.T','4578.T','6479.T','6501.T','6503.T','6504.T','6506.T','6526.T','6594.T','6645.T','6674.T','6701.T','6702.T','6723.T','6724.T','6752.T','6753.T','6758.T','6762.T','6770.T','6841.T','6857.T','6861.T','6902.T','6920.T','6952.T','6954.T','6971.T','6976.T','6981.T','7735.T','7751.T','7752.T','8035.T','7201.T','7202.T','7203.T','7205.T','7211.T','7261.T','7267.T','7269.T','7270.T','7272.T','4543.T','4902.T','6146.T','7731.T','7733.T','7741.T','7762.T','9432.T','9433.T','9434.T','9613.T','9984.T','5831.T','7186.T','8304.T','8306.T','8308.T','8309.T','8316.T','8331.T','8354.T','8411.T','8253.T','8591.T','8697.T','8601.T','8604.T','8630.T','8725.T','8750.T','8766.T','8795.T','1332.T','2002.T','2269.T','2282.T','2501.T','2502.T','2503.T','2801.T','2802.T','2871.T','2914.T','3086.T','3092.T','3099.T','3382.T','7453.T','8233.T','8252.T','8267.T','9843.T','9983.T','2413.T','2432.T','3659.T','4307.T','4324.T','4385.T','4661.T','4689.T','4704.T','4751.T','4755.T','6098.T','6178.T','7974.T','9602.T','9735.T','9766.T','1605.T','3401.T','3402.T','3861.T','3405.T','3407.T','4004.T','4005.T','4021.T','4042.T','4043.T','4061.T','4063.T','4183.T','4188.T','4208.T','4452.T','4901.T','4911.T','6988.T','5019.T','5020.T','5101.T','5108.T','5201.T','5214.T','5233.T','5301.T','5332.T','5333.T','5401.T','5406.T','5411.T','3436.T','5706.T','5711.T','5713.T','5714.T','5801.T','5802.T','5803.T','2768.T','8001.T','8002.T','8015.T','8031.T','8053.T','8058.T','1721.T','1801.T','1802.T','1803.T','1808.T','1812.T','1925.T','1928.T','1963.T','5631.T','6103.T','6113.T','6273.T','6301.T','6302.T','6305.T','6326.T','6361.T','6367.T','6471.T','6472.T','6473.T','7004.T','7011.T','7013.T','7012.T','7832.T','7911.T','7912.T','7951.T','3289.T','8801.T','8802.T','8804.T','8830.T','9001.T','9005.T','9007.T','9008.T','9009.T','9020.T','9021.T','9022.T','9064.T','9147.T','9101.T','9104.T','9107.T','9201.T','9202.T','9301.T','9501.T','9502.T','9503.T','9531.T','9532.T' ]
@@ -64,188 +71,109 @@ ticker_name_map = {
     "9735.T": "セコム", "9766.T": "コナミG", "9843.T": "ニトリHD", "9983.T": "ファーストリテ",
     "9984.T": "ソフトバンクG",
 }
-# ===== LINE送信 =====
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-LINE_USER_ID = os.environ.get("LINE_USER_ID", "")
 
-def line_send(text: str, to_user_id: str | None = LINE_USER_ID):
-    assert LINE_CHANNEL_ACCESS_TOKEN, "LINE_CHANNEL_ACCESS_TOKEN is missing"
-    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
-    if to_user_id:
-        url = "https://api.line.me/v2/bot/message/push"
-        payload = {"to": to_user_id, "messages": [{"type": "text", "text": text}]}
-    else:
-        url = "https://api.line.me/v2/bot/message/broadcast"
-        payload = {"messages": [{"type": "text", "text": text}]}
-    r = requests.post(url, headers=headers, json=payload, timeout=20)
-    if r.status_code >= 300:
-        raise RuntimeError(f"LINE send failed: {r.status_code} {r.text}")
+# ==============================
+# LINE通知
+# ==============================
+def line_send(msg: str):
+    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+    to    = os.environ.get("LINE_USER_ID")
+    if not token or not to: return
+    headers = {"Authorization": f"Bearer {token}"}
+    data = {"to": to, "messages": [{"type": "text", "text": msg}]}
+    requests.post("https://api.line.me/v2/bot/message/push",
+                  headers=headers, json=data)
 
-def send_long_text(text: str, chunk=900):
-    for i in range(0, len(text), chunk):
-        line_send(text[i:i+chunk])
+def send_long_text(text, limit=480):
+    for i in range(0, len(text), limit):
+        line_send(text[i:i+limit])
 
-# ===== 共通：データ取得 =====
-def fetch_market_data(tickers, lookback_days=300):
-    end_dt = datetime.now(tz=TZ).date() + timedelta(days=1)
-    start_dt = end_dt - timedelta(days=lookback_days)
-    data = yf.download(
-        tickers, start=start_dt.isoformat(), end=end_dt.isoformat(),
-        interval="1d", auto_adjust=False, progress=False, group_by="column",
-    )
-    return data["Close"], data.get("Volume")
+# ==============================
+# ゴールデンクロス検出
+# ==============================
+def detect_golden_cross(close, vol, open_, short=5, long=25,
+                        within_days=3, min_price=300,
+                        vol_ratio=1.2, include_near=True,
+                        near_thresh=0.98, max_kairi=6.0):
 
-def sma(s, w): return s.rolling(window=w, min_periods=1).mean()
+    results = []
+    short_ma = close.rolling(short).mean()
+    long_ma  = close.rolling(long).mean()
+    vol_ma20 = vol.rolling(20).mean()
 
-# ===== 検出ロジック：ゴールデンクロス =====
+    for t in close.columns:
+        c, s, l, v, v20, o = close[t], short_ma[t], long_ma[t], vol[t], vol_ma20[t], open_[t]
+        if len(c.dropna()) < long + 5: continue
 
-def detect_golden_cross(
-    close: pd.DataFrame,
-    vol: pd.DataFrame | None,
-    open_: pd.DataFrame,                  # ★ 追加：当日始値
-    short: int = 5,
-    long: int = 25,
-    within_days: int = 3,
-    min_price: float = 100.0,             # ★ 価格帯フィルタ（終値の下限）
-    vol_ratio: float = 1.2,               # ★ 出来高増加（直近出来高 / 20日平均）
-    include_near: bool = True,
-    near_thresh: float = 0.98,            # ★ 交差しかけ判定（short/long >= 0.98）
-    max_kairi: float = 6.0                # ★ 乖離の上限（|short/long -1|*100 <= max_kairi）
-):
-    """
-    直近ゴールデンクロス(GC) と 交差しかけ(NEAR) を検出。
-    フィルタ：価格帯、出来高増加、陰線NG、乖離上限 を採用。
-    """
-    out = []
+        latest = c.iloc[-1]; prev = c.iloc[-2]
+        s_now, l_now = s.iloc[-1], l.iloc[-1]
+        s_prev, l_prev = s.iloc[-2], l.iloc[-2]
 
-    for ticker in close.columns:
-        if ticker not in open_.columns:
-            continue
+        # 価格帯
+        if latest < min_price: continue
+        # 出来高増加
+        if v.iloc[-1] < vol_ratio * v20.iloc[-1]: continue
+        # 陰線NG
+        if latest < o.iloc[-1]: continue
+        # 乖離上限
+        kairi = abs((s_now - l_now)/l_now)*100 if l_now>0 else 999
+        if kairi > max_kairi: continue
 
-        s = close[ticker].dropna()
-        if len(s) < long + within_days + 5:
-            continue
+        hit = False
+        # クロス判定
+        if s_prev < l_prev and s_now >= l_now:
+            hit = True
+        # 交差しかけ
+        elif include_near and s_now >= near_thresh * l_now:
+            hit = True
 
-        o = open_[ticker].reindex(s.index)
-        if pd.isna(o.iloc[-1]) or pd.isna(s.iloc[-1]):
-            continue
+        if hit:
+            results.append({
+                "Ticker": t,
+                "Latest_Close": latest,
+                "Short_MA": s_now,
+                "Long_MA": l_now,
+                "Volume": v.iloc[-1],
+                "Avg20_Vol": v20.iloc[-1]
+            })
+    return pd.DataFrame(results)
 
-        # 価格帯フィルタ
-        if float(s.iloc[-1]) < float(min_price):
-            continue
+# ==============================
+# パイプライン
+# ==============================
+def run_golden_pipeline(top_n=15):
+    end   = datetime.now(TZ)
+    start = end - timedelta(days=60)
 
-        sma_s = s.rolling(short, min_periods=short).mean()
-        sma_l = s.rolling(long,  min_periods=long).mean()
-        if pd.isna(sma_l.iloc[-1]) or sma_l.iloc[-1] == 0:
-            continue
+    data = yf.download(nikkei225_tickers, start=start, end=end,
+                       interval="1d", auto_adjust=False, progress=False,
+                       group_by="column")
+    close = data["Close"]; open_ = data["Open"]; vol = data["Volume"]
 
-        # 出来高フィルタ（20日平均比）
-        if vol is not None and ticker in vol.columns:
-            v = vol[ticker].reindex(s.index)
-            v20 = v.rolling(20, min_periods=1).mean()
-            vr = float(v.iloc[-1]) / float(v20.iloc[-1]) if v20.iloc[-1] else 0.0
-            if vr < vol_ratio:
-                continue
+    df = detect_golden_cross(close, vol, open_,
+                             short=5, long=25, within_days=3,
+                             min_price=300, vol_ratio=1.2,
+                             include_near=True, near_thresh=0.98,
+                             max_kairi=6.0)
 
-        # 陰線NG（当日）
-        if float(s.iloc[-1]) < float(o.iloc[-1]):
-            continue
-
-        # 乖離（短期/長期 - 1）*100 の絶対値が大きすぎるのを除外
-        kairi_now = (sma_s.iloc[-1] / sma_l.iloc[-1] - 1.0) * 100.0
-        if abs(kairi_now) > max_kairi:
-            continue
-
-        # -------------------------
-        sig = sma_s - sma_l
-
-        # 直近GC（確定上抜け）
-        cross_up = (sig.shift(1) <= 0) & (sig > 0)
-        cross_dates = sig.index[cross_up]
-        if len(cross_dates) > 0:
-            last_cross = cross_dates[-1]
-            if last_cross >= s.index[-within_days]:
-                out.append({
-                    "Type": "GC",
-                    "Ticker": ticker,
-                    "Latest_Close": round(float(s.iloc[-1]), 2),
-                    "Cross_Date": last_cross.strftime("%Y-%m-%d"),
-                    "S_S_vs_L_L_%": round(kairi_now, 2)
-                })
-
-        # 交差しかけ（Near）
-        if include_near and sig.iloc[-1] <= 0:
-            cond_near = (
-                (sma_s.iloc[-1] / sma_l.iloc[-1] >= near_thresh) and  # 2%差以内
-                (sma_s.iloc[-1] > sma_s.iloc[-2]) and                 # 短期上向き
-                (sig.diff().iloc[-1] > 0) and                         # 差が改善中
-                (s.iloc[-1] >= sma_s.iloc[-1])                        # 価格が短期線以上
-            )
-            if cond_near:
-                out.append({
-                    "Type": "NEAR",
-                    "Ticker": ticker,
-                    "Latest_Close": round(float(s.iloc[-1]), 2),
-                    "Cross_Date": "",
-                    "S_S_vs_L_L_%": round(kairi_now, 2)
-                })
-
-    return (pd.DataFrame(out)
-              .sort_values(["Type", "S_S_vs_L_L_%", "Latest_Close"],
-                           ascending=[True, False, False])
-              .reset_index(drop=True))
-
-# ===== 通知 =====
-def notify(df: pd.DataFrame, top_n=15):
-    if df is None or df.empty:
-        line_send("【GCスクリーニング】該当なし"); return
-
-    def fnum(x):
-        try: return f"{float(x):,.0f}"
-        except: return "-"
-    def fpct(x):
-        try: return f"{float(x):.1f}%"
-        except: return "-"
+    if df.empty:
+        line_send("【ゴールデンクロス】該当なし")
+        return
 
     header = (
-        f"📈【ゴールデンクロス】{datetime.now(TZ).strftime('%m/%d %H:%M')}\n"
-        f"抽出: {len(df)} 銘柄（上位{top_n}を表示）\n"
-        f"条件: SMA50↗SMA200 / 終値が両SMA上 / (出来高基準:任意)\n"
+        f"📈【ゴールデンクロス検出】{datetime.now(TZ).strftime('%m/%d %H:%M')}\n"
+        f"抽出: {len(df)} 銘柄\n"
+        f"条件: SMA5≥SMA25(交差or近接)・出来高増・陰線NG・価格帯≥300円・乖離≤6%\n"
         f"——————————————\n"
     )
     send_long_text(header)
 
     cards = []
     for _, r in df.head(top_n).iterrows():
-        t = r["Ticker"]; name = r.get("Name","")
-        c = r["Latest_Close"]; ss = r["SMA_Short"]; ll = r["SMA_Long"]; gap = r["S_S_vs_L_L_%"]
+        t = r["Ticker"]; name = ticker_name_map.get(t, "")
         line1 = f"{t} {name}".rstrip()
-        line2 = f"終値 {fnum(c)}   短期 {fnum(ss)} / 長期 {fnum(ll)}"
-        line3 = f"短長乖離 {fpct(gap)}"
+        line2 = f"短期 {r['Short_MA']:.1f}   長期 {r['Long_MA']:.1f}"
+        line3 = f"終値 {r['Latest_Close']:.1f}   出来高 {int(r['Volume']):,}"
         cards.append("\n".join([line1, line2, line3]))
 
-    for i in range(0, len(cards), 5):
-        send_long_text(("\n— — — — —\n").join(cards[i:i+5]))
-
-# ===== 取引日/時間（JST） =====
-def is_trading_day_jst(dt: datetime):
-    if dt.weekday() >= 5: return False
-    if jpholiday.is_holiday(dt.date()): return False
-    return True
-def is_trading_time_jst(dt: datetime):
-    h, m = dt.hour, dt.minute
-    return (h > 9 or (h == 9 and m >= 0)) and (h < 15 or (h == 15 and m <= 30))
-
-def main():
-    now = datetime.now(TZ)
-    force = os.getenv("FORCE_RUN") == "1"
-    if not force:
-        if not is_trading_day_jst(now) or not is_trading_time_jst(now):
-            print(f"[SKIP] {now} 非取引時間"); return
-
-    close, vol = fetch_market_data(nikkei225_tickers, lookback_days=320)
-    hits = detect_golden_cross(close, vol, short=50, long=200, within_days=3, min_price=100, vol_ratio=1.0)
-    notify(hits, top_n=15)
-
-if __name__ == "__main__":
-    main()
+    send_long_text("\n\n".join(cards))
