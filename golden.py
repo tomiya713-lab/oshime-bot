@@ -155,7 +155,7 @@ def detect_golden_cross(close: pd.DataFrame, vol: pd.DataFrame | None,
             })
 
     if not out: return pd.DataFrame()
-return (
+    return (
     pd.DataFrame(out)
       .sort_values(["S_S_vs_L_L_%", "Latest_Close"], ascending=[False, False])
       .reset_index(drop=True) )
