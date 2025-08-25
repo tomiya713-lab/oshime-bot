@@ -146,7 +146,7 @@ def find_pullback_candidates(close, high, low, window_days=30):
         expected_rise_pct = (peak_high / latest_close - 1) * 100.0
 
         conds = [
-            rebound_from_low_pct >= 5.0,
+            1.0 <= rebound_from_low_pct <= 4.0,
             drop_pct <= 15.0,
             days_since_pullback >= 2,
             latest_close >= latest_sma25,
