@@ -22,7 +22,8 @@ import mplfinance as mpf
 
 # ===== 設定（必要に応じて変更） =====
 TZ_OFFSET = 9  # JST
-REBOUND_MIN = 5.0       # 反発率 >= 5%
+REBOUND_MIN = 2.0       # 反発率 >= 2%
+REBOUND_MAX = 4.0       # 反発率 <= 4%
 DROP_MAX = 15.0         # ピークからの許容下落率 <= 15%
 DAYS_SINCE_MIN = 2      # 押し目から最新までの営業日数 >= 2
 EXPECTED_RISE_MIN = 3.0 # 期待上昇率 >= 3%
@@ -195,9 +196,11 @@ def compute_one_ticker(close_s: pd.Series, high_s: pd.Series, low_s: pd.Series, 
         expected_rise_pct = (expected_upper / latest_val - 1.0) * 100.0
         days_since_pull = (close_s.index.get_loc(latest_idx) - close_s.index.get_loc(pull_idx))
 
+
         # 条件判定
         conds = [
             rebound_pct >= REBOUND_MIN,
+            rebound_pct <= REBOUND_MAX,
             drop_pct <= DROP_MAX,
             days_since_pull >= DAYS_SINCE_MIN,
             not math.isnan(sma25) and latest_val >= sma25,
