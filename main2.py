@@ -270,7 +270,7 @@ def compute_one_ticker(close_s: pd.Series, high_s: pd.Series, low_s: pd.Series, 
         if not all(conds):
             return None
 
-        nikkei225_tickers {
+        return {
             "Ticker": close_s.name,
             "Peak_Date": peak_idx.date(),
             "Peak_High": round(peak_val, 2),
