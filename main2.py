@@ -63,6 +63,32 @@ def chunk_text(text: str, limit: int = 4500):
         out.append("\n".join(buf))
     return out
 
+# ======= 追加: RSI 計算ヘルパー =======
+def latest_rsi_from_raw(raw_df, ticker: str, period: int = 14):
+    """
+    yf.download(..., group_by='column') の生データから対象ティッカーの終値でRSI(14)を算出。
+    取得不可の場合は None を返す。
+    """
+    try:
+        if isinstance(raw_df.columns, pd.MultiIndex):
+            close = raw_df[("Close", ticker)].dropna()
+        else:
+            close = raw_df["Close"].dropna()
+        if len(close) < period + 2:
+            return None
+        delta = close.diff()
+        up = delta.clip(lower=0.0)
+        down = (-delta).clip(lower=0.0)
+        # シンプル平均（必要ならWilder法へ変更可）
+        roll_up = up.rolling(period, min_periods=period).mean()
+        roll_down = down.rolling(period, min_periods=period).mean()
+        rs = roll_up / roll_down.replace(0, np.nan)
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+        return float(rsi.iloc[-1])
+    except Exception:
+        return None
+# ======= 追加ここまで =======
+
 # ===== LINE送信 =====
 def line_push_text(msg: str, to_user_id: str | None = None):
     uid = to_user_id or LINE_USER_ID
@@ -402,10 +428,17 @@ def notify(best_df: pd.DataFrame, raw_df, ticker_name_map: dict, top_n=TOP_N):
         chg_pct = ((float(latest) / float(prev)) - 1.0) * 100.0 if (pd.notna(latest) and pd.notna(prev) and float(prev) != 0.0) else None
         bot_pct = ((float(latest) / float(low)) - 1.0) * 100.0 if (pd.notna(latest) and pd.notna(low) and float(low) != 0.0) else None
 
+# 追加: 押し目記録日とRSI
+        pull_date = r.get("Pullback_Date")  # datetime.date
+        pull_str = pull_date.strftime("%m/%d") if hasattr(pull_date, "strftime") else "-"
+        rsi_val = latest_rsi_from_raw(raw_df, ticker, period=14)
+        rsi_str = "-" if rsi_val is None or not np.isfinite(rsi_val) else f"{rsi_val:.0f}"
+
         line1 = f"{ticker} {name}".rstrip()
         line2 = f"↗ {fpct(rise_p)}   🎯 上 {fnum(upper)}   下 {fnum(low)}"
         line3 = f"今 {fnum(latest)}   🎯 期待額 {fnum(expect_amt)}"
-        line4 = f"変動率 {fpct_signed(chg_pct)}   底値比較 {fpct_signed(bot_pct)}"
+        # 置換: 4行目に 押し目記録日 と RSI を追加
+        line4 = f"変動率 {fpct_signed(chg_pct)}   底値比較 {fpct_signed(bot_pct)}   記録日 {pull_str}   RSI {rsi_str}"
 
         # ① 4行テキスト
         send_long_text("\n".join([line1, line2, line3, line4]))
