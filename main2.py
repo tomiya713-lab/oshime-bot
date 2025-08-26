@@ -393,9 +393,10 @@ def notify(best_df: pd.DataFrame, raw_df, ticker_name_map: dict, top_n=TOP_N):
         return
 
     header = (
-        f"📊【押し目スクリーニング】{now_jst().strftime('%m/%d %H:%M')}\n"
+        f"★★★★★【押し目】★★★★★"
+        f"{now_jst().strftime('%m/%d %H:%M')}\n"
         f"抽出: {len(best_df)} 銘柄（重複統合）\n"
-        f"条件: 反発≥{REBOUND_MIN:.0f}%・下落≤{DROP_MAX:.0f}%・SMA25上・期待≥{EXPECTED_RISE_MIN:.0f}%・{DAYS_SINCE_MIN}日経過\n"
+        f"条件: {REBOUND_MAX:.0f}%≥反発≥{REBOUND_MIN:.0f}%・下落≤{DROP_MAX:.0f}%・SMA25上・期待≥{EXPECTED_RISE_MIN:.0f}%・{DAYS_SINCE_MIN}日経過\n"
         f"------------------------------\n"
     )
     send_long_text(header)
@@ -435,13 +436,13 @@ def notify(best_df: pd.DataFrame, raw_df, ticker_name_map: dict, top_n=TOP_N):
         rsi_str = "-" if rsi_val is None or not np.isfinite(rsi_val) else f"{rsi_val:.0f}"
 
         line1 = f"{ticker} {name}".rstrip()
-        line2 = f"↗ {fpct(rise_p)}   🎯 上 {fnum(upper)}   下 {fnum(low)}"
-        line3 = f"今 {fnum(latest)}   🎯 期待額 {fnum(expect_amt)}"
-        # 置換: 4行目に 押し目記録日 と RSI を追加
-        line4 = f"変動率 {fpct_signed(chg_pct)}   底値比較 {fpct_signed(bot_pct)}   記録日 {pull_str}   RSI {rsi_str}"
+        line2 = f"底日 {pull_str}"
+        line3 = f"↗ {fpct(rise_p)}   🎯 上 {fnum(upper)}   下 {fnum(low)}"
+        line4 = f"今 {fnum(latest)}   🎯 期待 {fnum(expect_amt)}  RSI {rsi_str}"
+        line5 = f"変動率 {fpct_signed(chg_pct)}   底値比較 {fpct_signed(bot_pct)}"
 
-        # ① 4行テキスト
-        send_long_text("\n".join([line1, line2, line3, line4]))
+        # ① 5行テキスト
+        send_long_text("\n".join([line1, line2, line3, line4, line5]))
 
         # ② チャート画像（同じデータから作図）→ 公開URLで送信
         img_path = save_chart_image_from_raw(raw_df, ticker, out_dir="charts")
