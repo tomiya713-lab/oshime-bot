@@ -22,7 +22,7 @@ import mplfinance as mpf
 
 # ===== 設定（必要に応じて変更） =====
 TZ_OFFSET = 9  # JST
-REBOUND_MIN = 2.0       # 反発率 >= 2%
+REBOUND_MIN = 1.0       # 反発率 >= 1%
 REBOUND_MAX = 4.0       # 反発率 <= 4%
 DROP_MAX = 15.0         # ピークからの許容下落率 <= 15%
 DAYS_SINCE_MIN = 2      # 押し目から最新までの営業日数 >= 2
@@ -336,9 +336,8 @@ def save_chart_image_from_raw(raw_df, ticker: str, out_dir="charts"):
 
 # ===== 名称辞書（必要なら拡張/差し替え）=====
 def build_ticker_name_map(tickers):
-    # 最低限: TSEは yfinance 上「.T」サフィックス、銘柄名はAPIで逐次取得すると重いので空にしておく
-    # 必要に応じてCSVから読み込むなどに差し替え
-    return {t: "" for t in tickers}
+    # 既存のグローバル辞書 ticker_name_map を参照して、必要な分だけ取り出す
+    return {t: ticker_name_map.get(t, "") for t in tickers}
 
 # ===== パイプライン =====
 def run_pipeline():
