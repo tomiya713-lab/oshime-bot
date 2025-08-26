@@ -351,7 +351,7 @@ def notify(best_df: pd.DataFrame, raw_df, ticker_name_map: dict, top_n=TOP_N):
         # ② チャート画像（同じデータから作図）→ 公開URLで送信
         img_path = save_chart_image_from_raw(raw_df, ticker, out_dir="charts")
         if img_path and PUBLIC_BASE_URL:
-            public_url = f"{PUBLIC_BASE_URL}/charts/{os.path.basename(img_path)}"
+            public_url = f"{PUBLIC_BASE_URL}/{os.path.basename(img_path)}"
             line_push_image(public_url)
 
 def main():
