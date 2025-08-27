@@ -152,25 +152,83 @@ ticker_name_map = {
 }
 
 def fetch_market_data(tickers, lookback_days=DEFAULT_LOOKBACK_DAYS):
+    """
+    yfinance をバッチ分割＆リトライで堅牢に取得。
+    欠損が多いティッカーは自動で除外し、MultiIndex raw / Close / High / Low を返す。
+    """
+    import time
     end_dt = (now_jst().date() + timedelta(days=1)).isoformat()
     start_dt = (now_jst().date() - timedelta(days=lookback_days)).isoformat()
-    raw = yf.download(
-        tickers,
-        start=start_dt,
-        end=end_dt,
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        group_by="column",  # (field, ticker)
-        threads=True,
-    )
-    # 必須カラムチェック
-    for c in ("Close", "High", "Low"):
-        if c not in raw.columns.get_level_values(0):
-            raise RuntimeError(f"yfinance returned missing column: {c}")
-    close = raw["Close"].copy()
-    high = raw["High"].copy()
-    low = raw["Low"].copy()
+
+    BATCH = 50        # 一度に取得する最大銘柄数
+    RETRIES = 3       # 失敗時のリトライ回数
+    SLEEP   = 1.5     # リトライ間隔(秒)
+
+    # ティッカーごとのOHLCVを貯める
+    per_t_raw = {}    # t -> DataFrame(OHLCV)
+
+    def _download(batch):
+        # 分割・配当の歪みを避けるため auto_adjust=True
+        return yf.download(
+            batch,
+            start=start_dt, end=end_dt, interval="1d",
+            auto_adjust=True,
+            group_by="column", progress=False, threads=True,
+        )
+
+    # バッチ分割して取得（リトライつき）
+    for i in range(0, len(tickers), BATCH):
+        batch = tickers[i:i+BATCH]
+        df = None
+        for r in range(RETRIES):
+            try:
+                df = _download(batch)
+                if df is not None and not df.empty:
+                    break
+            except Exception:
+                pass
+            time.sleep(SLEEP * (r+1))
+
+        if df is None or df.empty:
+            continue
+
+        # 単一ティッカー返却（非MultiIndex）の場合を補正
+        if not isinstance(df.columns, pd.MultiIndex):
+            cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+            t = batch[0]
+            df = df[cols].copy()
+            df.columns = pd.MultiIndex.from_product([cols, [t]])
+
+        # バッチ中の各ティッカーを分解して検証
+        for t in set([c[1] for c in df.columns]):
+            try:
+                sub = df.loc[:, [(c, t) for c in ["Open", "High", "Low", "Close", "Volume"] if (c, t) in df.columns]].dropna()
+                if sub.empty:
+                    continue
+                # SMA25 と 30日ウィンドウが計算できるだけの十分な日数を確保
+                if len(sub) < max(SMA_WINDOW, 30) + 2:
+                    continue
+                tmp = sub.copy()
+                tmp.columns = [c[0] for c in tmp.columns]  # 列名を OHLCV の単層に
+                per_t_raw[t] = tmp.sort_index()
+            except Exception:
+                continue
+
+    if not per_t_raw:
+        raise RuntimeError("yfinance download produced no usable tickers.")
+
+    # MultiIndex raw を再構成：columns = [(field, ticker)]
+    pieces = []
+    for t, df1 in per_t_raw.items():
+        df1.columns = pd.MultiIndex.from_product([df1.columns, [t]])
+        pieces.append(df1)
+    raw = pd.concat(pieces, axis=1).sort_index(axis=1)
+
+    # ワイド形式（列=ticker）に変換
+    close = pd.concat([per_t_raw[t]["Close"].rename(t) for t in per_t_raw], axis=1)
+    high  = pd.concat([per_t_raw[t]["High"].rename(t)  for t in per_t_raw], axis=1)
+    low   = pd.concat([per_t_raw[t]["Low"].rename(t)   for t in per_t_raw], axis=1)
+
     return raw, close, high, low
 
 # ===== 押し目抽出 =====
