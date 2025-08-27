@@ -308,6 +308,53 @@ def run_pipeline():
     cat = pd.concat(rs, ignore_index=True).sort_values(["Ticker", "Return_%"], ascending=[True, False])
     best = cat.groupby("Ticker", as_index=False).first().sort_values("Return_%", ascending=False).reset_index(drop=True)
     name_map = build_ticker_name_map(best["Ticker"].tolist())
+# --- ここから診断ログ（最小追加） ---
+    try:
+        total_cols = len(close.columns)
+        ok_len = sum(len(close[c].dropna()) >= max(SMA_WINDOW, 30) + 2 for c in close.columns)
+        msg = [
+            f"[DEBUG] fetched tickers: {total_cols}, usable(len>= {max(SMA_WINDOW,30)+2}): {ok_len}",
+        ]
+        # ざっくり 30日ウィンドウの条件で各段階の通過数を数える
+        stage = {"start": 0, "rebound": 0, "drop": 0, "days": 0, "sma25": 0, "expect": 0, "pullnotlow": 0, "all": 0}
+        for t in close.columns:
+            c = close[t].dropna()
+            if len(c) < max(SMA_WINDOW, 30) + 2:
+                continue
+            h = high[t].reindex_like(c).dropna()
+            l = low[t].reindex_like(c).dropna()
+            stage["start"] += 1
+            look = c.iloc[-30:]
+            lh, ll = h.loc[look.index], l.loc[look.index]
+            if lh.empty or ll.empty:
+                continue
+            peak_idx = lh.idxmax()
+            after_peak = ll.loc[ll.index > peak_idx]
+            if after_peak.empty:
+                stage["pullnotlow"] += 1; continue
+            pull_idx = after_peak.idxmin()
+            latest = float(c.iloc[-1]); pull = float(after_peak.loc[pull_idx]); peak = float(lh.loc[peak_idx])
+            rebound = (latest/pull - 1)*100
+            drop = (1 - latest/peak)*100
+            exp = (peak/latest - 1)*100
+            sma25 = float(rolling_sma(c).iloc[-1]) if len(c) >= SMA_WINDOW else float("nan")
+            days = (c.index.get_loc(c.index[-1]) - c.index.get_loc(pull_idx))
+            if rebound >= REBOUND_MIN and rebound <= REBOUND_MAX: stage["rebound"] += 1
+            if drop <= DROP_MAX: stage["drop"] += 1
+            if days >= DAYS_SINCE_MIN: stage["days"] += 1
+            if (not math.isnan(sma25)) and latest >= sma25: stage["sma25"] += 1
+            if exp >= EXPECTED_RISE_MIN: stage["expect"] += 1
+            if (rebound >= REBOUND_MIN and rebound <= REBOUND_MAX and drop <= DROP_MAX and
+                days >= DAYS_SINCE_MIN and (not math.isnan(sma25)) and latest >= sma25 and exp >= EXPECTED_RISE_MIN):
+                stage["all"] += 1
+        msg.append(f"[DEBUG] start:{stage['start']}  no-low-after-peak:{stage['pullnotlow']}  "
+                   f"rebound:{stage['rebound']}  drop:{stage['drop']}  days:{stage['days']}  "
+                   f"sma25:{stage['sma25']}  expect:{stage['expect']}  all:{stage['all']}")
+        # 目視のため Discord に出す
+        discord_notify("\n".join(msg))
+    except Exception as e:
+        discord_notify(f"[DEBUG] diag failed: {e}")
+    # --- 診断ログここまで ---
     return best, raw, name_map
 
 # ===== 通知（Discord: テキスト＋画像 1通）=====
