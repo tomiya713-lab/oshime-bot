@@ -1,12 +1,3 @@
-# -*- coding: utf-8 -*-
-# main2.py — 押し目抽出 → Discordへ「テキスト＋チャート画像」1通で送信
-# 依存: pandas, numpy, yfinance, mplfinance, requests
-# 環境変数:
-#   PUBLIC_BASE_URL               （GitHub Pages のベースURL。例: https://<user>.github.io/<repo>）
-#   DISCORD_WEBHOOK_URL          （DiscordのWebhook URL。未設定なら下の DEFAULT_WEBHOOK を使用）
-#   （任意）FORCE_RUN=1         （週末スキップ無効化）
-#   （任意）TICKERS_CSV=./tickers.csv  (Ticker列を含むCSV)
-#   （任意）LOOKBACK_DAYS=180
 
 import os
 import sys
