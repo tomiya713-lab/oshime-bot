@@ -1,3 +1,15 @@
+# -*- coding: utf-8 -*-
+# main3.py — 押し目抽出 → Discord Webhook に「テキスト（分割）→ チャート画像(Embed)」連続送信
+# 依存: pandas, numpy, yfinance, mplfinance, requests
+#
+# 環境変数:
+#   DISCORD_WEBHOOK_URL  (必須)
+#   PUBLIC_BASE_URL      (任意; 例: https://<user>.github.io/charts など / 末尾スラ無しでもOK)
+#   （任意）FORCE_RUN=1 で週末スキップ無効化
+#   （任意）TICKERS_CSV=./tickers.csv  (Ticker列/Code列/Symbol列を含むCSV)
+#   （任意）LOOKBACK_DAYS=180
+#
+# 参考: LINE版の既存実装（抽出・画像生成ロジック）は踏襲し、送信先のみDiscordに変更。
 
 import os
 import sys
@@ -11,28 +23,60 @@ import mplfinance as mpf
 
 # ===== 設定（必要に応じて変更） =====
 TZ_OFFSET = 9  # JST
-REBOUND_MIN = 1.0       # 反発率 >= 1%   ←必要なら 2.0 に
+REBOUND_MIN = 1.0       # 反発率 >= 1%
 REBOUND_MAX = 4.0       # 反発率 <= 4%
 DROP_MAX = 15.0         # ピークからの許容下落率 <= 15%
 DAYS_SINCE_MIN = 2      # 押し目から最新までの営業日数 >= 2
 EXPECTED_RISE_MIN = 3.0 # 期待上昇率 >= 3%
 SMA_WINDOW = 25
-TOP_N = 15
+TOP_N = 15              # 送信上限
 DEFAULT_LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "180"))
 
-# ===== 配信先 =====
+# ===== Discord Webhook =====
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
-DEFAULT_WEBHOOK = "https://canary.discord.com/api/webhooks/1410262330180243506/uyfezbFe3uTaMiqbQgY5d029FLtyyx4kkZf-iVHYJf6A9qeCl2w52b60mR57BBX5RXcN"
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", DEFAULT_WEBHOOK)
+
+if not DISCORD_WEBHOOK_URL:
+    print("[ERROR] Set DISCORD_WEBHOOK_URL env.", file=sys.stderr)
 
 # ===== ユーティリティ =====
 def now_jst():
     return datetime.utcnow() + timedelta(hours=TZ_OFFSET)
 
 def is_weekend(dt: datetime) -> bool:
-    return dt.weekday() >= 5  # 土日
+    # 土日スキップ（日本の祝日は考慮しない）
+    return dt.weekday() >= 5
 
-# ===== RSI 計算ヘルパー =====
+def chunk_text(text: str, limit: int = 1900):
+    """
+    Discordのcontent制限(2000文字)を考慮して分割（余裕1900）。
+    改行単位で分割。長すぎる1行は強制的に切る。
+    """
+    out, buf, size = [], [], 0
+    for line in text.splitlines():
+        if len(line) > limit:
+            # 1行が超長いときは強制分割
+            while len(line) > limit:
+                part = line[:limit]
+                line = line[limit:]
+                if buf:
+                    out.append("\n".join(buf))
+                    buf, size = [], 0
+                out.append(part)
+            if line == "":
+                continue
+        add = len(line) + 1
+        if size + add > limit:
+            out.append("\n".join(buf))
+            buf, size = [line], len(line) + 1
+        else:
+            buf.append(line)
+            size += add
+    if buf:
+        out.append("\n".join(buf))
+    return out
+
+# ======= RSI 計算ヘルパー（LINE版から踏襲） =======
 def latest_rsi_from_raw(raw_df, ticker: str, period: int = 14):
     """
     yf.download(..., group_by='column') の生データから対象ティッカーの終値でRSI(14)を算出。
@@ -56,39 +100,57 @@ def latest_rsi_from_raw(raw_df, ticker: str, period: int = 14):
     except Exception:
         return None
 
-# ===== Discord 送信 =====
-def discord_notify(text: str, image_url: str | None = None):
+# ===== Discord送信 =====
+def discord_send_content(msg: str):
     """
-    Discord Webhook に 1通で送る。
-    - text は content として送信
-    - image_url があれば embed の画像として添付
+    contentでシンプルに送信。2000文字制限に合わせて事前分割。
     """
-    if not DISCORD_WEBHOOK_URL:
-        print("[ERROR] DISCORD_WEBHOOK_URL is missing.", file=sys.stderr)
-        return
-    data = {"content": text}
+    headers = {"Content-Type": "application/json"}
+    for part in chunk_text(msg, limit=1900):
+        payload = {"content": part}
+        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, headers=headers, timeout=20)
+        if r.status_code >= 300:
+            raise RuntimeError(f"Discord send failed: {r.status_code} {r.text}")
+
+def discord_send_embed(title: str, description: str | None = None, image_url: str | None = None, fields: list | None = None):
+    """
+    Embedで送信（チャート画像URLをimageに表示）。
+    """
+    embed = {"title": title, "timestamp": datetime.utcnow().isoformat() + "Z"}
+    if description:
+        # descriptionも2000文字制限あるが、ここでは短文想定
+        embed["description"] = description
     if image_url:
-        data["embeds"] = [{"image": {"url": image_url}}]
-    r = requests.post(DISCORD_WEBHOOK_URL, json=data, timeout=20)
+        embed["image"] = {"url": image_url}
+    if fields:
+        embed["fields"] = fields
+
+    payload = {"embeds": [embed]}
+    headers = {"Content-Type": "application/json"}
+    r = requests.post(DISCORD_WEBHOOK_URL, json=payload, headers=headers, timeout=20)
     if r.status_code >= 300:
-        raise RuntimeError(f"Discord送信失敗: {r.status_code} {r.text}")
+        raise RuntimeError(f"Discord embed failed: {r.status_code} {r.text}")
+
+def send_long_text(msg: str):
+    # 長文を自動分割して送る（content）
+    discord_send_content(msg)
 
 # ===== データ取得 =====
 def load_tickers():
-    # 優先: 環境変数 TICKERS_CSV のCSV（Ticker列）
+    # 優先: 環境変数 TICKERS_CSV のCSV（Ticker/Symbol/Code列）
     csv_path = os.getenv("TICKERS_CSV")
     if csv_path and os.path.exists(csv_path):
         df = pd.read_csv(csv_path)
         col = None
         for c in df.columns:
-            if str(c).lower() in ("ticker", "symbol", "code"):
+            if c.lower() in ("ticker", "symbol", "code"):
                 col = c
                 break
         if col:
             tickers = [str(x).strip() for x in df[col].dropna().unique().tolist()]
             if tickers:
                 return tickers
-    # フォールバック：日経225の一部だけ（必要なら増やしてOK）
+
     return nikkei225_tickers
 
 # ===== 日経225ティッカー =====
@@ -151,76 +213,29 @@ ticker_name_map = {
     "9984.T": "ソフトバンクG",
 }
 
-# ===== データ取得 =====
 def fetch_market_data(tickers, lookback_days=DEFAULT_LOOKBACK_DAYS):
-    """
-    yfinance を 1 銘柄ずつ取得（history）＋ リトライ ＋ スリープで堅牢化。
-    - auto_adjust=True で分割/配当の歪みを回避
-    - 必要日数(= SMA25と30日ウィンドウ計算に足るデータ)がない銘柄は自動スキップ
-    返り値:
-      raw  : MultiIndex [(field, ticker)]
-      close/high/low : 列=ticker のワイド
-    """
-    import time
-
-    RETRIES    = 4
-    BASE_SLEEP = float(os.getenv("YF_REQUEST_GAP", "0.8"))  # 1銘柄ごとの間隔(秒) 環境で調整可
-    BACKOFF    = 1.8                                        # リトライごとの倍率
-
-    need_days   = max(SMA_WINDOW, 30) + 2
-    period_days = lookback_days + need_days + 10
-    period_str  = f"{period_days}d"
-
-    per_t_raw = {}  # {ticker: DataFrame(OHLCV)}
-
-    for t in tickers:
-        df = None
-        for r in range(RETRIES):
-            try:
-                # 単騎で取得（downloadではなくTicker(...).historyが安定）
-                hist = yf.Ticker(t).history(period=period_str, interval="1d", auto_adjust=True)
-                if hist is not None and not hist.empty:
-                    cols = ["Open", "High", "Low", "Close", "Volume"]
-                    if all(c in hist.columns for c in cols):
-                        df = hist[cols].dropna().copy()
-                        df.index = pd.to_datetime(df.index).tz_localize(None)
-                if df is not None and len(df) >= need_days:
-                    break  # 成功
-            except Exception:
-                pass
-
-            sleep_s = BASE_SLEEP * (BACKOFF ** r)
-            print(f"[INFO] retry {r+1}/{RETRIES} for {t} after {sleep_s:.1f}s")
-            time.sleep(sleep_s)
-
-        if df is None or len(df) < need_days:
-            print(f"[WARN] skip ticker {t}: no usable data (len={0 if df is None else len(df)})")
-        else:
-            per_t_raw[t] = df.sort_index()
-
-        # 次の銘柄までの間隔（Yahooへの負荷回避）
-        time.sleep(BASE_SLEEP)
-
-    if not per_t_raw:
-        raise RuntimeError("yfinance single-fetch produced no usable tickers.")
-
-    # MultiIndex raw を構成（[(field, ticker)]）
-    pieces = []
-    for t, df1 in per_t_raw.items():
-        df1 = df1.copy()
-        df1.columns = pd.MultiIndex.from_product([df1.columns, [t]])
-        pieces.append(df1)
-    raw = pd.concat(pieces, axis=1).sort_index(axis=1)
-
-    # 列=ticker のワイド形式
-    close = pd.concat([per_t_raw[t]["Close"].rename(t) for t in per_t_raw], axis=1)
-    high  = pd.concat([per_t_raw[t]["High"].rename(t)  for t in per_t_raw], axis=1)
-    low   = pd.concat([per_t_raw[t]["Low"].rename(t)   for t in per_t_raw], axis=1)
-
+    end_dt = (now_jst().date() + timedelta(days=1)).isoformat()
+    start_dt = (now_jst().date() - timedelta(days=lookback_days)).isoformat()
+    raw = yf.download(
+        tickers,
+        start=start_dt,
+        end=end_dt,
+        interval="1d",
+        auto_adjust=False,
+        progress=False,
+        group_by="column",  # (field, ticker)
+        threads=True,
+    )
+    # 必須カラムが揃っているか簡易チェック
+    for c in ("Close", "High", "Low"):
+        if c not in raw.columns.get_level_values(0):
+            raise RuntimeError(f"yfinance returned missing column: {c}")
+    close = raw["Close"].copy()
+    high = raw["High"].copy()
+    low = raw["Low"].copy()
     return raw, close, high, low
-                    
-                
-# ===== 押し目抽出 =====
+
+# ===== 押し目抽出（厳しい条件・LINE版踏襲） =====
 def rolling_sma(series: pd.Series, window=SMA_WINDOW):
     return series.rolling(window, min_periods=window).mean()
 
@@ -243,7 +258,7 @@ def compute_one_ticker(close_s: pd.Series, high_s: pd.Series, low_s: pd.Series, 
         peak_idx = look_high.idxmax()
         peak_val = float(look_high.loc[peak_idx])
 
-        # ピーク後の最安値
+        # ピーク後の最安値（なければ除外）
         after_peak = look_low.loc[look_low.index > peak_idx]
         if after_peak.empty:
             return None
@@ -253,15 +268,15 @@ def compute_one_ticker(close_s: pd.Series, high_s: pd.Series, low_s: pd.Series, 
         latest_idx = close_s.index[-1]
         latest_val = float(close_s.iloc[-1])
         prev_val = float(close_s.iloc[-2]) if len(close_s) >= 2 else np.nan
+
         sma25 = float(rolling_sma(close_s).iloc[-1]) if len(close_s) >= SMA_WINDOW else np.nan
 
         rebound_pct = (latest_val / pull_val - 1.0) * 100.0
         drop_pct = (1.0 - latest_val / peak_val) * 100.0
-        expected_upper = float(peak_val)
+        expected_upper = peak_val
         expected_rise_pct = (expected_upper / latest_val - 1.0) * 100.0
         days_since_pull = (close_s.index.get_loc(latest_idx) - close_s.index.get_loc(pull_idx))
 
-        # 条件
         conds = [
             rebound_pct >= REBOUND_MIN,
             rebound_pct <= REBOUND_MAX,
@@ -282,7 +297,7 @@ def compute_one_ticker(close_s: pd.Series, high_s: pd.Series, low_s: pd.Series, 
             "Pullback_Low": round(pull_val, 2),
             "Latest_Date": latest_idx.date(),
             "Latest_Close": round(latest_val, 2),
-            "Prev_Close": round(prev_val, 2) if not math.isnan(prev_val) else np.nan,
+            "Prev_Close": round(prev_val, 2) if not np.isnan(prev_val) else np.nan,
             "Return_%": round(expected_rise_pct, 2),
             "Rebound_From_Low_%": round(rebound_pct, 2),
             "Drop_From_Peak_%": round(drop_pct, 2),
@@ -304,10 +319,14 @@ def find_pullback_candidates(close_df: pd.DataFrame, high_df: pd.DataFrame, low_
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
-    return df.sort_values("Return_%", ascending=False).reset_index(drop=True)
+    df = df.sort_values("Return_%", ascending=False).reset_index(drop=True)
+    return df
 
-# ===== チャート画像作成 =====
+# ===== チャート画像作成（踏襲） =====
 def save_chart_image_from_raw(raw_df, ticker: str, out_dir="charts"):
+    """
+    raw_df: yf.download(..., group_by='column') の MultiIndex DataFrame
+    """
     need_cols = ["Open", "High", "Low", "Close", "Volume"]
     try:
         use = raw_df.loc[:, [(c, ticker) for c in need_cols]].copy()
@@ -334,6 +353,7 @@ def save_chart_image_from_raw(raw_df, ticker: str, out_dir="charts"):
 
 # ===== 名称辞書 =====
 def build_ticker_name_map(tickers):
+    # 既存のグローバル辞書を参照。無ければ空文字。
     return {t: ticker_name_map.get(t, "") for t in tickers}
 
 # ===== パイプライン =====
@@ -355,68 +375,21 @@ def run_pipeline():
     cat = pd.concat(rs, ignore_index=True).sort_values(["Ticker", "Return_%"], ascending=[True, False])
     best = cat.groupby("Ticker", as_index=False).first().sort_values("Return_%", ascending=False).reset_index(drop=True)
     name_map = build_ticker_name_map(best["Ticker"].tolist())
-# --- ここから診断ログ（最小追加） ---
-    try:
-        total_cols = len(close.columns)
-        ok_len = sum(len(close[c].dropna()) >= max(SMA_WINDOW, 30) + 2 for c in close.columns)
-        msg = [
-            f"[DEBUG] fetched tickers: {total_cols}, usable(len>= {max(SMA_WINDOW,30)+2}): {ok_len}",
-        ]
-        # ざっくり 30日ウィンドウの条件で各段階の通過数を数える
-        stage = {"start": 0, "rebound": 0, "drop": 0, "days": 0, "sma25": 0, "expect": 0, "pullnotlow": 0, "all": 0}
-        for t in close.columns:
-            c = close[t].dropna()
-            if len(c) < max(SMA_WINDOW, 30) + 2:
-                continue
-            h = high[t].reindex_like(c).dropna()
-            l = low[t].reindex_like(c).dropna()
-            stage["start"] += 1
-            look = c.iloc[-30:]
-            lh, ll = h.loc[look.index], l.loc[look.index]
-            if lh.empty or ll.empty:
-                continue
-            peak_idx = lh.idxmax()
-            after_peak = ll.loc[ll.index > peak_idx]
-            if after_peak.empty:
-                stage["pullnotlow"] += 1; continue
-            pull_idx = after_peak.idxmin()
-            latest = float(c.iloc[-1]); pull = float(after_peak.loc[pull_idx]); peak = float(lh.loc[peak_idx])
-            rebound = (latest/pull - 1)*100
-            drop = (1 - latest/peak)*100
-            exp = (peak/latest - 1)*100
-            sma25 = float(rolling_sma(c).iloc[-1]) if len(c) >= SMA_WINDOW else float("nan")
-            days = (c.index.get_loc(c.index[-1]) - c.index.get_loc(pull_idx))
-            if rebound >= REBOUND_MIN and rebound <= REBOUND_MAX: stage["rebound"] += 1
-            if drop <= DROP_MAX: stage["drop"] += 1
-            if days >= DAYS_SINCE_MIN: stage["days"] += 1
-            if (not math.isnan(sma25)) and latest >= sma25: stage["sma25"] += 1
-            if exp >= EXPECTED_RISE_MIN: stage["expect"] += 1
-            if (rebound >= REBOUND_MIN and rebound <= REBOUND_MAX and drop <= DROP_MAX and
-                days >= DAYS_SINCE_MIN and (not math.isnan(sma25)) and latest >= sma25 and exp >= EXPECTED_RISE_MIN):
-                stage["all"] += 1
-        msg.append(f"[DEBUG] start:{stage['start']}  no-low-after-peak:{stage['pullnotlow']}  "
-                   f"rebound:{stage['rebound']}  drop:{stage['drop']}  days:{stage['days']}  "
-                   f"sma25:{stage['sma25']}  expect:{stage['expect']}  all:{stage['all']}")
-        # 目視のため Discord に出す
-        discord_notify("\n".join(msg))
-    except Exception as e:
-        discord_notify(f"[DEBUG] diag failed: {e}")
-    # --- 診断ログここまで ---
     return best, raw, name_map
 
-# ===== 通知（Discord: テキスト＋画像 1通）=====
+# ===== 通知（Discord版） =====
 def notify(best_df: pd.DataFrame, raw_df, ticker_name_map: dict, top_n=TOP_N):
     if best_df is None or best_df.empty:
-        discord_notify("【押し目スクリーニング】本日は抽出なしでした。")
+        discord_send_content("【押し目スクリーニング】本日は抽出なしでした。")
         return
 
     header = (
-        f"📊【押し目スクリーニング】{now_jst().strftime('%m/%d %H:%M')}\n"
+        f"★★★★★【押し目】★★★★★ {now_jst().strftime('%m/%d %H:%M')}\n"
         f"抽出: {len(best_df)} 銘柄（重複統合）\n"
-        f"条件: 反発≤{REBOUND_MAX:.0f}% & ≥{REBOUND_MIN:.0f}%・下落≤{DROP_MAX:.0f}%・SMA25上・期待≥{EXPECTED_RISE_MIN:.0f}%・{DAYS_SINCE_MIN}日経過\n"
-        f"────────────────────"
+        f"条件: {REBOUND_MAX:.0f}%≥反発≥{REBOUND_MIN:.0f}%・下落≤{DROP_MAX:.0f}%・SMA25上・期待≥{EXPECTED_RISE_MIN:.0f}%・{DAYS_SINCE_MIN}日経過\n"
+        f"------------------------------"
     )
-    discord_notify(header)
+    send_long_text(header)
 
     for _, r in best_df.head(top_n).iterrows():
         ticker = str(r["Ticker"])
@@ -445,26 +418,32 @@ def notify(best_df: pd.DataFrame, raw_df, ticker_name_map: dict, top_n=TOP_N):
         chg_pct = ((float(latest) / float(prev)) - 1.0) * 100.0 if (pd.notna(latest) and pd.notna(prev) and float(prev) != 0.0) else None
         bot_pct = ((float(latest) / float(low)) - 1.0) * 100.0 if (pd.notna(latest) and pd.notna(low) and float(low) != 0.0) else None
 
-        # 押し目記録日とRSI
         pull_date = r.get("Pullback_Date")
         pull_str = pull_date.strftime("%m/%d") if hasattr(pull_date, "strftime") else "-"
         rsi_val = latest_rsi_from_raw(raw_df, ticker, period=14)
         rsi_str = "-" if rsi_val is None or not np.isfinite(rsi_val) else f"{rsi_val:.0f}"
 
-        # テキスト 4行（line1〜4）
+        # テキスト 5行（content）
         line1 = f"{ticker} {name}".rstrip()
-        line2 = f"↗ {fpct(rise_p)}   🎯 上 {fnum(upper)}   下 {fnum(low)}"
-        line3 = f"今 {fnum(latest)}   🎯 期待額 {fnum(expect_amt)}"
-        line4 = f"変動率 {fpct_signed(chg_pct)}   底値比較 {fpct_signed(bot_pct)}   記録日 {pull_str}   RSI {rsi_str}"
-        msg = "\n".join([line1, line2, line3, line4])
+        line2 = f"底日 {pull_str}"
+        line3 = f"↗ {fpct(rise_p)}   🎯 上 {fnum(upper)}   下 {fnum(low)}"
+        line4 = f"今 {fnum(latest)}   🎯 期待 {fnum(expect_amt)}  RSI {rsi_str}"
+        line5 = f"変動率 {fpct_signed(chg_pct)}   底値比較 {fpct_signed(bot_pct)}"
+        msg = "\n".join([line1, line2, line3, line4, line5])
+        send_long_text(msg)
 
-        # チャート画像を作成し、公開URLをDiscordに添付
+        # チャート画像（Embed）
         img_path = save_chart_image_from_raw(raw_df, ticker, out_dir="charts")
         if img_path and PUBLIC_BASE_URL:
-            public_url = f"{PUBLIC_BASE_URL}/{os.path.basename(img_path)}"  # ← サイト直下に公開する想定
-            discord_notify(msg, image_url=public_url)
-        else:
-            discord_notify(msg)
+            public_url = f"{PUBLIC_BASE_URL}/{os.path.basename(img_path)}"
+            title = f"{ticker} {name}".strip()
+            desc = f"Window: best / 期待上昇 {fpct(rise_p)}"
+            fields = [
+                {"name": "Pullback", "value": f"{pull_str}", "inline": True},
+                {"name": "Latest", "value": f"{fnum(latest)}", "inline": True},
+                {"name": "Target", "value": f"{fnum(upper)}", "inline": True},
+            ]
+            discord_send_embed(title=title, description=desc, image_url=public_url, fields=fields)
 
 def main():
     now = now_jst()
@@ -479,3 +458,20 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ===== サンプルの銘柄・名称（あとで全銘柄に差し替えOK） =====
+nikkei225_tickers = [
+    "7974.T",  # 任天堂
+    "7203.T",  # トヨタ
+    "9432.T",  # NTT
+    "6981.T",  # 村田製作所
+    "8035.T",  # 東京エレクトロン
+]
+
+ticker_name_map = {
+    "7974.T": "任天堂",
+    "7203.T": "トヨタ",
+    "9432.T": "NTT",
+    "6981.T": "村田製作所",
+    "8035.T": "東エレク",
+        }
