@@ -1,0 +1,47 @@
+name: Run Oshime Bot (main3)
+
+on:
+  # 手動実行（任意）
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "強制実行（取引時間チェック無視）"
+        type: boolean
+        default: false
+  # スケジュール実行（UTC基準）
+  # JST 9:02–15:32 を 30分おき（混雑回避の2分/32分）
+  schedule:
+    - cron: '4,34 0-6 * * 1-5'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: oshime-bot-main3
+      cancel-in-progress: true   # ← 古い実行をキャンセルして最新のみ実行
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: '**/requirements.txt'
+
+      - name: Upgrade pip
+        run: python -m pip install -U pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Check envs
+        run: |
+          test -n "${{ secrets.DISCORD_WEBHOOK_URL }}" || (echo "Missing DISCORD_WEBHOOK_URL" && exit 1)
+
+      - name: Run python
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force && '1' || '' }}
+        run: python main3.py
