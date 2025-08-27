@@ -213,26 +213,76 @@ ticker_name_map = {
     "9984.T": "ソフトバンクG",
 }
 
+def _download_chunk(tickers_chunk, start_dt, end_dt):
+    """
+    失敗があっても落ちないように1チャンクずつ取得。
+    取得できた分だけを返す（MultiIndex: (field, ticker)）。
+    """
+    try:
+        df = yf.download(
+            tickers_chunk,
+            start=start_dt,
+            end=end_dt,
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            group_by="column",  # (field, ticker)
+            threads=False,      # ← 並列を切って安定化
+        )
+        # yfinance は単一銘柄だと列が単層になる場合があるので揃える
+        if not isinstance(df.columns, pd.MultiIndex):
+            # 単一ティッカーだった場合、ダミーで MultiIndex 化
+            ticker = tickers_chunk[0]
+            df.columns = pd.MultiIndex.from_product([df.columns, [ticker]])
+        return df
+    except Exception as e:
+        print(f"[WARN] download chunk failed: {e}", file=sys.stderr)
+        return pd.DataFrame()
+
 def fetch_market_data(tickers, lookback_days=DEFAULT_LOOKBACK_DAYS):
     end_dt = (now_jst().date() + timedelta(days=1)).isoformat()
     start_dt = (now_jst().date() - timedelta(days=lookback_days)).isoformat()
-    raw = yf.download(
-        tickers,
-        start=start_dt,
-        end=end_dt,
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        group_by="column",  # (field, ticker)
-        threads=True,
-    )
-    # 必須カラムが揃っているか簡易チェック
-    for c in ("Close", "High", "Low"):
-        if c not in raw.columns.get_level_values(0):
-            raise RuntimeError(f"yfinance returned missing column: {c}")
-    close = raw["Close"].copy()
-    high = raw["High"].copy()
-    low = raw["Low"].copy()
+
+    # 30件ずつ小分け
+    CHUNK = 30
+    parts = []
+    for i in range(0, len(tickers), CHUNK):
+        chunk = [t for t in tickers[i:i+CHUNK] if t and isinstance(t, str)]
+        if not chunk:
+            continue
+        df = _download_chunk(chunk, start_dt, end_dt)
+        if not df.empty:
+            parts.append(df)
+
+    if not parts:
+        # 1件も取れなかった
+        raise RuntimeError("No market data fetched. Yahoo側の一時的な失敗か、ティッカーが全て無効な可能性があります。")
+
+    # 列方向に統合（MultiIndexのまま）
+    raw = pd.concat(parts, axis=1)
+    # 実在カラムを確認
+    top = raw.columns.get_level_values(0)
+    for need in ("Close", "High", "Low"):
+        if need not in top:
+            # ない列はスキップではなく明示的にエラー
+            raise RuntimeError(f"yfinance returned missing column: {need}")
+
+    # 実際にデータがあるティッカーだけ抽出
+    have_close = raw["Close"].dropna(axis=1, how="all")
+    have_high  = raw["High"].dropna(axis=1, how="all")
+    have_low   = raw["Low"].dropna(axis=1, how="all")
+    valid = sorted(set(have_close.columns) & set(have_high.columns) & set(have_low.columns))
+
+    if not valid:
+        raise RuntimeError("All requested tickers returned empty data.")
+
+    close = have_close.loc[:, valid]
+    high  = have_high.loc[:, valid]
+    low   = have_low.loc[:, valid]
+    # raw も不要な列を間引いて返す
+    keep_cols = [(c, t) for c in ("Open","High","Low","Close","Volume") for t in valid if (c, t) in raw.columns]
+    raw = raw.loc[:, keep_cols]
+
     return raw, close, high, low
 
 # ===== 押し目抽出（厳しい条件・LINE版踏襲） =====
