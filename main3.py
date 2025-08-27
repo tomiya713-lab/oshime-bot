@@ -150,77 +150,74 @@ ticker_name_map = {
     "9735.T": "セコム", "9766.T": "コナミG", "9843.T": "ニトリHD", "9983.T": "ファーストリテ",
     "9984.T": "ソフトバンクG",
 }
-def fetch_market_data(
-    tickers,
-    lookback_days=DEFAULT_LOOKBACK_DAYS,
-    chunk=30,         # 一度に投げる最大件数（20〜50が目安）
-    pause=1.0,        # チャンク間の小休止（Yahooのレート制限回避）
-    retries=2         # 失敗時の再試行回数
-):
-    end_dt = (now_jst().date() + timedelta(days=1)).isoformat()
-    start_dt = (now_jst().date() - timedelta(days=lookback_days)).isoformat()
 
-    frames = []
-    failed = []
+# ===== データ取得 =====
+def fetch_market_data(tickers, lookback_days=DEFAULT_LOOKBACK_DAYS):
+    """
+    yfinance を 1 銘柄ずつ取得（history）＋ リトライ ＋ スリープで堅牢化。
+    - auto_adjust=True で分割/配当の歪みを回避
+    - 必要日数(= SMA25と30日ウィンドウ計算に足るデータ)がない銘柄は自動スキップ
+    返り値:
+      raw  : MultiIndex [(field, ticker)]
+      close/high/low : 列=ticker のワイド
+    """
+    import time
 
-    for i in range(0, len(tickers), chunk):
-        sub = tickers[i:i+chunk]
-        success = False
-        for attempt in range(retries + 1):
+    RETRIES    = 4
+    BASE_SLEEP = float(os.getenv("YF_REQUEST_GAP", "0.8"))  # 1銘柄ごとの間隔(秒) 環境で調整可
+    BACKOFF    = 1.8                                        # リトライごとの倍率
+
+    need_days   = max(SMA_WINDOW, 30) + 2
+    period_days = lookback_days + need_days + 10
+    period_str  = f"{period_days}d"
+
+    per_t_raw = {}  # {ticker: DataFrame(OHLCV)}
+
+    for t in tickers:
+        df = None
+        for r in range(RETRIES):
             try:
-                part = yf.download(
-                    sub,
-                    start=start_dt,
-                    end=end_dt,
-                    interval="1d",
-                    auto_adjust=False,        # ← main2 と同じ
-                    progress=False,
-                    group_by="column",        # (field, ticker)
-                    threads=True,             # main2 と同じ
-                )
-                # 空やNoneなら例外化してリトライ
-                if part is None or (isinstance(part, pd.DataFrame) and part.empty):
-                    raise RuntimeError("empty response")
-
-                # 単一銘柄だと列が単層になることがあるのでMultiIndexへ正規化
-                if not isinstance(part.columns, pd.MultiIndex):
-                    t = sub[0]
-                    part.columns = pd.MultiIndex.from_product([part.columns, [t]])
-
-                frames.append(part)
-                success = True
-                break
+                # 単騎で取得（downloadではなくTicker(...).historyが安定）
+                hist = yf.Ticker(t).history(period=period_str, interval="1d", auto_adjust=True)
+                if hist is not None and not hist.empty:
+                    cols = ["Open", "High", "Low", "Close", "Volume"]
+                    if all(c in hist.columns for c in cols):
+                        df = hist[cols].dropna().copy()
+                        df.index = pd.to_datetime(df.index).tz_localize(None)
+                if df is not None and len(df) >= need_days:
+                    break  # 成功
             except Exception:
-                # 少し待ってから再試行（attempt 0,1,2 → 1s,2s,3s…でもOK）
-                time.sleep(pause * (attempt + 1))
+                pass
 
-        # チャンク間の小休止（Yahooへの優しさ）
-        time.sleep(pause)
+            sleep_s = BASE_SLEEP * (BACKOFF ** r)
+            print(f"[INFO] retry {r+1}/{RETRIES} for {t} after {sleep_s:.1f}s")
+            time.sleep(sleep_s)
 
-        if not success:
-            failed.extend(sub)
+        if df is None or len(df) < need_days:
+            print(f"[WARN] skip ticker {t}: no usable data (len={0 if df is None else len(df)})")
+        else:
+            per_t_raw[t] = df.sort_index()
 
-    if not frames:
-        raise RuntimeError(f"yfinance download failed for all tickers ({len(failed)} fails)")
+        # 次の銘柄までの間隔（Yahooへの負荷回避）
+        time.sleep(BASE_SLEEP)
 
-    # チャンクを横に結合（列は MultiIndex: (field, ticker)）
-    raw = pd.concat(frames, axis=1)
-    raw = raw.loc[:, ~raw.columns.duplicated()]
+    if not per_t_raw:
+        raise RuntimeError("yfinance single-fetch produced no usable tickers.")
 
-    # 必須カラムチェック（main2 と同じ）
-    for c in ("Close", "High", "Low"):
-        if c not in raw.columns.get_level_values(0):
-            raise RuntimeError(f"yfinance returned missing column: {c}")
+    # MultiIndex raw を構成（[(field, ticker)]）
+    pieces = []
+    for t, df1 in per_t_raw.items():
+        df1 = df1.copy()
+        df1.columns = pd.MultiIndex.from_product([df1.columns, [t]])
+        pieces.append(df1)
+    raw = pd.concat(pieces, axis=1).sort_index(axis=1)
 
-    close = raw["Close"].copy()
-    high  = raw["High"].copy()
-    low   = raw["Low"].copy()
-
-    if failed:
-        print(f"[WARN] skipped {len(failed)} tickers due to fetch errors: {failed[:10]} ...", file=sys.stderr)
+    # 列=ticker のワイド形式
+    close = pd.concat([per_t_raw[t]["Close"].rename(t) for t in per_t_raw], axis=1)
+    high  = pd.concat([per_t_raw[t]["High"].rename(t)  for t in per_t_raw], axis=1)
+    low   = pd.concat([per_t_raw[t]["Low"].rename(t)   for t in per_t_raw], axis=1)
 
     return raw, close, high, low
-
                     
                 
 # ===== 押し目抽出 =====
