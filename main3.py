@@ -221,19 +221,26 @@ def fetch_market_data(tickers, lookback_days=DEFAULT_LOOKBACK_DAYS):
         start=start_dt,
         end=end_dt,
         interval="1d",
-        auto_adjust=False,
+        auto_adjust=False,   # ← このままでOK（Adj Close列が来る）
         progress=False,
-        group_by="column",  # (field, ticker)
+        group_by="column",
         threads=True,
     )
-    # 必須カラムが揃っているか簡易チェック
-    for c in ("Close", "High", "Low"):
+    # 必須カラムチェック（High/Lowは必須）
+    for c in ("High", "Low"):
         if c not in raw.columns.get_level_values(0):
             raise RuntimeError(f"yfinance returned missing column: {c}")
-    close = raw["Close"].copy()
-    high = raw["High"].copy()
-    low = raw["Low"].copy()
+
+    # ★ここを変更：Adj Close があれば優先、無ければ Close
+    close_choice = "Adj Close" if "Adj Close" in raw.columns.get_level_values(0) else "Close"
+    if close_choice not in raw.columns.get_level_values(0):
+        raise RuntimeError("Neither Adj Close nor Close is present.")
+
+    close = raw[close_choice].copy()
+    high  = raw["High"].copy()
+    low   = raw["Low"].copy()
     return raw, close, high, low
+
 
 # ===== 押し目抽出（厳しい条件・LINE版踏襲） =====
 def rolling_sma(series: pd.Series, window=SMA_WINDOW):
@@ -254,9 +261,12 @@ def compute_one_ticker(close_s: pd.Series, high_s: pd.Series, low_s: pd.Series, 
         if look_high.empty or look_low.empty:
             return None
 
-        # ピーク（期間内の最高値）
-        peak_idx = look_high.idxmax()
-        peak_val = float(look_high.loc[peak_idx])
+        # ピーク（期間内の最高値）— 最終行（当日足）を探索から除外
+        look_high_use = look_high.iloc[:-1] if len(look_high) > 1 else look_high
+        if look_high_use.empty:
+            return None
+        peak_idx = look_high_use.idxmax()
+        peak_val = float(look_high_use.loc[peak_idx])
 
         # ピーク後の最安値（なければ除外）
         after_peak = look_low.loc[look_low.index > peak_idx]
@@ -264,6 +274,7 @@ def compute_one_ticker(close_s: pd.Series, high_s: pd.Series, low_s: pd.Series, 
             return None
         pull_idx = after_peak.idxmin()
         pull_val = float(after_peak.loc[pull_idx])
+
 
         latest_idx = close_s.index[-1]
         latest_val = float(close_s.iloc[-1])
