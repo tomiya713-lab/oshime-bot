@@ -9,7 +9,6 @@
 #   （任意）TICKERS_CSV=./tickers.csv  (Ticker列/Code列/Symbol列を含むCSV)
 #   （任意）LOOKBACK_DAYS=180
 #
-# 参考: LINE版の既存実装（抽出・画像生成ロジック）は踏襲し、送信先のみDiscordに変更。
 
 import os
 import sys
@@ -214,32 +213,68 @@ def load_tickers():
     return nikkei225_tickers
 
 def fetch_market_data(tickers, lookback_days=DEFAULT_LOOKBACK_DAYS):
+    """
+    Colabの安定パターンを移植：
+    - まとめてdownload（threads=False）
+    - MultiIndex列から stack(dropna=False) で縦持ち化
+    - 列を揃えてから pivot（横展開）
+    - Closeを“分析用の終値”としてAdj_Close列名に統一
+    """
     end_dt = (now_jst().date() + timedelta(days=1)).isoformat()
     start_dt = (now_jst().date() - timedelta(days=lookback_days)).isoformat()
+
+    # まとめてDL（ここをColabと同じ方針に）
     raw = yf.download(
-        tickers,
+        tickers=tickers,
         start=start_dt,
         end=end_dt,
         interval="1d",
-        auto_adjust=False,   # ← このままでOK（Adj Close列が来る）
+        auto_adjust=False,   # Colabと合わせる（Close=通常の終値）
         progress=False,
-        group_by="column",
-        threads=True,
+        threads=False        # ★安定優先
+        # group_by は明示しない（デフォルトで column）
     )
-    # 必須カラムチェック（High/Lowは必須）
-    for c in ("High", "Low"):
-        if c not in raw.columns.get_level_values(0):
-            raise RuntimeError(f"yfinance returned missing column: {c}")
 
-    # ★ここを変更：Adj Close があれば優先、無ければ Close
-    close_choice = "Adj Close" if "Adj Close" in raw.columns.get_level_values(0) else "Close"
-    if close_choice not in raw.columns.get_level_values(0):
-        raise RuntimeError("Neither Adj Close nor Close is present.")
+    if raw is None or len(raw) == 0:
+        raise RuntimeError("yfinance returned empty frame for all tickers.")
 
-    close = raw[close_choice].copy()
-    high  = raw["High"].copy()
-    low   = raw["Low"].copy()
-    return raw, close, high, low
+    # --- 縦持ち → 結合（Colabのやり方） ---
+    # ※ dropna=False で欠損も保持し、後段で必要列だけを安全に組み立て
+    try:
+        s_close = raw["Close"].stack(dropna=False)
+        s_open  = raw["Open" ].stack(dropna=False)
+        s_high  = raw["High" ].stack(dropna=False)
+        s_low   = raw["Low"  ].stack(dropna=False)
+        s_vol   = raw["Volume"].stack(dropna=False)
+    except Exception as e:
+        raise RuntimeError(f"stack failed: {e}")
+
+    vdf = pd.concat(
+        {
+            "Adj_Close": s_close,    # 分析側は“終値”としてこの列名に寄せる（Colab準拠）
+            "Open":      s_open,
+            "high":      s_high,
+            "low":       s_low,
+            "volume":    s_vol,
+        },
+        axis=1
+    ).reset_index()
+    vdf.columns = ["Date", "Ticker", "Adj_Close", "Open", "high", "low", "volume"]
+
+    # --- 横展開：分析用DataFrame（close_df / high_df / low_df） ---
+    vdf["Date"] = pd.to_datetime(vdf["Date"])
+    vdf = vdf.sort_values(["Ticker", "Date"])
+
+    close_df = vdf.pivot(index="Date", columns="Ticker", values="Adj_Close").sort_index()
+    high_df  = vdf.pivot(index="Date", columns="Ticker", values="high").sort_index()
+    low_df   = vdf.pivot(index="Date", columns="Ticker", values="low").sort_index()
+
+    # main3の他処理と互換にするため raw も返す（チャート生成用）
+    # チャートは (Open,High,Low,Close,Volume) を要求するため、簡易リビルド
+    # -> 生の raw をそのまま返してOK（MultiIndexの (field,ticker) 構造）
+    #    以降の save_chart_image_from_raw で参照できます
+    return raw, close_df, high_df, low_df
+
 
 
 # ===== 押し目抽出（厳しい条件・LINE版踏襲） =====
