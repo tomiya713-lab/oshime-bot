@@ -150,7 +150,7 @@ def load_tickers():
             tickers = [str(x).strip() for x in df[col].dropna().unique().tolist()]
             if tickers:
                 return tickers
-  return nikkei225_tickers
+    return nikkei225_tickers
 
 def fetch_market_data(tickers, lookback_days=DEFAULT_LOOKBACK_DAYS):
     end_dt = (now_jst().date() + timedelta(days=1)).isoformat()
