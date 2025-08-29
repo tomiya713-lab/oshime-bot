@@ -1,18 +1,7 @@
-# -*- coding: utf-8 -*-
-# main3.py — 押し目抽出 → Discord Webhook に「テキスト（分割）→ チャート画像(Embed)」連続送信
-# 依存: pandas, numpy, yfinance, mplfinance, requests
-#
-# 環境変数:
-#   DISCORD_WEBHOOK_URL  (必須)
-#   PUBLIC_BASE_URL      (任意; 例: https://<user>.github.io/charts など / 末尾スラ無しでもOK)
-#   （任意）FORCE_RUN=1 で週末スキップ無効化
-#   （任意）TICKERS_CSV=./tickers.csv  (Ticker列/Code列/Symbol列を含むCSV)
-#   （任意）LOOKBACK_DAYS=180
-#
-# 参考: LINE版の既存実装（抽出・画像生成ロジック）は踏襲し、送信先のみDiscordに変更。
 
 import os
 import sys
+import json
 import math
 from datetime import datetime, timedelta
 import requests
@@ -162,37 +151,68 @@ def latest_rsi_from_raw(raw_df, ticker: str, period: int = 14):
 
 # ===== Discord送信 =====
 def discord_send_content(msg: str):
-    """
-    contentでシンプルに送信。2000文字制限に合わせて事前分割。
-    """
-    headers = {"Content-Type": "application/json"}
-    for part in chunk_text(msg, limit=1900):
-        payload = {"content": part}
-        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, headers=headers, timeout=20)
-        if r.status_code >= 300:
-            raise RuntimeError(f"Discord send failed: {r.status_code} {r.text}")
+    r = requests.post(
+        DISCORD_WEBHOOK_URL,
+        json={"content": msg},
+        headers={"Content-Type": "application/json"},
+        timeout=30,
+    )
+    if r.status_code >= 300:
+        raise RuntimeError(f"Discord content failed: {r.status_code} {r.text}")
 
-def discord_send_embed(title: str, description: str | None = None, image_url: str | None = None, fields: list | None = None):
-    """
-    Embedで送信（チャート画像URLをimageに表示）。
-    """
+
+def discord_send_embed(
+    title: str,
+    description: str | None = None,
+    image_url: str | None = None,
+    fields: list | None = None,
+):
     embed = {"title": title, "timestamp": datetime.utcnow().isoformat() + "Z"}
     if description:
-        # descriptionも2000文字制限あるが、ここでは短文想定
         embed["description"] = description
     if image_url:
         embed["image"] = {"url": image_url}
     if fields:
         embed["fields"] = fields
 
-    payload = {"embeds": [embed]}
-    headers = {"Content-Type": "application/json"}
-    r = requests.post(DISCORD_WEBHOOK_URL, json=payload, headers=headers, timeout=20)
+    r = requests.post(
+        DISCORD_WEBHOOK_URL,
+        json={"embeds": [embed]},
+        headers={"Content-Type": "application/json"},
+        timeout=30,
+    )
     if r.status_code >= 300:
         raise RuntimeError(f"Discord embed failed: {r.status_code} {r.text}")
 
+
+def discord_send_image_file(
+    file_path: str,
+    title: str,
+    description: str | None = None,
+    fields: list | None = None,
+):
+    """画像ファイルをWebhookに直接添付して送る（外部URL不要）"""
+    embed = {"title": title, "timestamp": datetime.utcnow().isoformat() + "Z"}
+    if description:
+        embed["description"] = description
+    if fields:
+        embed["fields"] = fields
+
+    filename = os.path.basename(file_path)
+    # 添付ファイルは attachment://<filename> で参照
+    embed["image"] = {"url": f"attachment://{filename}"}
+
+    with open(file_path, "rb") as f:
+        files = {"file": (filename, f, "image/png")}
+        data = {"payload_json": json.dumps({"embeds": [embed]})}
+        r = requests.post(DISCORD_WEBHOOK_URL, files=files, data=data, timeout=30)
+        if r.status_code >= 300:
+            raise RuntimeError(
+                f"Discord image upload failed: {r.status_code} {r.text}"
+            )
+
+
 def send_long_text(msg: str):
-    # 長文を自動分割して送る（content）
     discord_send_content(msg)
 
 # ===== データ取得 =====
@@ -433,18 +453,40 @@ def notify(best_df: pd.DataFrame, raw_df, ticker_name_map: dict, top_n=TOP_N):
         msg = "\n".join([line1, line2, line3, line4, line5])
         send_long_text(msg)
 
-        # チャート画像（Embed）
+        # チャート画像（Embed or 添付）
         img_path = save_chart_image_from_raw(raw_df, ticker, out_dir="charts")
-        if img_path and PUBLIC_BASE_URL:
-            public_url = f"{PUBLIC_BASE_URL}/{os.path.basename(img_path)}"
-            title = f"{ticker} {name}".strip()
-            desc = f"Window: best / 期待上昇 {fpct(rise_p)}"
-            fields = [
-                {"name": "Pullback", "value": f"{pull_str}", "inline": True},
-                {"name": "Latest", "value": f"{fnum(latest)}", "inline": True},
-                {"name": "Target", "value": f"{fnum(upper)}", "inline": True},
-            ]
-            discord_send_embed(title=title, description=desc, image_url=public_url, fields=fields)
+        title = f"{ticker} {name}".strip()
+        desc = f"Window: best / 期待上昇 {fpct(rise_p)}"
+        fields = [
+            {"name": "Pullback", "value": f"{pull_str}", "inline": True},
+            {"name": "Latest",   "value": f"{fnum(latest)}", "inline": True},
+            {"name": "Target",   "value": f"{fnum(upper)}",  "inline": True},
+        ]
+
+        if img_path:
+            if PUBLIC_BASE_URL:
+                public_url = f"{PUBLIC_BASE_URL}/{os.path.basename(img_path)}"
+                discord_send_embed(
+                    title=title,
+                    description=desc,
+                    image_url=public_url,
+                    fields=fields,
+                )
+            else:
+                # URLなしでも画像をDiscordに直接添付して送る
+                discord_send_image_file(
+                    file_path=img_path,
+                    title=title,
+                    description=desc,
+                    fields=fields,
+                )
+        else:
+            # 画像が作れなかった場合はテキストのみEmbed
+            discord_send_embed(
+                title=title,
+                description=desc,
+                fields=fields,
+            )
 
 def main():
     now = now_jst()
