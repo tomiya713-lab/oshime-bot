@@ -1,6 +1,6 @@
 jpholiday
 pandas==2.2.2
 numpy==1.26.4
-yfinance==0.2.43
+yfinance>=0.2.54
 mplfinance==0.12.10b0
 requests==2.32.3
