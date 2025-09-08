@@ -260,7 +260,7 @@ def fetch_market_data(tickers, lookback_days=DEFAULT_LOOKBACK_DAYS):
 def rolling_sma(series: pd.Series, window=SMA_WINDOW):
     return series.rolling(window, min_periods=window).mean()
 
-def compute_one_ticker(close_s: pd.Series, high_s: pd.Series, low_s: pd.Series, window_days=30):
+def compute_one_ticker(close_s: pd.Series, high_s: pd.Series, low_s: pd.Series, window_days=60):
     try:
         close_s = close_s.dropna()
         high_s = high_s.reindex_like(close_s).dropna()
@@ -382,9 +382,9 @@ def run_pipeline():
     tickers = load_tickers()
     raw, close, high, low = fetch_market_data(tickers, lookback_days=DEFAULT_LOOKBACK_DAYS)
 
-    # 30日・14日で抽出 → マージ（同一ティッカーは 'Return_%' が大きい方を採用）
+    # 60日・30日で抽出 → マージ（同一ティッカーは 'Return_%' が大きい方を採用）
     rs = []
-    for w in (30, 14):
+    for w in (60, 30):
         df = find_pullback_candidates(close, high, low, window_days=w)
         if not df.empty:
             df["Window"] = w
