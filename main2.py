@@ -469,19 +469,19 @@ def run_pipeline():
     if not rs:
         return pd.DataFrame(), raw, {}
 
-cat = (
-    pd.concat(rs, ignore_index=True)
-      .sort_values(["Ticker", "Expected_Rise_%"], ascending=[True, False])
-)
-best = (
-    cat.groupby("Ticker", as_index=False)
-       .first()
-       .sort_values("Expected_Rise_%", ascending=False)
-       .reset_index(drop=True)
-)
+    cat = (
+        pd.concat(rs, ignore_index=True)
+          .sort_values(["Ticker", "Expected_Rise_%"], ascending=[True, False])
+    )
+    best = (
+        cat.groupby("Ticker", as_index=False)
+           .first()
+           .sort_values("Expected_Rise_%", ascending=False)
+           .reset_index(drop=True)
+    )
+
     name_map = build_ticker_name_map(best["Ticker"].tolist())
     return best, raw, name_map
-
 # ===== 通知（Discord版） =====
 def notify(best_df: pd.DataFrame, raw_df, ticker_name_map: dict, top_n=TOP_N):
     if best_df is None or best_df.empty:
@@ -491,7 +491,7 @@ def notify(best_df: pd.DataFrame, raw_df, ticker_name_map: dict, top_n=TOP_N):
     header = (
         f"★★★★★【押し目】★★★★★ {now_jst().strftime('%m/%d %H:%M')}\n"
         f"抽出: {len(best_df)} 銘柄（重複統合）\n"
-        f"条件: {REBOUND_MAX:.0f}%≥反発≥{REBOUND_MIN:.0f}%・下落≤{DROP_MAX:.0f}%・SMA25上・期待≥{EXPECTED_RISE_MIN:.0f}%・{DAYS_SINCE_MIN}日経過\n"
+        f"条件: {REBOUND_MAX*100:.0f}%≥反発≥{REBOUND_MIN*100:.0f}%・下落≤{DROP_MAX:.0f}%・SMA25上・期待≥{EXPECTED_RISE_MIN:.0f}%・{DAYS_SINCE_LOW_MIN}日経過\n"
         f"------------------------------"
     )
     send_long_text(header)
