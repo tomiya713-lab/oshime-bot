@@ -519,5 +519,46 @@ def notify(best_df: pd.DataFrame, raw_df, ticker_name_map: dict, top_n=TOP_N):
         title = f"{ticker} {name}".strip()
         desc = f"Window: best / 期待上昇 {fpct(rise_p)}"
         fields = [
-            {"name": "Pullback", "value": f"{pull_str}", "inline": True},
-            {"name": "Latest",   "value": f"{fnum(latest)}
+            {"name": "Pullback", "value": f"{pull_str}",     "inline": True},
+            {"name": "Latest",   "value": f"{fnum(latest)}", "inline": True},
+            {"name": "Target",   "value": f"{fnum(upper)}",  "inline": True},
+        ]
+
+        if img_path:
+            if PUBLIC_BASE_URL:
+                public_url = f"{PUBLIC_BASE_URL}/{os.path.basename(img_path)}"
+                discord_send_embed(
+                    title=title,
+                    description=desc,
+                    image_url=public_url,
+                    fields=fields,
+                )
+            else:
+                discord_send_image_file(
+                    file_path=img_path,
+                    title=title,
+                    description=desc,
+                    fields=fields,
+                )
+        else:
+            discord_send_embed(
+                title=title,
+                description=desc,
+                fields=fields,
+            )
+
+
+def main():
+    now = now_jst()
+    force = os.getenv("FORCE_RUN") == "1"
+
+    if not force and is_weekend(now):
+        print(f"[SKIP] {now:%F %R} 週末のためスキップ（FORCE_RUN=1で実行可能）")
+        return
+
+    best, raw, name_map = run_pipeline()
+    notify(best, raw, name_map, top_n=TOP_N)
+
+
+if __name__ == "__main__":
+    main()
