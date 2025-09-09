@@ -261,10 +261,12 @@ def fetch_market_data(tickers, lookback_days=DEFAULT_LOOKBACK_DAYS):
     return raw, close, high, low
 
 # ===== 押し目抽出（厳しい条件・LINE版踏襲） =====
+
 def _ema(s: pd.Series, span: int) -> pd.Series:
     return s.ewm(span=span, adjust=False, min_periods=span).mean()
 
 def _atr20(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    """ATR(20) = 20日EMA(TR)。TR=max(H-L, |H-PrevC|, |L-PrevC|)"""
     prev_close = close.shift(1)
     tr = pd.concat([
         (high - low).abs(),
@@ -276,10 +278,10 @@ def _atr20(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
 def _zigzag_last_swing_low(high: pd.Series, low: pd.Series, close: pd.Series,
                            thresh_pct: float, atr_mult: float) -> tuple[pd.Timestamp, float] | None:
     """
-    直近window内で意味のある“谷”を一つ返す（ZigZag風）。
-    ・直近の局所高値から thresh_pct 以上（or ATR20*atr_mult 以上）下落 → 安値確定
-    ・その後の反発で“谷”を確定
-    戻り値: (日付, 安値) / 見つからなければ None
+    直近window内で“意味のある谷（Swing Low）”を1つ返す（ZigZag風）
+    ・直近の局所高値から閾値（% または ATR20×mult）以上下落→谷候補確定
+    ・その後の上昇でピボット確定
+    戻り値: (安値日, 安値) / 見つからなければ None
     """
     atr20 = _atr20(high, low, close)
     pivot_high_idx = None
@@ -303,36 +305,41 @@ def _zigzag_last_swing_low(high: pd.Series, low: pd.Series, close: pd.Series,
             pivot_high_idx = i
 
     return last_swing_low
-def rolling_sma(series: pd.Series, window=SMA_WINDOW):
-    return series.rolling(window, min_periods=window).mean()
 
 def compute_one_ticker(close_s: pd.Series, high_s: pd.Series, low_s: pd.Series, window_days=60):
     """
-    押し目＝『上昇トレンド上での直近スイングロー（十分な深さ＋SMA25タッチ）からの反発』
+    新仕様：
+      ① 上昇トレンド（SMA25>SMA75、両者の傾き>=0）
+      ② 直近スイングロー（ZigZag風）を特定
+      ③ Peak→Lowの“深さ” 下限（% または ATR20×mult）
+      ④ Swing Low が SMA25 にタッチ（±SMA_TOUCH_TOL）or いったん割って即回復
+      ⑤ Low からの経過日数 >= DAYS_SINCE_LOW_MIN
+      ⑥ 反発率 REBOUND_MIN〜REBOUND_MAX
+    満たせば dict を返す。満たさなければ None。
     """
     if close_s is None or close_s.empty:
         return None
 
+    # 対象窓の切り出し（NaN落とし＆整列）
     close = close_s.dropna().iloc[-window_days:]
-    high  = high_s.reindex(close.index).fillna(method="ffill")
-    low   = low_s.reindex(close.index).fillna(method="ffill")
+    high  = high_s.reindex(close.index).ffill()
+    low   = low_s.reindex(close.index).ffill()
     if len(close) < max(30, window_days // 2):
         return None
 
+    # トレンド：SMA25 / SMA75 と傾き
     sma25 = close.rolling(25, min_periods=25).mean()
     sma75 = close.rolling(75, min_periods=75).mean()
     if sma25.isna().all() or sma75.isna().all():
         return None
-
-    # ④ 上昇トレンド必須
     if not (sma25.iloc[-1] > sma75.iloc[-1]):
         return None
-    slope25 = sma25.iloc[-1] - sma25.iloc[-6] if len(sma25.dropna()) >= 6 else 0.0
-    slope75 = sma75.iloc[-1] - sma75.iloc[-6] if len(sma75.dropna()) >= 6 else 0.0
+    slope25 = sma25.iloc[-1] - (sma25.iloc[-6] if len(sma25.dropna()) >= 6 else sma25.iloc[-1])
+    slope75 = sma75.iloc[-1] - (sma75.iloc[-6] if len(sma75.dropna()) >= 6 else sma75.iloc[-1])
     if slope25 <= 0 or slope75 < 0:
         return None
 
-    # ① 直近スイングロー
+    # 直近スイングロー（ZigZag）
     swing = _zigzag_last_swing_low(high, low, close, DEPTH_MIN_PCT, ATR20_MULT_MIN)
     if swing is None:
         return None
@@ -340,56 +347,64 @@ def compute_one_ticker(close_s: pd.Series, high_s: pd.Series, low_s: pd.Series, 
     if low_date not in close.index:
         return None
 
+    # Peak（low_date 以前の高値）
     before = close.loc[:low_date]
     if before.empty:
         return None
     peak_val = float(before.max())
     peak_date = before.idxmax()
 
-    # ② 押しの深さ検証
+    # 押しの深さ（%とATRの両条件）
     drop_pct = (peak_val - low_val) / peak_val if peak_val else 0.0
     if drop_pct < DEPTH_MIN_PCT:
         return None
     atr20 = _atr20(high, low, close)
-    atr_ok = (peak_val - low_val) >= (ATR20_MULT_MIN * float(atr20.loc[low_date] if low_date in atr20.index and pd.notna(atr20.loc[low_date]) else 0.0))
+    atr_ok = (peak_val - low_val) >= (ATR20_MULT_MIN * float(atr20.loc[low_date] if (low_date in atr20.index and pd.notna(atr20.loc[low_date])) else 0.0))
     if not atr_ok:
         return None
 
-    # ③ SMA25タッチ
-    sma25_at_low = float(sma25.loc[low_date]) if low_date in sma25.index and pd.notna(sma25.loc[low_date]) else None
+    # SMA25 タッチ（±許容 or 一時割れ→回復）
+    sma25_at_low = float(sma25.loc[low_date]) if (low_date in sma25.index and pd.notna(sma25.loc[low_date])) else None
     if sma25_at_low is None:
         return None
     touch_ok = abs(low_val - sma25_at_low) / sma25_at_low <= SMA_TOUCH_TOL or (low_val <= sma25_at_low <= float(close.iloc[-1]))
     if not touch_ok:
         return None
 
+    # 反発・経過日数
     latest = float(close.iloc[-1])
+    prev   = float(close.iloc[-2]) if len(close) >= 2 else np.nan
     days_since_low = (close.index[-1] - low_date).days
     if days_since_low < DAYS_SINCE_LOW_MIN:
         return None
-
     rebound_pct = (latest / low_val) - 1.0
     if not (REBOUND_MIN <= rebound_pct <= REBOUND_MAX):
         return None
 
+    # 目標値：Low以降の高値（無ければ窓内高値）
     after = close.loc[low_date:]
     target = float(after.max()) if not after.empty else float(close.max())
     expected_rise_pct = (target / latest - 1.0) * 100.0 if latest > 0 else None
 
+    # ← ここが重要：notify が参照するキー名に完全準拠
     return {
-        "Pullback_Date": low_date.to_pydatetime(),
-        "Pullback_Low": low_val,
-        "Peak_Date": peak_date.to_pydatetime(),
-        "Peak_High": peak_val,
-        "Latest_Close": latest,
-        "Expected_Upper": target,
-        "Expected_Rise_%": expected_rise_pct,
-        "Days_Since_Low": days_since_low,
-        "Window": window_days,
-        "SMA25": float(sma25.iloc[-1]) if pd.notna(sma25.iloc[-1]) else None,
-        "SMA75": float(sma75.iloc[-1]) if pd.notna(sma75.iloc[-1]) else None,
-        "Drop_%": drop_pct * 100.0,
-        "Rebound_%": rebound_pct * 100.0,
+        "Ticker": close_s.name,
+        "Peak_Date": peak_date.to_pydatetime().date(),
+        "Peak_High": round(peak_val, 2),
+        "Pullback_Date": low_date.to_pydatetime().date(),
+        "Pullback_Low": round(low_val, 2),
+        "Latest_Date": close.index[-1].to_pydatetime().date(),
+        "Latest_Close": round(latest, 2),
+        "Prev_Close": round(prev, 2) if not np.isnan(prev) else np.nan,
+        "Expected_Upper": round(target, 2),
+        "Expected_Rise_%": round(expected_rise_pct, 2) if expected_rise_pct is not None else np.nan,
+        # 参考情報（通知で使わないがデバッグ用）
+        "Drop_From_Peak_%": round(drop_pct * 100.0, 2),
+        "Rebound_From_Low_%": round(rebound_pct * 100.0, 2),
+        "Days_Since_Pullback": int(days_since_low),
+        "SMA25": round(float(sma25.iloc[-1]), 2) if pd.notna(sma25.iloc[-1]) else np.nan,
+        "SMA75": round(float(sma75.iloc[-1]), 2) if pd.notna(sma75.iloc[-1]) else np.nan,
+        "Window": int(window_days),
     }
 
 def find_pullback_candidates(close_df: pd.DataFrame, high_df: pd.DataFrame, low_df: pd.DataFrame, window_days=30):
