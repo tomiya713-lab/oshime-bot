@@ -458,7 +458,7 @@ def run_pipeline():
     tickers = load_tickers()
     raw, close, high, low = fetch_market_data(tickers, lookback_days=DEFAULT_LOOKBACK_DAYS)
 
-    # 60日・30日で抽出 → マージ（同一ティッカーは 'Return_%' が大きい方を採用）
+    # 60日・30日で抽出 → マージ（同一ティッカーは 'Expected_Rise_%' が大きい方を採用）
     rs = []
     for w in (60, 30):
         df = find_pullback_candidates(close, high, low, window_days=w)
@@ -469,8 +469,16 @@ def run_pipeline():
     if not rs:
         return pd.DataFrame(), raw, {}
 
-    cat = pd.concat(rs, ignore_index=True).sort_values(["Ticker", "Return_%"], ascending=[True, False])
-    best = cat.groupby("Ticker", as_index=False).first().sort_values("Return_%", ascending=False).reset_index(drop=True)
+    cat = (
+        pd.concat(rs, ignore_index=True)
+          .sort_values(["Ticker", "Expected_Rise_%"], ascending=[True, False])
+    )
+    best = (
+        cat.groupby("Ticker", as_index=False)
+           .first()
+           .sort_values("Expected_Rise_%", ascending=False)
+           .reset_index(drop=True)
+    )
     name_map = build_ticker_name_map(best["Ticker"].tolist())
     return best, raw, name_map
 
