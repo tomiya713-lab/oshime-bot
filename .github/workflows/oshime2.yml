@@ -23,6 +23,12 @@ jobs:
       group: oshime-bot-main2
       cancel-in-progress: true
 
+    # ★ ここでジョブ全体に環境変数を渡す
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}   # 任意。未設定なら空のままでOK
+      FORCE_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.force) && '1' || '' }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -40,25 +46,31 @@ jobs:
           pip install -r requirements.txt
           pip install mplfinance
 
+      # ★ Discord 用シークレットがジョブに渡っているかを確認（値はマスクされます）
       - name: Check envs
         run: |
-          test -n "${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}" || (echo "Missing LINE_CHANNEL_ACCESS_TOKEN" && exit 1)
-          test -n "${{ secrets.LINE_USER_ID }}" || (echo "Missing LINE_USER_ID" && exit 1)
-          test -n "${{ vars.PUBLIC_BASE_URL }}" || (echo "Missing PUBLIC_BASE_URL variable" && exit 1)
+          if [ -z "${DISCORD_WEBHOOK_URL}" ]; then
+            echo "ERROR: DISCORD_WEBHOOK_URL is EMPTY (Actions secrets not passed)"
+            exit 1
+          else
+            echo "OK: DISCORD_WEBHOOK_URL is present."
+          fi
+          if [ -n "${PUBLIC_BASE_URL}" ]; then
+            echo "INFO: PUBLIC_BASE_URL is set (optional)."
+          else
+            echo "INFO: PUBLIC_BASE_URL is empty (images will be sent as attachments)."
+          fi
 
       - name: Run main2.py
-        env:
-          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
-          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
-          PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}
-          FORCE_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.force) && '1' || '' }}
         run: python main2.py
 
-      # charts/ を Pages で公開
+      # charts/ を Pages で公開（画像URL埋め込みを使う場合のみ有効）
       - name: Upload Pages artifact
+        if: hashFiles('charts/**') != ''
         uses: actions/upload-pages-artifact@v3
         with:
           path: charts
 
       - name: Deploy to GitHub Pages
+        if: hashFiles('charts/**') != ''
         uses: actions/deploy-pages@v4
