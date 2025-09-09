@@ -16,8 +16,8 @@ ATR20_MULT_MIN     = float(os.getenv("ATR20_MULT_MIN", "1.0"))  # Peak→Low の
 SMA_TOUCH_TOL      = float(os.getenv("SMA_TOUCH_TOL", "0.02"))  # SMA25 へのタッチ許容 ±2%
 DAYS_SINCE_LOW_MIN = int(os.getenv("DAYS_SINCE_LOW_MIN", "3"))  # Low からの経過最小日数
 TZ_OFFSET = 9  # JST
-REBOUND_MIN = 1.0       # 反発率 >= 1%
-REBOUND_MAX = 4.0       # 反発率 <= 4%
+REBOUND_MIN = 0.01       # 反発率 >= 1%
+REBOUND_MAX = 0.04       # 反発率 <= 4%
 DROP_MAX = 15.0         # ピークからの許容下落率 <= 15%
 DAYS_SINCE_MIN = 2      # 押し目から最新までの営業日数 >= 2
 EXPECTED_RISE_MIN = 3.0 # 期待上昇率 >= 3%
@@ -416,7 +416,7 @@ def find_pullback_candidates(close_df: pd.DataFrame, high_df: pd.DataFrame, low_
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
-    df = df.sort_values("Return_%", ascending=False).reset_index(drop=True)
+    df = df.sort_values("Expected_Rise_%", ascending=False).reset_index(drop=True)
     return df
 
 # ===== チャート画像作成（踏襲） =====
@@ -469,16 +469,16 @@ def run_pipeline():
     if not rs:
         return pd.DataFrame(), raw, {}
 
-    cat = (
-        pd.concat(rs, ignore_index=True)
-          .sort_values(["Ticker", "Expected_Rise_%"], ascending=[True, False])
-    )
-    best = (
-        cat.groupby("Ticker", as_index=False)
-           .first()
-           .sort_values("Expected_Rise_%", ascending=False)
-           .reset_index(drop=True)
-    )
+cat = (
+    pd.concat(rs, ignore_index=True)
+      .sort_values(["Ticker", "Expected_Rise_%"], ascending=[True, False])
+)
+best = (
+    cat.groupby("Ticker", as_index=False)
+       .first()
+       .sort_values("Expected_Rise_%", ascending=False)
+       .reset_index(drop=True)
+)
     name_map = build_ticker_name_map(best["Ticker"].tolist())
     return best, raw, name_map
 
