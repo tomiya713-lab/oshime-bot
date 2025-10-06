@@ -10,23 +10,38 @@ import pandas as pd
 import yfinance as yf
 import mplfinance as mpf
 
-# ===== 設定（必要に応じて変更） =====
 TZ_OFFSET = 9  # JST
-REBOUND_MIN = 1.0       # 反発率 >= 1%
-REBOUND_MAX = 4.0       # 反発率 <= 4%
-DROP_MAX = 15.0         # ピークからの許容下落率 <= 15%
-DAYS_SINCE_MIN = 2      # 押し目から最新までの営業日数 >= 2
-EXPECTED_RISE_MIN = 3.0 # 期待上昇率 >= 3%
+
+# --- STEP4: 抽出ロジックの閾値（最終決定） ---
+DROP_MAX = 15.0               # ピークからの許容下落率 ≤ 15%
+EXPECTED_RISE_MIN = 3.0       # Return_%（ピークまでの上昇余地）≥ 3%
+WITHIN_UPPER = 1.02           # 押し目安値の +2%（帯上限）
+EXP_OR = 5.0                  # OR条件：Return_% ≥ 5% で通過
+WEEKLY_MA2_FILTER = True      # 週足MA(2)が下向きなら除外
+WEEKLY_RESAMPLE = "W-FRI"     # 週足は金曜終値でリサンプル
+
+# --- 通過理由ラベル（Discord通知用） ---
+PASS_REASON_BAND = "帯内合致"
+PASS_REASON_EXP  = "Return_≥5%"
+
+# --- チャート等の描画で利用（選定条件には不使用） ---
 SMA_WINDOW = 25
-TOP_N = 15              # 送信上限
+
+# --- 通知/取得まわり ---
+TOP_N = 15  # 送信上限
 DEFAULT_LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "180"))
 
+
 # ===== Discord Webhook =====
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+DISCORD_ENABLED = bool(DISCORD_WEBHOOK_URL)
 
 if not DISCORD_WEBHOOK_URL:
-    print("[ERROR] Set DISCORD_WEBHOOK_URL env.", file=sys.stderr)
+    # 通知はスキップ可能に（他処理は続行）
+    print("[WARN] DISCORD_WEBHOOK_URL not set — skipping Discord notification.", file=sys.stderr)
+
 
 # ===== ユーティリティ =====
 def now_jst():
@@ -257,15 +272,40 @@ def fetch_market_data(tickers, lookback_days=DEFAULT_LOOKBACK_DAYS):
     return raw, close, high, low
 
 # ===== 押し目抽出（厳しい条件・LINE版踏襲） =====
+
 def rolling_sma(series: pd.Series, window=SMA_WINDOW):
+    # （描画等で使用。選定条件には不使用）
     return series.rolling(window, min_periods=window).mean()
 
+def _weekly_ma2_is_down(close_s: pd.Series) -> bool:
+    """
+    週足（W-FRI）終値→2週SMAを作成し、直近MA2 < 1週前MA2 なら“下向き”。
+    データ不足やNaNがある場合は False（除外しない）として扱う。
+    """
+    s = close_s.dropna().resample(WEEKLY_RESAMPLE).last()
+    if len(s) < 3:
+        return False
+    ma2 = s.rolling(2, min_periods=2).mean()
+    last = ma2.iloc[-1]
+    prev = ma2.iloc[-2]
+    if np.isnan(last) or np.isnan(prev):
+        return False
+    return bool(last < prev)
+
 def compute_one_ticker(close_s: pd.Series, high_s: pd.Series, low_s: pd.Series, window_days=60):
+    """
+    STEP4 最終ロジック：
+      ベース: Drop≤15%, Return_%≥3%
+      除外   : latest == pull_low
+      採用   : (pull_low < latest ≤ pull_low*WITHIN_UPPER)  or  (Return_% ≥ EXP_OR)
+      週足   : 2週SMAが下向きなら除外
+    返却に通過理由 'Pass_Reason'（「帯内合致」or「Return_≥5%」）を付与。
+    """
     try:
         close_s = close_s.dropna()
-        high_s = high_s.reindex_like(close_s).dropna()
-        low_s  = low_s.reindex_like(close_s).dropna()
-        if len(close_s) < max(SMA_WINDOW, window_days) + 2:
+        high_s  = high_s.reindex_like(close_s).dropna()
+        low_s   = low_s.reindex_like(close_s).dropna()
+        if len(close_s) < window_days + 2:
             return None
 
         # 対象期間
@@ -279,35 +319,41 @@ def compute_one_ticker(close_s: pd.Series, high_s: pd.Series, low_s: pd.Series, 
         peak_idx = look_high.idxmax()
         peak_val = float(look_high.loc[peak_idx])
 
-        # ピーク後の最安値（なければ除外）
+        # ピーク後の最安値（押し目）
         after_peak = look_low.loc[look_low.index > peak_idx]
         if after_peak.empty:
             return None
         pull_idx = after_peak.idxmin()
         pull_val = float(after_peak.loc[pull_idx])
 
+        # 最新
         latest_idx = close_s.index[-1]
         latest_val = float(close_s.iloc[-1])
-        prev_val = float(close_s.iloc[-2]) if len(close_s) >= 2 else np.nan
+        prev_val   = float(close_s.iloc[-2]) if len(close_s) >= 2 else np.nan
 
-        sma25 = float(rolling_sma(close_s).iloc[-1]) if len(close_s) >= SMA_WINDOW else np.nan
-
-        rebound_pct = (latest_val / pull_val - 1.0) * 100.0
+        # 指標
         drop_pct = (1.0 - latest_val / peak_val) * 100.0
-        expected_upper = peak_val
-        expected_rise_pct = (expected_upper / latest_val - 1.0) * 100.0
-        days_since_pull = (close_s.index.get_loc(latest_idx) - close_s.index.get_loc(pull_idx))
+        expected_rise_pct = (peak_val / latest_val - 1.0) * 100.0
+        delta_from_pull_pct = (latest_val / pull_val - 1.0) * 100.0
 
-        conds = [
-            rebound_pct >= REBOUND_MIN,
-            rebound_pct <= REBOUND_MAX,
-            drop_pct <= DROP_MAX,
-            days_since_pull >= DAYS_SINCE_MIN,
-            not math.isnan(sma25) and latest_val >= sma25,
-            expected_rise_pct >= EXPECTED_RISE_MIN,
-            latest_val >= pull_val,
-        ]
-        if not all(conds):
+        # グローバル除外：押し目と完全一致
+        if np.isclose(latest_val, pull_val, rtol=0.0, atol=1e-6):
+            return None
+
+        # OR条件
+        within_band = (latest_val > pull_val) and (latest_val <= pull_val * WITHIN_UPPER)
+        pass_reason = None
+        if within_band:
+            pass_reason = PASS_REASON_BAND
+        elif expected_rise_pct >= EXP_OR:
+            pass_reason = PASS_REASON_EXP
+
+        # ベース条件 + OR成立
+        if not (drop_pct <= DROP_MAX and expected_rise_pct >= EXPECTED_RISE_MIN and pass_reason is not None):
+            return None
+
+        # 週足MA(2)フィルター
+        if WEEKLY_MA2_FILTER and _weekly_ma2_is_down(close_s):
             return None
 
         return {
@@ -320,12 +366,12 @@ def compute_one_ticker(close_s: pd.Series, high_s: pd.Series, low_s: pd.Series, 
             "Latest_Close": round(latest_val, 2),
             "Prev_Close": round(prev_val, 2) if not np.isnan(prev_val) else np.nan,
             "Return_%": round(expected_rise_pct, 2),
-            "Rebound_From_Low_%": round(rebound_pct, 2),
             "Drop_From_Peak_%": round(drop_pct, 2),
-            "Days_Since_Pullback": int(days_since_pull),
-            "SMA25": round(sma25, 2) if not math.isnan(sma25) else np.nan,
-            "Expected_Upper": round(expected_upper, 2),
-            "Expected_Rise_%": round(expected_rise_pct, 2),
+            "Delta_from_Pull_%": round(delta_from_pull_pct, 2),
+            "Within_(pull, +2%]": within_band,
+            "OR_Return_ge_5%": expected_rise_pct >= EXP_OR,
+            "Pass_Reason": pass_reason,  # 「帯内合致」 or 「Return_≥5%」
+            "Window": window_days,
         }
     except Exception as e:
         print(f"[WARN] compute_one_ticker failed for {close_s.name}: {e}", file=sys.stderr)
@@ -340,8 +386,10 @@ def find_pullback_candidates(close_df: pd.DataFrame, high_df: pd.DataFrame, low_
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
+    # Return_%（ピークまでの上昇余地）が大きい順
     df = df.sort_values("Return_%", ascending=False).reset_index(drop=True)
     return df
+
 
 # ===== チャート画像作成（踏襲） =====
 def save_chart_image_from_raw(raw_df, ticker: str, out_dir="charts"):
@@ -399,70 +447,154 @@ def run_pipeline():
     return best, raw, name_map
 
 # ===== 通知（Discord版） =====
+
 def notify(best_df: pd.DataFrame, raw_df, ticker_name_map: dict, top_n=TOP_N):
+    """
+    STEP4最終ロジックに対応したDiscord通知。
+      ・各銘柄に通過理由 [帯内合致] / [Return_≥5%] を表示
+      ・ヘッダーの条件表記を新ルールに更新
+    """
     if best_df is None or best_df.empty:
         discord_send_content("【押し目スクリーニング】本日は抽出なしでした。")
         return
 
+    # 新ルールの説明に更新
     header = (
         f"★★★★★【押し目】★★★★★ {now_jst().strftime('%m/%d %H:%M')}\n"
         f"抽出: {len(best_df)} 銘柄（重複統合）\n"
-        f"条件: {REBOUND_MAX:.0f}%≥反発≥{REBOUND_MIN:.0f}%・下落≤{DROP_MAX:.0f}%・SMA25上・期待≥{EXPECTED_RISE_MIN:.0f}%・{DAYS_SINCE_MIN}日経過\n"
+        f"条件: 下落≤{DROP_MAX:.0f}%・Return≥{EXPECTED_RISE_MIN:.0f}%・"
+        f"（帯内: +2%以内 or Return≥{EXP_OR:.0f}%）・"
+        f"=押し目は除外・週足MA(2)下向きは除外\n"
         f"------------------------------"
     )
     send_long_text(header)
 
-    for _, r in best_df.head(top_n).iterrows():
+    # 互換性確保：必要列が無ければフォールバック作成
+    cols_needed = [
+        "Ticker", "Return_%", "Drop_From_Peak_%", "Delta_from_Pull_%",
+        "Window", "Pass_Reason", "Pullback_Date", "Latest_Close",
+        "Pullback_Low", "Prev_Close", "Within_(pull, +2%]", "OR_Return_ge_5%"
+    ]
+    for c in cols_needed:
+        if c not in best_df.columns:
+            best_df[c] = np.nan if c not in ("Ticker", "Pass_Reason") else ""
+
+    def fnum(x):
+        try: return f"{float(x):,.0f}"
+        except: return "-"
+
+    def fpct(x, digits=1):
+        try:
+            v = float(x)
+            if not np.isfinite(v): return "-"
+            return f"{v:.{digits}f}%"
+        except:
+            return "-"
+
+    def pass_reason_of(row) -> str:
+        # 優先的に新列を使い、無ければブール列で代替判断
+        reason = str(row.get("Pass_Reason") or "").strip()
+        if reason:
+            return reason
+        try:
+            if bool(row.get("Within_(pull, +2%]")):
+                return PASS_REASON_BAND  # 「帯内合致」
+            if bool(row.get("OR_Return_ge_5%")):
+                return PASS_REASON_EXP   # 「Return_≥5%」
+        except Exception:
+            pass
+        return "—"
+
+    lines = []
+    head = best_df.sort_values("Return_%", ascending=False).head(top_n)
+    for _, r in head.iterrows():
         ticker = str(r["Ticker"])
         name = ticker_name_map.get(ticker, "")
-        upper  = r.get("Expected_Upper")
+        reason = pass_reason_of(r)
+
         latest = r.get("Latest_Close")
         low    = r.get("Pullback_Low")
-        rise_p = r.get("Expected_Rise_%")
         prev   = r.get("Prev_Close")
+        pull_d = r.get("Pullback_Date")
+        pull_str = pull_d.strftime("%m/%d") if hasattr(pull_d, "strftime") else "-"
 
+        # 行の体裁：ティッカー 名称 [理由] 指標…
+        line = (
+            f"{ticker:<8} {name}  [{reason}]  "
+            f"Return%: {fpct(r.get('Return_%'))}  "
+            f"Drop%: {fpct(r.get('Drop_From_Peak_%'))}  "
+            f"ΔPull%: {fpct(r.get('Delta_from_Pull_%'))}  "
+            f"Win: {int(r.get('Window') or 0)}d  "
+            f"Pull: {pull_str}"
+        )
+        lines.append(line)
+
+    body = "\n".join(lines)
+    send_long_text(body)
+
+
+    # ─────────────────────────────────────────────────────────
+    # チャート画像（Embed）— 新ロジック用（TOP_N分）
+    # ※旧ブロック（5行テキスト＋画像送信）は削除してください
+    # ─────────────────────────────────────────────────────────
+    for _, r in head.iterrows():
+        ticker = str(r["Ticker"])
+        name = ticker_name_map.get(ticker, "")
+        reason = pass_reason_of(r)
+
+        # 数値の取り出し（新ロジックの列に合わせて）
+        peak   = r.get("Peak_High")
+        latest = r.get("Latest_Close")
+        low    = r.get("Pullback_Low")
+        pull_d = r.get("Pullback_Date")
+        pull_str = pull_d.strftime("%m/%d") if hasattr(pull_d, "strftime") else "-"
+
+        # 参考メトリクス
         def fnum(x):
             try: return f"{float(x):,.0f}"
             except: return "-"
-        def fpct(x):
-            try: return f"{float(x):.1f}%"
-            except: return "-"
-        def fpct_signed(x):
+        def fpct(x, digits=1):
             try:
-                x = float(x)
-                if not np.isfinite(x): return "-"
-                return f"{x:+.1f}%"
+                v = float(x)
+                if not np.isfinite(v): return "-"
+                return f"{v:.{digits}f}%"
             except:
                 return "-"
 
-        expect_amt = (float(upper) - float(latest)) if pd.notna(upper) and pd.notna(latest) else None
-        chg_pct = ((float(latest) / float(prev)) - 1.0) * 100.0 if (pd.notna(latest) and pd.notna(prev) and float(prev) != 0.0) else None
-        bot_pct = ((float(latest) / float(low)) - 1.0) * 100.0 if (pd.notna(latest) and pd.notna(low) and float(low) != 0.0) else None
+        # 期待金額（ピーク－最新）
+        expect_amt = None
+        try:
+            if pd.notna(peak) and pd.notna(latest):
+                expect_amt = float(peak) - float(latest)
+        except Exception:
+            pass
 
-        pull_date = r.get("Pullback_Date")
-        pull_str = pull_date.strftime("%m/%d") if hasattr(pull_date, "strftime") else "-"
+        # RSI（必要なければこの2行は外してOK）
         rsi_val = latest_rsi_from_raw(raw_df, ticker, period=14)
         rsi_str = "-" if rsi_val is None or not np.isfinite(rsi_val) else f"{rsi_val:.0f}"
 
-        # テキスト 5行（content）
-        line1 = f"{ticker} {name}".rstrip()
-        line2 = f"底日 {pull_str}"
-        line3 = f"↗ {fpct(rise_p)}   🎯 上 {fnum(upper)}   下 {fnum(low)}"
-        line4 = f"今 {fnum(latest)}   🎯 期待 {fnum(expect_amt)}  RSI {rsi_str}"
-        line5 = f"変動率 {fpct_signed(chg_pct)}   底値比較 {fpct_signed(bot_pct)}"
-        msg = "\n".join([line1, line2, line3, line4, line5])
-        send_long_text(msg)
-
-        # チャート画像（Embed or 添付）
+        # チャート画像作成（既存のヘルパーを利用）
         img_path = save_chart_image_from_raw(raw_df, ticker, out_dir="charts")
-        title = f"{ticker} {name}".strip()
-        desc = f"Window: best / 期待上昇 {fpct(rise_p)}"
+
+        # Embedのタイトルと説明
+        title = f"{ticker} {name} [{reason}]".strip()
+        desc = (
+            f"Win: {int(r.get('Window') or 0)}d  "
+            f"Return%: {fpct(r.get('Return_%'))}  "
+            f"Drop%: {fpct(r.get('Drop_From_Peak_%'))}  "
+            f"ΔPull%: {fpct(r.get('Delta_from_Pull_%'))}  "
+            f"RSI: {rsi_str}"
+        )
+
+        # 追加フィールド（Pull/Latest/Target を並べる）
         fields = [
             {"name": "Pullback", "value": f"{pull_str}", "inline": True},
             {"name": "Latest",   "value": f"{fnum(latest)}", "inline": True},
-            {"name": "Target",   "value": f"{fnum(upper)}",  "inline": True},
+            {"name": "Target",   "value": f"{fnum(peak)}",  "inline": True},
+            {"name": "Expect",   "value": f"{fnum(expect_amt)}", "inline": True},
         ]
 
+        # 画像付きで送信（PUBLIC_BASE_URL があればURL埋め込み、なければファイル添付）
         if img_path:
             if PUBLIC_BASE_URL:
                 public_url = f"{PUBLIC_BASE_URL}/{os.path.basename(img_path)}"
@@ -470,23 +602,20 @@ def notify(best_df: pd.DataFrame, raw_df, ticker_name_map: dict, top_n=TOP_N):
                     title=title,
                     description=desc,
                     image_url=public_url,
-                    fields=fields,
                 )
             else:
-                # URLなしでも画像をDiscordに直接添付して送る
                 discord_send_image_file(
                     file_path=img_path,
                     title=title,
                     description=desc,
-                    fields=fields,
                 )
         else:
             # 画像が作れなかった場合はテキストのみEmbed
             discord_send_embed(
                 title=title,
                 description=desc,
-                fields=fields,
             )
+
 
 def main():
     now = now_jst()
