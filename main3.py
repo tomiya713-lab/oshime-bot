@@ -3,6 +3,8 @@ import os
 import sys
 import json
 import math
+import time
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
 import requests
 import numpy as np
@@ -165,6 +167,40 @@ def latest_rsi_from_raw(raw_df, ticker: str, period: int = 14):
         return None
 
 # ===== Discord送信 =====
+def _normalize_webhook_url(url: str) -> str:
+    return (
+        url.replace("canary.discord.com", "discord.com")
+           .replace("ptb.discord.com", "discord.com")
+           .replace("discordapp.com", "discord.com")
+    )
+
+def _post_with_retry(url, *, json=None, files=None, data=None, headers=None,
+                     timeout=30, max_attempts=4, backoff_base=1.0):
+    import requests, time
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = requests.post(url, json=json, files=files, data=data,
+                              headers=headers, timeout=timeout)
+            if r.status_code == 429:
+                try:
+                    wait = float(r.headers.get("Retry-After") or r.json().get("retry_after") or 1.0)
+                except Exception:
+                    wait = 1.0
+                time.sleep(max(wait, 1.0))
+                continue
+            if 500 <= r.status_code < 600:
+                time.sleep(backoff_base * (2 ** (attempt - 1)))
+                continue
+            return r
+        except Exception as e:
+            last_exc = e
+            time.sleep(backoff_base * (2 ** (attempt - 1)))
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Discord request failed after retries.")
+
+
 def discord_send_content(msg: str):
     r = requests.post(
         DISCORD_WEBHOOK_URL,
