@@ -1,4 +1,4 @@
-name: Run Oshime Bot (main3)
+name: Run RSI Bot (main_rsi)
 
 on:
   # 手動実行（任意）
@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
-      group: oshime-bot-main3
+      group: oshime-bot-main_rsi
       cancel-in-progress: true   # ← 古い実行をキャンセルして最新のみ実行
 
     steps:
@@ -44,4 +44,4 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force && '1' || '' }}
-        run: python main3.py
+        run: python main_rsi.py
