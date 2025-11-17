@@ -7,6 +7,13 @@ import pandas as pd
 import yfinance as yf
 import requests
 
+# チャート用
+try:
+    import mplfinance as mpf
+    MPF_AVAILABLE = True
+except ImportError:
+    MPF_AVAILABLE = False
+
 # ===== タイムゾーン／環境変数 =====
 TZ_OFFSET = 9  # JST
 
@@ -24,12 +31,20 @@ ROC_PERIOD = 10
 RSI_THRESHOLD = 28.0      # RSI(14) ≤ 28
 ROC_THRESHOLD = -10.0     # ROC(10) ≤ -10%
 
+# チャート設定
+CHART_OUT_DIR = "charts"
+CHART_LOOKBACK_DAYS = 90   # 直近◯営業日分を描画
+CHART_TOP_N = 8            # 画像を出す最大銘柄数
+
+
 # ===== ユーティリティ =====
 def now_jst() -> datetime:
     return datetime.utcnow() + timedelta(hours=TZ_OFFSET)
 
+
 def is_weekend(dt: datetime) -> bool:
     return dt.weekday() >= 5  # 5=Sat, 6=Sun
+
 
 def chunk_text(text: str, limit: int = 1900):
     """Discord 2000文字制限対策。行単位で分割。"""
@@ -45,6 +60,7 @@ def chunk_text(text: str, limit: int = 1900):
     if buf:
         out.append("\n".join(buf))
     return out
+
 
 # ===== Discord 送信 =====
 def discord_send_content(msg: str):
@@ -66,13 +82,47 @@ def discord_send_content(msg: str):
     except Exception as e:
         print(f"[WARN] Discord post exception: {e}", file=sys.stderr)
 
+
+def discord_send_image_file(file_path: str, title: str, description: str | None = None):
+    """画像ファイルを添付して送信（外部URL不要）。"""
+    if not DISCORD_ENABLED:
+        print(f"[INFO] (image not sent) {title}: {file_path}", file=sys.stderr)
+        return
+
+    filename = os.path.basename(file_path)
+    embed = {
+        "title": title,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+    if description:
+        embed["description"] = description
+    # 添付ファイルは attachment://<filename> で参照する
+    embed["image"] = {"url": f"attachment://{filename}"}
+
+    try:
+        with open(file_path, "rb") as f:
+            files = {"file": (filename, f, "image/png")}
+            data = {"payload_json": json_dumps({"embeds": [embed]})}
+            r = requests.post(DISCORD_WEBHOOK_URL, files=files, data=data, timeout=30)
+            if r.status_code >= 300:
+                print(f"[WARN] Discord image upload failed: {r.status_code} {r.text}", file=sys.stderr)
+    except Exception as e:
+        print(f"[WARN] Discord image send exception: {e}", file=sys.stderr)
+
+
+def json_dumps(obj) -> str:
+    import json
+    return json.dumps(obj, ensure_ascii=False)
+
+
 def send_long_text(msg: str):
     for part in chunk_text(msg):
         discord_send_content(part)
 
+
 # ===== ティッカー一覧 =====
 
-# フォールバックとして日経225ティッカー（必要に応じて調整可）
+# フォールバックとして日経225ティッカー
 NIKKEI225_TICKERS = [
     '4151.T','4502.T','4503.T','4506.T','4507.T','4519.T','4523.T','4568.T','4578.T',
     '6479.T','6501.T','6503.T','6504.T','6506.T','6526.T','6594.T','6645.T','6674.T',
@@ -110,8 +160,13 @@ TICKER_NAME_MAP = {
     "8035.T": "東エレク",
     "9983.T": "ファストリ",
     "9984.T": "SBG",
-    # …必要に応じて追加
+    "3436.T": "SUMCO",
+    "7004.T": "日立造船",
+    "7012.T": "川重",
+    "5233.T": "太平洋セメ",
+    # 必要に応じて増やしてOK
 }
+
 
 def load_tickers():
     if TICKERS_CSV and os.path.exists(TICKERS_CSV):
@@ -126,6 +181,7 @@ def load_tickers():
             if tickers:
                 return tickers
     return NIKKEI225_TICKERS
+
 
 # ===== yfinance データ取得 & RSI/ROC 計算 =====
 def fetch_market_data(tickers, lookback_days=LOOKBACK_DAYS):
@@ -143,6 +199,7 @@ def fetch_market_data(tickers, lookback_days=LOOKBACK_DAYS):
         threads=True,
     )
     return raw
+
 
 def latest_rsi_from_raw(raw_df: pd.DataFrame, ticker: str, period: int = RSI_PERIOD):
     """raw_df から指定ティッカーの終値で RSI を算出し、直近値を返す。"""
@@ -164,6 +221,7 @@ def latest_rsi_from_raw(raw_df: pd.DataFrame, ticker: str, period: int = RSI_PER
     except Exception:
         return None
 
+
 def latest_roc_from_raw(raw_df: pd.DataFrame, ticker: str, period: int = ROC_PERIOD):
     """raw_df から指定ティッカーの終値で ROC(period) [%] を算出し、直近値を返す。"""
     try:
@@ -177,6 +235,49 @@ def latest_roc_from_raw(raw_df: pd.DataFrame, ticker: str, period: int = ROC_PER
         return float(roc.iloc[-1])
     except Exception:
         return None
+
+
+# ===== チャート生成 =====
+def save_chart_image_from_raw(raw_df: pd.DataFrame, ticker: str, out_dir: str = CHART_OUT_DIR):
+    """yfinanceのrawデータから対象ティッカーのローソク＋移動平均チャートをPNG保存。"""
+    if not MPF_AVAILABLE:
+        return None
+
+    need_cols = ["Open", "High", "Low", "Close", "Volume"]
+    try:
+        if isinstance(raw_df.columns, pd.MultiIndex):
+            use = raw_df.loc[:, [(c, ticker) for c in need_cols]].copy()
+            use.columns = need_cols
+        else:
+            # 単一ティッカー想定
+            use = raw_df[need_cols].copy()
+    except Exception:
+        return None
+
+    use = use.dropna()
+    if use.empty:
+        return None
+
+    # 直近数十日分に絞る
+    use = use.tail(CHART_LOOKBACK_DAYS)
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{ticker}.png")
+
+    try:
+        mpf.plot(
+            use,
+            type="candle",
+            mav=(5, 25, 75),
+            volume=True,
+            style="yahoo",
+            savefig=dict(fname=out_path, dpi=140, bbox_inches="tight"),
+        )
+        return out_path
+    except Exception as e:
+        print(f"[WARN] mplfinance plot failed for {ticker}: {e}", file=sys.stderr)
+        return None
+
 
 # ===== シグナル判定 & 通知 =====
 def screen_rsi_roc(raw_df: pd.DataFrame, tickers):
@@ -202,7 +303,9 @@ def screen_rsi_roc(raw_df: pd.DataFrame, tickers):
     df = df.sort_values(["RSI14", "ROC10"]).reset_index(drop=True)
     return df
 
-def notify(df: pd.DataFrame):
+
+def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
+    # --- テキスト部 ---
     if df is None or df.empty:
         msg = (
             f"【RSI×ROCスクリーニング】{now_jst():%m/%d %H:%M}\n"
@@ -238,6 +341,23 @@ def notify(df: pd.DataFrame):
     msg = "\n".join(lines)
     send_long_text(msg)
 
+    # --- チャート画像部 ---
+    if not MPF_AVAILABLE:
+        print("[INFO] mplfinance not installed; charts will not be generated.", file=sys.stderr)
+        return
+
+    top = df.head(CHART_TOP_N)
+    for _, r in top.iterrows():
+        t = r["Ticker"]
+        name = TICKER_NAME_MAP.get(t, "")
+        title = f"{t} {name}".strip()
+        desc = f"RSI14: {fp(r['RSI14'],1)}  ROC10: {fp(r['ROC10'],1)}%"
+
+        img_path = save_chart_image_from_raw(raw_df, t, out_dir=CHART_OUT_DIR)
+        if img_path:
+            discord_send_image_file(img_path, title=title, description=desc)
+
+
 # ===== メイン =====
 def main():
     now = now_jst()
@@ -248,7 +368,8 @@ def main():
     tickers = load_tickers()
     raw = fetch_market_data(tickers, lookback_days=LOOKBACK_DAYS)
     df = screen_rsi_roc(raw, tickers)
-    notify(df)
+    notify(df, raw)
+
 
 if __name__ == "__main__":
     main()
