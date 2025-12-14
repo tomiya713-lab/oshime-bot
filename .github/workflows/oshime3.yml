@@ -44,5 +44,6 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force && '1' || '' }}
-        run: python main_rsi.py
-             python GC_MACD_BB.py
+        run: |
+          python main_rsi.py
+          python GC_MACD_BB.py
