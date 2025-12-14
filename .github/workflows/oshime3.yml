@@ -47,3 +47,4 @@ jobs:
         run: |
           python main_rsi.py
           python GC_MACD_BB.py
+          python ATR_swing_5pct.py
