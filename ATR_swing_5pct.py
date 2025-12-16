@@ -26,8 +26,12 @@ DISCORD_ENABLED = bool(DISCORD_WEBHOOK_URL)
 FORCE_RUN = os.getenv("FORCE_RUN", "0") == "1"
 
 # ★ 抽出ロジック用パラメータ（ここだけロジック関連）
-ATR_MIN_PCT = 5.0        # ATR20_pct >= 5%
-WEEK_RET_MIN = 0.0       # 5営業日前比リターン >= 0
+# --- A（バランス型）：+3% 指値が刺さりやすい “高値側のクセ”も加味 ---
+ATR_MIN_PCT = 4.5               # ATR20_pct >= 4.5%
+UPPER_ATR_MIN_PCT = 2.0         # Upper_ATR20_pct >= 2.0%
+HIGH_REACH_RATIO_MIN = 0.50     # HighReachRatio20(3%) >= 50%（=0.50）
+WEEK_RET_MIN = 0.0              # 5営業日前比リターン >= 0
+REACH_PCT = 3.0                 # 高値到達判定の閾値（前日終値×(1+3%)）
 
 # チャート設定（GC_MACD_BB と同じ）
 CHART_OUT_DIR = "charts"
@@ -239,11 +243,15 @@ def fetch_market_data(tickers, lookback_days=LOOKBACK_DAYS):
     return raw
 
 
-# ===== 抽出ロジック：ATR≥5％ ＆ 週足非マイナス =====
+# ===== 抽出ロジック：A（バランス型） =====
 def latest_atr_swing_from_raw(raw_df: pd.DataFrame, ticker: str):
     """
-    ロジック：
+    ロジック（A: バランス型）：
       - ATR20_pct >= ATR_MIN_PCT
+      - Upper_ATR20_pct >= UPPER_ATR_MIN_PCT
+      - HighReachRatio20(3%) >= HIGH_REACH_RATIO_MIN
+         * HighReach = (当日高値 >= 前日終値 * (1 + REACH_PCT/100))
+         * Ratio20 = 過去20営業日の HighReach 成立比率
       - 5営業日前比リターン >= WEEK_RET_MIN
     を最新日で判定し、指標を返す。
     """
@@ -259,11 +267,13 @@ def latest_atr_swing_from_raw(raw_df: pd.DataFrame, ticker: str):
             high = raw_df["High"].reindex(close.index)
             low = raw_df["Low"].reindex(close.index)
 
-        if len(close) < 25:  # ATR20用に最低限
+        # 必要期間（ATR20 + Reach20 + 週足判定5）を考慮して余裕を持たせる
+        if len(close) < 50:
             return None
 
-        # --- ATR20 の計算 ---
         prev_close = close.shift(1)
+
+        # --- ATR20（True Rangeベース）---
         tr1 = high - low
         tr2 = (high - prev_close).abs()
         tr3 = (low - prev_close).abs()
@@ -272,19 +282,46 @@ def latest_atr_swing_from_raw(raw_df: pd.DataFrame, ticker: str):
         atr20 = tr.rolling(window=20, min_periods=20).mean()
         atr20_pct = atr20 / close * 100.0
 
+        # --- Upper_ATR20（高値側の動き：上ヒゲ/ギャップ上方向を重視）---
+        upper_tr1 = high - close
+        upper_tr2 = (high - prev_close).abs()
+        upper_tr = pd.concat([upper_tr1, upper_tr2], axis=1).max(axis=1)
+
+        upper_atr20 = upper_tr.rolling(window=20, min_periods=20).mean()
+        upper_atr20_pct = upper_atr20 / close * 100.0
+
+        # --- HighReachRatio20(3%) ---
+        target_mult = 1.0 + (REACH_PCT / 100.0)
+        reach = (high >= prev_close * target_mult).astype(float)
+        high_reach_ratio20 = reach.rolling(window=20, min_periods=20).mean()
+
         # --- 週足がマイナスじゃない（5営業日前比で非マイナス） ---
         close_5ago = close.shift(5)
         week_ret = close / close_5ago - 1.0
 
-        atr_ok = atr20_pct.iloc[-1] >= ATR_MIN_PCT
-        week_ok = week_ret.iloc[-1] >= WEEK_RET_MIN
+        # 最新値
+        atr_v = atr20_pct.iloc[-1]
+        upper_atr_v = upper_atr20_pct.iloc[-1]
+        reach_v = high_reach_ratio20.iloc[-1]
+        week_v = week_ret.iloc[-1]
 
-        ok = bool(atr_ok and week_ok)
+        # NaNガード
+        if np.isnan(atr_v) or np.isnan(upper_atr_v) or np.isnan(reach_v) or np.isnan(week_v):
+            return None
+
+        atr_ok = atr_v >= ATR_MIN_PCT
+        upper_ok = upper_atr_v >= UPPER_ATR_MIN_PCT
+        reach_ok = reach_v >= HIGH_REACH_RATIO_MIN
+        week_ok = week_v >= WEEK_RET_MIN
+
+        ok = bool(atr_ok and upper_ok and reach_ok and week_ok)
 
         return {
             "ok": ok,
-            "ATR20_pct": float(atr20_pct.iloc[-1]),
-            "WeekRet": float(week_ret.iloc[-1]) if not np.isnan(week_ret.iloc[-1]) else None,
+            "ATR20_pct": float(atr_v),
+            "Upper_ATR20_pct": float(upper_atr_v),
+            "HighReachRatio20": float(reach_v),
+            "WeekRet": float(week_v),
         }
 
     except Exception:
@@ -335,7 +372,11 @@ def save_chart_image_from_raw(raw_df: pd.DataFrame, ticker: str, out_dir: str = 
 # ===== シグナル判定 & 通知 =====
 def screen_atr_swing(raw_df: pd.DataFrame, tickers):
     """
-    ATR>=5% かつ 5営業日前比リターン>=0 の銘柄を抽出。
+    A（バランス型）:
+      ATR20_pct >= 4.5%
+      Upper_ATR20_pct >= 2.0%
+      HighReachRatio20(3%) >= 50%
+      5営業日前比リターン >= 0
     """
     rows = []
     for t in tickers:
@@ -347,6 +388,8 @@ def screen_atr_swing(raw_df: pd.DataFrame, tickers):
         rows.append({
             "Ticker": t,
             "ATR20_pct": res["ATR20_pct"],
+            "Upper_ATR20_pct": res["Upper_ATR20_pct"],
+            "HighReachRatio20": res["HighReachRatio20"],
             "WeekRet": res["WeekRet"],
         })
 
@@ -361,12 +404,18 @@ def screen_atr_swing(raw_df: pd.DataFrame, tickers):
 
 def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
     # --- テキスト部 ---
-    title = "【ATRスイング候補（ATR≥5% × 週足非マイナス）】"
+    title = "【ATRスイング候補（A: 指値+3%向け / バランス型）】"
+
+    cond_line = (
+        f"条件: ATR20%>={ATR_MIN_PCT:.1f}% / UpperATR20%>={UPPER_ATR_MIN_PCT:.1f}% "
+        f"/ HighReach20({REACH_PCT:.0f}%)>={HIGH_REACH_RATIO_MIN*100:.0f}% "
+        f"/ WeekRet(5d)>={WEEK_RET_MIN:.1%}"
+    )
 
     if df is None or df.empty:
         msg = (
             f"{title} {now_jst():%m/%d %H:%M}\n"
-            f"条件: ATR20_pct >= {ATR_MIN_PCT:.1f}% かつ 5営業日前比リターン >= {WEEK_RET_MIN:.1%}\n"
+            f"{cond_line}\n"
             f"該当銘柄はありませんでした。"
         )
         send_long_text(msg)
@@ -374,7 +423,7 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
 
     header = (
         f"{title} {now_jst():%m/%d %H:%M}\n"
-        f"条件: ATR20_pct >= {ATR_MIN_PCT:.1f}% かつ 5営業日前比リターン >= {WEEK_RET_MIN:.1%}\n"
+        f"{cond_line}\n"
         f"抽出: {len(df)} 銘柄\n"
         f"------------------------------"
     )
@@ -391,8 +440,10 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
         t = r["Ticker"]
         name = TICKER_NAME_MAP.get(t, "")
         atr = fp(r["ATR20_pct"], 2)
+        uatr = fp(r["Upper_ATR20_pct"], 2)
+        reach = fp(100.0 * r["HighReachRatio20"], 1)
         wret = fp(100 * r["WeekRet"], 2) if r["WeekRet"] is not None else "-"
-        line = f"{t:<8} {name:<8}  ATR20%:{atr:>6}  WeekRet%:{wret:>6}"
+        line = f"{t:<8} {name:<8}  ATR20%:{atr:>6}  UpperATR%:{uatr:>6}  Reach20%:{reach:>6}  WeekRet%:{wret:>6}"
         lines.append(line)
 
     msg = "\n".join(lines)
@@ -408,7 +459,12 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
         t = r["Ticker"]
         name = TICKER_NAME_MAP.get(t, "")
         title = f"{t} {name}".strip()
-        desc = f"ATR20%:{fp(r['ATR20_pct'],2)} WeekRet%:{fp(100 * r['WeekRet'],2) if r['WeekRet'] is not None else '-'}"
+        desc = (
+            f"ATR20%:{fp(r['ATR20_pct'],2)} "
+            f"UpperATR%:{fp(r['Upper_ATR20_pct'],2)} "
+            f"Reach20%:{fp(100.0 * r['HighReachRatio20'],1)} "
+            f"WeekRet%:{fp(100 * r['WeekRet'],2) if r['WeekRet'] is not None else '-'}"
+        )
 
         img_path = save_chart_image_from_raw(raw_df, t, out_dir=CHART_OUT_DIR)
         if img_path:
