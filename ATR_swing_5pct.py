@@ -1,25 +1,15 @@
+# ============================================================
+# ATR swing (Tableau一致版)
+# 変更点：抽出ロジック＆通知文言のみ
+# ============================================================
+
 import os
-import sys
-from datetime import datetime, timedelta
-
-import numpy as np
-import pandas as pd
-import yfinance as yf
+import math
 import requests
-
-# ====== チャート用（元の運用に合わせて：入っていれば画像も送る） ======
-try:
-    import mplfinance as mpf
-    MPF_AVAILABLE = True
-except Exception:
-    MPF_AVAILABLE = False
-
-
-# ===== 基本設定（通知・環境変数などは変更しない想定） =====
-TZ_OFFSET = 9  # JST
-LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "180"))
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
-FORCE_RUN = os.getenv("FORCE_RUN", "0") == "1"
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from datetime import datetime
 
 # ===== 日経225ティッカー =====
 nikkei225_tickers = [ '4151.T','4502.T','4503.T','4506.T','4507.T','4519.T','4523.T','4568.T','4578.T','6479.T','6501.T','6503.T','6504.T','6506.T','6526.T','6594.T','6645.T','6674.T','6701.T','6702.T','6723.T','6724.T','6752.T','6753.T','6758.T','6762.T','6770.T','6841.T','6857.T','6861.T','6902.T','6920.T','6952.T','6954.T','6971.T','6976.T','6981.T','7735.T','7751.T','7752.T','8035.T','7201.T','7202.T','7203.T','7205.T','7211.T','7261.T','7267.T','7269.T','7270.T','7272.T','4543.T','4902.T','6146.T','7731.T','7733.T','7741.T','7762.T','9432.T','9433.T','9434.T','6963.T','9984.T','5831.T','7186.T','8304.T','8306.T','8308.T','8309.T','8316.T','8331.T','8354.T','8411.T','8253.T','8591.T','8697.T','8601.T','8604.T','8630.T','8725.T','8750.T','8766.T','8795.T','1332.T','2002.T','2269.T','2282.T','2501.T','2502.T','2503.T','2801.T','2802.T','2871.T','2914.T','3086.T','3092.T','3099.T','3382.T','7453.T','8233.T','8252.T','8267.T','9843.T','9983.T','2413.T','2432.T','3659.T','4307.T','4324.T','4385.T','4661.T','4689.T','4704.T','4751.T','4755.T','6098.T','6178.T','7974.T','9602.T','9735.T','9766.T','1605.T','3401.T','3402.T','3861.T','3405.T','3407.T','4004.T','4005.T','4021.T','4042.T','4043.T','4061.T','4063.T','4183.T','4188.T','4208.T','4452.T','4901.T','4911.T','6988.T','5019.T','5020.T','5101.T','5108.T','5201.T','5214.T','5233.T','5301.T','5332.T','5333.T','5401.T','5406.T','5411.T','3436.T','5706.T','5711.T','5713.T','5714.T','5801.T','5802.T','5803.T','2768.T','8001.T','8002.T','8015.T','8031.T','8053.T','8058.T','1721.T','1801.T','1802.T','1803.T','1808.T','1812.T','1925.T','1928.T','1963.T','5631.T','6103.T','6113.T','6273.T','6301.T','6302.T','6305.T','6326.T','6361.T','6367.T','6471.T','6472.T','6473.T','7004.T','7011.T','7013.T','7012.T','7832.T','7911.T','7912.T','7951.T','3289.T','8801.T','8802.T','8804.T','8830.T','9001.T','9005.T','9007.T','9008.T','9009.T','9020.T','9021.T','9022.T','9064.T','9147.T','9101.T','9104.T','9107.T','9201.T','9202.T','9301.T','9501.T','9502.T','9503.T','9531.T','9532.T' ]
@@ -82,334 +72,129 @@ ticker_name_map = {
 }
 
 
-# ===== ユーティリティ（既存運用のまま） =====
-def now_jst() -> datetime:
-    return datetime.utcnow() + timedelta(hours=TZ_OFFSET)
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-
-def is_weekend(dt: datetime) -> bool:
-    return dt.weekday() >= 5
-
-
-def chunk_text(text: str, limit: int = 1900):
-    out, buf, size = [], [], 0
-    for line in text.splitlines():
-        add = len(line) + 1
-        if size + add > limit and buf:
-            out.append("\n".join(buf))
-            buf, size = [], 0
-        buf.append(line)
-        size += add
-    if buf:
-        out.append("\n".join(buf))
+# -----------------------
+# 指標計算（Tableau一致）
+# -----------------------
+def wilder_ema(series, period):
+    alpha = 1 / period
+    out = series.copy()
+    out.iloc[:period] = np.nan
+    for i in range(period, len(series)):
+        if i == period:
+            out.iloc[i] = series.iloc[:period].mean()
+        else:
+            out.iloc[i] = out.iloc[i-1] + alpha * (series.iloc[i] - out.iloc[i-1])
     return out
 
+def compute_indicators(df):
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    prev_close = close.shift(1)
 
-def discord_post(payload: dict, files=None):
-    if not DISCORD_WEBHOOK_URL:
-        print("[WARN] DISCORD_WEBHOOK_URL is empty. skip notify.", file=sys.stderr)
-        return False
+    # True Range
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+
+    # ATR20 (SMA) and %
+    atr20 = tr.rolling(20, min_periods=20).mean()
+    atr20_pct = atr20 / close * 100
+
+    # Bollinger Bands (20, ±1σ)
+    ma20 = close.rolling(20, min_periods=20).mean()
+    sd20 = close.rolling(20, min_periods=20).std()
+    bb_up1 = ma20 + sd20
+    bb_dn1 = ma20 - sd20
+
+    # ★前日BBに対して当日タッチ
+    touch_up = (high >= bb_up1.shift(1)).astype(int)
+    touch_dn = (low  <= bb_dn1.shift(1)).astype(int)
+    touch_up_cnt20 = touch_up.rolling(20, min_periods=20).sum()
+    touch_dn_cnt20 = touch_dn.rolling(20, min_periods=20).sum()
+
+    # SMA25 and slope (5 days)
+    sma25 = close.rolling(25, min_periods=25).mean()
+    sma25_slope5_pct = (sma25 - sma25.shift(5)) / sma25.shift(5) * 100
+
+    # ADX14 (Wilder)
+    up_move = high.diff()
+    dn_move = -low.diff()
+    plus_dm = np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0)
+    plus_dm = pd.Series(plus_dm, index=df.index)
+    minus_dm = pd.Series(minus_dm, index=df.index)
+
+    tr_w = wilder_ema(tr, 14)
+    plus_di = 100 * wilder_ema(plus_dm, 14) / tr_w
+    minus_di = 100 * wilder_ema(minus_dm, 14) / tr_w
+    dx = ( (plus_di - minus_di).abs() / (plus_di + minus_di) ) * 100
+    adx14 = wilder_ema(dx, 14)
+
+    return {
+        "atr20_pct": atr20_pct,
+        "bb_up1": bb_up1,
+        "bb_dn1": bb_dn1,
+        "touch_up_cnt20": touch_up_cnt20,
+        "touch_dn_cnt20": touch_dn_cnt20,
+        "sma25": sma25,
+        "sma25_slope5_pct": sma25_slope5_pct,
+        "adx14": adx14
+    }
+
+# -----------------------
+# メイン
+# -----------------------
+signals = []
+
+for t in nikkei225_tickers:
     try:
-        if files:
-            r = requests.post(DISCORD_WEBHOOK_URL, data=payload, files=files, timeout=30)
-        else:
-            r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
-        if r.status_code >= 300:
-            print(f"[WARN] Discord post failed: {r.status_code} {r.text}", file=sys.stderr)
-            return False
-        return True
+        df = yf.download(t, period="1y", interval="1d", auto_adjust=False, progress=False)
+        if df is None or df.empty:
+            continue
+
+        ind = compute_indicators(df)
+        last = df.index[-1]
+
+        adx = ind["adx14"].loc[last]
+        atrp = ind["atr20_pct"].loc[last]
+        tu = ind["touch_up_cnt20"].loc[last]
+        td = ind["touch_dn_cnt20"].loc[last]
+        slope = ind["sma25_slope5_pct"].loc[last]
+
+        cond = (
+            (not np.isnan(adx)) and adx <= 25 and
+            (not np.isnan(atrp)) and (1.8 <= atrp <= 4.0) and
+            (not np.isnan(tu)) and (not np.isnan(td)) and (tu >= 3) and (td >= 3) and
+            (not np.isnan(slope)) and abs(slope) <= 0.5
+        )
+
+        if cond:
+            name = ticker_name_map.get(t, t)
+            close = float(df['Close'].iloc[-1])
+            bb_u = float(ind["bb_up1"].iloc[-1])
+            bb_d = float(ind["bb_dn1"].iloc[-1])
+
+            msg = (
+                f"【ATR Swing（Tableau一致）】\n"
+                f"{t} {name}\n"
+                f"Close: {close:.2f}\n"
+                f"BB +1σ: {bb_u:.2f} / -1σ: {bb_d:.2f}\n"
+                f"ATR20%: {atrp:.2f}% | ADX14: {adx:.1f}\n"
+                f"±1σタッチ(20D): +{int(tu)} / -{int(td)}\n"
+                f"SMA25傾き(5D): {slope:.2f}%"
+            )
+
+            signals.append(msg)
+
     except Exception as e:
-        print(f"[WARN] Discord post error: {e}", file=sys.stderr)
-        return False
+        print(f"Error {t}: {e}")
 
-
-def discord_send_text(content: str):
-    return discord_post({"content": content})
-
-
-def discord_send_image_file(file_path: str, title: str = "", description: str = ""):
-    if not os.path.exists(file_path):
-        return False
-    with open(file_path, "rb") as f:
-        files = {"file": (os.path.basename(file_path), f)}
-        payload = {"content": f"**{title}**\n{description}".strip()}
-        return discord_post(payload, files=files)
-
-
-def fp(x, nd=2):
-    try:
-        if x is None or (isinstance(x, float) and np.isnan(x)):
-            return "-"
-        return f"{float(x):.{nd}f}"
-    except Exception:
-        return "-"
-
-
-# ===== データ取得（既存運用のまま） =====
-def fetch_market_data(tickers, lookback_days=LOOKBACK_DAYS):
-    end = now_jst().date()
-    start = end - timedelta(days=lookback_days + 10)
-
-    raw = yf.download(
-        tickers=tickers,
-        start=str(start),
-        end=str(end + timedelta(days=1)),
-        interval="1d",
-        group_by="column",
-        auto_adjust=False,
-        threads=True,
-        progress=False,
-        actions=True,
-    )
-    return raw
-
-
-# =====================================================================================
-# ここから下：抽出ロジック＆通知文言のみ変更（それ以外は触らない）
-# =====================================================================================
-
-# ★ 抽出ロジック用パラメータ
-ADX_MAX = 25.0
-ATR_MIN_PCT = 1.8
-ATR_MAX_PCT = 4.0
-BB_TOUCH_MIN = 3
-SMA_SLOPE_MAX_PCT = 0.5
-
-# チャート設定（既存のまま使う想定。未設定ならデフォルトで安全に動作）
-CHART_OUT_DIR = os.getenv("CHART_OUT_DIR", "charts")
-CHART_LOOKBACK_DAYS = int(os.getenv("CHART_LOOKBACK_DAYS", "90"))
-CHART_TOP_N = int(os.getenv("CHART_TOP_N", "8"))
-
-
-def calc_latest_metrics_from_raw(raw_df: pd.DataFrame, ticker: str):
-    """
-    最新日で以下を算出し、条件を満たす場合に返す（満たさない場合はNone）
-      - ADX14 <= 25
-      - 1.8% <= ATR20% <= 4.0%
-      - 直近20日で BB(20,±1σ) +1σ/-1σ タッチ回数 >= 3
-      - |SMA25の20日傾き(%)| <= 0.5
-
-    通知追加用
-      - Close（最新終値）
-      - BB(20,±1σ)の価格（最新日の上下1σ）
-    """
-    try:
-        if not isinstance(raw_df.columns, pd.MultiIndex):
-            return None
-
-        close = raw_df[("Close", ticker)].dropna()
-        high = raw_df[("High", ticker)].reindex(close.index)
-        low = raw_df[("Low", ticker)].reindex(close.index)
-
-        if len(close) < 60:
-            return None
-
-        # --- ATR20% ---
-        prev_close = close.shift(1)
-        tr = pd.concat(
-            [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
-            axis=1
-        ).max(axis=1)
-        atr20 = tr.rolling(20, min_periods=20).mean()
-        atr20_pct = atr20 / close * 100.0
-
-        # --- ADX14（Rolling Sum DI / Rolling Mean DX） ---
-        prev_high = high.shift(1)
-        prev_low = low.shift(1)
-
-        up_move = high - prev_high
-        down_move = prev_low - low
-
-        plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=close.index)
-        minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=close.index)
-
-        tr14 = tr.rolling(14, min_periods=14).sum()
-        plus_dm14 = plus_dm.rolling(14, min_periods=14).sum()
-        minus_dm14 = minus_dm.rolling(14, min_periods=14).sum()
-
-        plus_di14 = 100.0 * (plus_dm14 / tr14)
-        minus_di14 = 100.0 * (minus_dm14 / tr14)
-
-        dx = 100.0 * (plus_di14 - minus_di14).abs() / (plus_di14 + minus_di14)
-        adx14 = dx.rolling(14, min_periods=14).mean()
-
-        # --- BB(20,±1σ) & タッチ回数（直近20日） ---
-        bb_mid = close.rolling(20, min_periods=20).mean()
-        bb_std = close.rolling(20, min_periods=20).std()
-        bb_up_1 = bb_mid + bb_std
-        bb_dn_1 = bb_mid - bb_std
-
-        touch_up_1 = (high >= bb_up_1).astype(int)
-        touch_dn_1 = (low <= bb_dn_1).astype(int)
-
-        touch_up_cnt20 = touch_up_1.rolling(20, min_periods=20).sum()
-        touch_dn_cnt20 = touch_dn_1.rolling(20, min_periods=20).sum()
-
-        # --- SMA25傾き（20日） ---
-        sma25 = close.rolling(25, min_periods=25).mean()
-        sma25_20ago = sma25.shift(20)
-        sma25_slope20_pct = (sma25 - sma25_20ago) / sma25_20ago * 100.0
-
-        # --- 最新値 ---
-        close_v = close.iloc[-1]
-        atr_v = atr20_pct.iloc[-1]
-        adx_v = adx14.iloc[-1]
-        up_cnt = touch_up_cnt20.iloc[-1]
-        dn_cnt = touch_dn_cnt20.iloc[-1]
-        sma_slope_v = sma25_slope20_pct.iloc[-1]
-        bb_up_v = bb_up_1.iloc[-1]
-        bb_dn_v = bb_dn_1.iloc[-1]
-
-        if any(pd.isna(x) for x in [close_v, atr_v, adx_v, up_cnt, dn_cnt, sma_slope_v, bb_up_v, bb_dn_v]):
-            return None
-
-        # --- 条件判定 ---
-        if float(adx_v) > ADX_MAX:
-            return None
-        if not (ATR_MIN_PCT <= float(atr_v) <= ATR_MAX_PCT):
-            return None
-        if int(up_cnt) < BB_TOUCH_MIN or int(dn_cnt) < BB_TOUCH_MIN:
-            return None
-        if abs(float(sma_slope_v)) > SMA_SLOPE_MAX_PCT:
-            return None
-
-        return {
-            "Ticker": ticker,
-            "Name": ticker_name_map.get(ticker, ""),
-            "Close": float(close_v),
-            "ATR20_pct": float(atr_v),
-            "ADX14": float(adx_v),
-            "BB_up_touch_cnt20": int(up_cnt),
-            "BB_dn_touch_cnt20": int(dn_cnt),
-            "BB_up_1": float(bb_up_v),
-            "BB_dn_1": float(bb_dn_v),
-            "SMA25_slope20_pct": float(sma_slope_v),
-        }
-
-    except Exception:
-        return None
-
-
-def screen_candidates(raw_df: pd.DataFrame, tickers):
-    rows = []
-    for t in tickers:
-        m = calc_latest_metrics_from_raw(raw_df, t)
-        if m is not None:
-            rows.append(m)
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    df = df.sort_values(["ADX14", "ATR20_pct"], ascending=[True, False]).reset_index(drop=True)
-    return df
-
-
-def save_chart_image_with_bb1sigma(raw_df: pd.DataFrame, ticker: str, out_dir: str = CHART_OUT_DIR):
-    """
-    既存運用を壊さないように：mplfinanceが使えるときだけ画像作成。
-    チャートに BB(20,±1σ) を重ねる。
-    """
-    if not MPF_AVAILABLE:
-        return None
-
-    try:
-        ohlcv = raw_df.loc[:, [(c, ticker) for c in ["Open", "High", "Low", "Close", "Volume"]]].copy()
-        ohlcv.columns = ["Open", "High", "Low", "Close", "Volume"]
-        ohlcv = ohlcv.dropna()
-        if ohlcv.empty:
-            return None
-        ohlcv = ohlcv.tail(CHART_LOOKBACK_DAYS)
-
-        close = ohlcv["Close"]
-        bb_mid = close.rolling(20, min_periods=20).mean()
-        bb_std = close.rolling(20, min_periods=20).std()
-        bb_up_1 = bb_mid + bb_std
-        bb_dn_1 = bb_mid - bb_std
-
-        add_plots = [
-            mpf.make_addplot(bb_up_1, panel=0),
-            mpf.make_addplot(bb_dn_1, panel=0),
-        ]
-
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"{ticker}.png")
-
-        mpf.plot(
-            ohlcv,
-            type="candle",
-            mav=(5, 25, 75),
-            volume=True,
-            style="yahoo",
-            title=ticker,
-            addplot=add_plots,
-            savefig=dict(fname=out_path, dpi=150, bbox_inches="tight"),
-        )
-        return out_path
-    except Exception:
-        return None
-
-
-def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
-    title = "【ATRレンジ候補（ADX≤25 × ATR(1.8-4)% × BB±1σ>=3 × SMA傾き小）】"
-
-    if df is None or df.empty:
-        discord_send_text(f"{title} {now_jst():%m/%d %H:%M}\n対象なし")
-        return
-
-    lines = [f"{title} {now_jst():%m/%d %H:%M}"]
-    lines.append("Ticker   名称       Close   ATR%   ADX   BB(+/-)   BB_dn1σ   BB_up1σ   SMA_slope%")
-
-    for _, r in df.iterrows():
-        t = r["Ticker"]
-        name = r.get("Name", "")
-        close = fp(r["Close"], 2)
-        atr = fp(r["ATR20_pct"], 2)
-        adx = fp(r["ADX14"], 1)
-        upc = str(int(r["BB_up_touch_cnt20"]))
-        dnc = str(int(r["BB_dn_touch_cnt20"]))
-        bb_dn = fp(r["BB_dn_1"], 2)
-        bb_up = fp(r["BB_up_1"], 2)
-        smas = fp(r["SMA25_slope20_pct"], 2)
-        lines.append(f"{t:<7} {name:<8} {close:>7} {atr:>6} {adx:>6}   {upc:>2}/{dnc:<2}   {bb_dn:>7}   {bb_up:>7}   {smas:>9}")
-
-    for part in chunk_text("\n".join(lines)):
-        discord_send_text(part)
-
-    # 画像（BB±1σ線入り）
-    if not MPF_AVAILABLE:
-        return
-    for _, r in df.head(CHART_TOP_N).iterrows():
-        t = r["Ticker"]
-        name = r.get("Name", "")
-        desc = (
-            f"Close:{fp(r['Close'],2)}  ATR%:{fp(r['ATR20_pct'],2)}  ADX:{fp(r['ADX14'],1)}  "
-            f"BB(+/-):{int(r['BB_up_touch_cnt20'])}/{int(r['BB_dn_touch_cnt20'])}  "
-            f"BB(±1σ):{fp(r['BB_dn_1'],2)}–{fp(r['BB_up_1'],2)}  "
-            f"SMA_slope%:{fp(r['SMA25_slope20_pct'],2)}"
-        )
-        img = save_chart_image_with_bb1sigma(raw_df, t, out_dir=CHART_OUT_DIR)
-        if img:
-            discord_send_image_file(img, title=f"{t} {name}".strip(), description=desc)
-
-
-def main():
-    now = now_jst()
-    if not FORCE_RUN and is_weekend(now):
-        print(f"[SKIP] {now:%F %R} 週末のためスキップ（FORCE_RUN=1で強制実行）")
-        return
-
-    tickers = nikkei225_tickers
-    raw = fetch_market_data(tickers, lookback_days=LOOKBACK_DAYS)
-
-    # yfinanceが存在しない銘柄で落ちないように（運用安定）
-    if raw is None or raw.empty:
-        discord_send_text(f"【ATRレンジ候補】 {now_jst():%m/%d %H:%M}\nデータ取得失敗")
-        return
-
-    df = screen_candidates(raw, tickers)
-    notify(df, raw)
-
-
-if __name__ == "__main__":
-    main()
+# Discord送信（従来通り）
+if signals and DISCORD_WEBHOOK_URL:
+    for s in signals:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": s})
