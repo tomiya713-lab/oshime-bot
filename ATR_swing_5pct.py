@@ -1,17 +1,12 @@
-import os
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
-from ta.volatility import AverageTrueRange, BollingerBands
-from ta.trend import ADXIndicator
+import os
+from datetime import datetime
+import matplotlib.pyplot as plt
 
-# =============================
-# Discord Webhook
-# =============================
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-
-# ===== 日経225ティッカー =====
+# ===== 日経225ティッカー ====3D
 nikkei225_tickers = [ '4151.T','4502.T','4503.T','4506.T','4507.T','4519.T','4523.T','4568.T','4578.T','6479.T','6501.T','6503.T','6504.T','6506.T','6526.T','6594.T','6645.T','6674.T','6701.T','6702.T','6723.T','6724.T','6752.T','6753.T','6758.T','6762.T','6770.T','6841.T','6857.T','6861.T','6902.T','6920.T','6952.T','6954.T','6971.T','6976.T','6981.T','7735.T','7751.T','7752.T','8035.T','7201.T','7202.T','7203.T','7205.T','7211.T','7261.T','7267.T','7269.T','7270.T','7272.T','4543.T','4902.T','6146.T','7731.T','7733.T','7741.T','7762.T','9432.T','9433.T','9434.T','6963.T','9984.T','5831.T','7186.T','8304.T','8306.T','8308.T','8309.T','8316.T','8331.T','8354.T','8411.T','8253.T','8591.T','8697.T','8601.T','8604.T','8630.T','8725.T','8750.T','8766.T','8795.T','1332.T','2002.T','2269.T','2282.T','2501.T','2502.T','2503.T','2801.T','2802.T','2871.T','2914.T','3086.T','3092.T','3099.T','3382.T','7453.T','8233.T','8252.T','8267.T','9843.T','9983.T','2413.T','2432.T','3659.T','4307.T','4324.T','4385.T','4661.T','4689.T','4704.T','4751.T','4755.T','6098.T','6178.T','7974.T','9602.T','9735.T','9766.T','1605.T','3401.T','3402.T','3861.T','3405.T','3407.T','4004.T','4005.T','4021.T','4042.T','4043.T','4061.T','4063.T','4183.T','4188.T','4208.T','4452.T','4901.T','4911.T','6988.T','5019.T','5020.T','5101.T','5108.T','5201.T','5214.T','5233.T','5301.T','5332.T','5333.T','5401.T','5406.T','5411.T','3436.T','5706.T','5711.T','5713.T','5714.T','5801.T','5802.T','5803.T','2768.T','8001.T','8002.T','8015.T','8031.T','8053.T','8058.T','1721.T','1801.T','1802.T','1803.T','1808.T','1812.T','1925.T','1928.T','1963.T','5631.T','6103.T','6113.T','6273.T','6301.T','6302.T','6305.T','6326.T','6361.T','6367.T','6471.T','6472.T','6473.T','7004.T','7011.T','7013.T','7012.T','7832.T','7911.T','7912.T','7951.T','3289.T','8801.T','8802.T','8804.T','8830.T','9001.T','9005.T','9007.T','9008.T','9009.T','9020.T','9021.T','9022.T','9064.T','9147.T','9101.T','9104.T','9107.T','9201.T','9202.T','9301.T','9501.T','9502.T','9503.T','9531.T','9532.T' ]
 
 # ===== 短縮名マップ =====
@@ -72,63 +67,87 @@ ticker_name_map = {
 }
 
 
-# =============================
-# パラメータ（Tableau一致）
-# =============================
-ATR_MIN = 1.8
-ATR_MAX = 4.0
-ADX_MAX = 25
-SIGMA_TOUCH_MIN = 3
-SMA_SLOPE_MAX = 0.5
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# =============================
-# Discord通知
-# =============================
 def send_discord(msg):
     if DISCORD_WEBHOOK_URL:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=10)
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
 
-# =============================
-# メイン処理
-# =============================
+results = []
+
 for t in nikkei225_tickers:
     try:
         df = yf.download(t, period="1y", interval="1d", progress=False)
         if df.empty or len(df) < 60:
             continue
 
-        atr = AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range()
-        atr_pct = atr / df["Close"] * 100
+        df = df.dropna().copy()
 
-        adx = ADXIndicator(df["High"], df["Low"], df["Close"], window=14).adx()
+        # ===== ATR（14日・絶対値）=====
+        high = df["High"]
+        low = df["Low"]
+        close = df["Close"]
 
-        bb = BollingerBands(df["Close"], window=20, window_dev=1)
-        upper = bb.bollinger_hband()
-        lower = bb.bollinger_lband()
+        tr = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs()
+        ], axis=1).max(axis=1)
 
-        sigma_touch = ((df["High"] >= upper) | (df["Low"] <= lower)).rolling(20).sum()
+        atr14 = tr.rolling(14).mean()
 
-        sma25 = df["Close"].rolling(25).mean()
-        sma_slope = sma25.diff()
+        # ===== ADX（14）=====
+        up = high.diff()
+        down = low.diff() * -1
+        plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+        minus_dm = np.where((down > up) & (down > 0), down, 0.0)
 
-        # ★ CSV作成時と完全一致（NaN除外の最後）
-        atr_v = atr_pct.dropna().iloc[-1]
-        adx_v = adx.dropna().iloc[-1]
-        sigma_v = sigma_touch.dropna().iloc[-1]
-        sma_v = sma_slope.dropna().iloc[-1]
+        tr14 = tr.rolling(14).sum()
+        plus_di = 100 * pd.Series(plus_dm).rolling(14).sum() / tr14
+        minus_di = 100 * pd.Series(minus_dm).rolling(14).sum() / tr14
+        dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+        adx14 = dx.rolling(14).mean()
 
+        # ===== ボリンジャーバンド（20,1σ）=====
+        ma20 = close.rolling(20).mean()
+        std20 = close.rolling(20).std()
+        upper1 = ma20 + std20
+        lower1 = ma20 - std20
+
+        touch_1sigma = ((high >= upper1) | (low <= lower1)).astype(int)
+        touch_cnt_20 = touch_1sigma.rolling(20).sum()
+
+        # ===== SMA25 傾き（%）=====
+        sma25 = close.rolling(25).mean()
+        sma_slope_pct = (sma25 - sma25.shift(1)) / sma25.shift(1) * 100
+
+        # ===== 最新日 index（CSVと完全一致）=====
+        latest = df.index[-1]
+
+        atr_v = atr14.loc[latest]
+        adx_v = adx14.loc[latest]
+        sigma_v = touch_cnt_20.loc[latest]
+        sma_v = sma_slope_pct.loc[latest]
+
+        if pd.isna([atr_v, adx_v, sigma_v, sma_v]).any():
+            continue
+
+        # ===== 抽出条件（Tableauと完全一致）=====
         if (
-            ATR_MIN <= atr_v <= ATR_MAX and
-            adx_v <= ADX_MAX and
-            sigma_v >= SIGMA_TOUCH_MIN and
-            abs(sma_v) <= SMA_SLOPE_MAX
+            adx_v <= 25 and
+            1.8 <= atr_v <= 4.0 and
+            sigma_v >= 3 and
+            abs(sma_v) <= 0.5
         ):
-            send_discord(
-                f"📊 ATR Swing検出\n"
-                f"{t} {ticker_name_map.get(t, '')}\n"
-                f"ATR%:{atr_v:.2f} ADX:{adx_v:.2f}\n"
-                f"±1σ:{sigma_v} SMA傾き:{sma_v:.4f}"
+            name = ticker_name_map.get(t, t)
+            msg = (
+                f"📊【{name}】\n"
+                f"ADX={adx_v:.1f}\n"
+                f"ATR={atr_v:.2f}\n"
+                f"±1σタッチ={int(sigma_v)}回\n"
+                f"SMA25傾き={sma_v:.2f}%"
             )
+            send_discord(msg)
 
     except Exception as e:
-        print(f"ERROR {t}: {e}")
+        print(f"Error {t}: {e}")
