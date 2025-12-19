@@ -1,14 +1,15 @@
+import os
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import requests
+from ta.volatility import AverageTrueRange, BollingerBands
+from ta.trend import ADXIndicator
 
-# ==============================
-# 設定
-# ==============================
-ATR_THRESHOLD = 5.0
-ADX_THRESHOLD = 20
-SIGMA_TOUCH_MIN = 2
-SMA_SLOPE_MIN = 0
+# =============================
+# Discord Webhook
+# =============================
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 # ===== 日経225ティッカー =====
 nikkei225_tickers = [ '4151.T','4502.T','4503.T','4506.T','4507.T','4519.T','4523.T','4568.T','4578.T','6479.T','6501.T','6503.T','6504.T','6506.T','6526.T','6594.T','6645.T','6674.T','6701.T','6702.T','6723.T','6724.T','6752.T','6753.T','6758.T','6762.T','6770.T','6841.T','6857.T','6861.T','6902.T','6920.T','6952.T','6954.T','6971.T','6976.T','6981.T','7735.T','7751.T','7752.T','8035.T','7201.T','7202.T','7203.T','7205.T','7211.T','7261.T','7267.T','7269.T','7270.T','7272.T','4543.T','4902.T','6146.T','7731.T','7733.T','7741.T','7762.T','9432.T','9433.T','9434.T','6963.T','9984.T','5831.T','7186.T','8304.T','8306.T','8308.T','8309.T','8316.T','8331.T','8354.T','8411.T','8253.T','8591.T','8697.T','8601.T','8604.T','8630.T','8725.T','8750.T','8766.T','8795.T','1332.T','2002.T','2269.T','2282.T','2501.T','2502.T','2503.T','2801.T','2802.T','2871.T','2914.T','3086.T','3092.T','3099.T','3382.T','7453.T','8233.T','8252.T','8267.T','9843.T','9983.T','2413.T','2432.T','3659.T','4307.T','4324.T','4385.T','4661.T','4689.T','4704.T','4751.T','4755.T','6098.T','6178.T','7974.T','9602.T','9735.T','9766.T','1605.T','3401.T','3402.T','3861.T','3405.T','3407.T','4004.T','4005.T','4021.T','4042.T','4043.T','4061.T','4063.T','4183.T','4188.T','4208.T','4452.T','4901.T','4911.T','6988.T','5019.T','5020.T','5101.T','5108.T','5201.T','5214.T','5233.T','5301.T','5332.T','5333.T','5401.T','5406.T','5411.T','3436.T','5706.T','5711.T','5713.T','5714.T','5801.T','5802.T','5803.T','2768.T','8001.T','8002.T','8015.T','8031.T','8053.T','8058.T','1721.T','1801.T','1802.T','1803.T','1808.T','1812.T','1925.T','1928.T','1963.T','5631.T','6103.T','6113.T','6273.T','6301.T','6302.T','6305.T','6326.T','6361.T','6367.T','6471.T','6472.T','6473.T','7004.T','7011.T','7013.T','7012.T','7832.T','7911.T','7912.T','7951.T','3289.T','8801.T','8802.T','8804.T','8830.T','9001.T','9005.T','9007.T','9008.T','9009.T','9020.T','9021.T','9022.T','9064.T','9147.T','9101.T','9104.T','9107.T','9201.T','9202.T','9301.T','9501.T','9502.T','9503.T','9531.T','9532.T' ]
@@ -71,101 +72,63 @@ ticker_name_map = {
 }
 
 
-# ==============================
-# ADX（Wilder方式）
-# ==============================
-def calc_adx(df, period=14):
-    high, low, close = df["High"], df["Low"], df["Close"]
+# =============================
+# パラメータ（Tableau一致）
+# =============================
+ATR_MIN = 1.8
+ATR_MAX = 4.0
+ADX_MAX = 25
+SIGMA_TOUCH_MIN = 3
+SMA_SLOPE_MAX = 0.5
 
-    plus_dm = high.diff()
-    minus_dm = low.diff() * -1
+# =============================
+# Discord通知
+# =============================
+def send_discord(msg):
+    if DISCORD_WEBHOOK_URL:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=10)
 
-    plus_dm[plus_dm < 0] = 0
-    minus_dm[minus_dm < 0] = 0
-
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
-    ], axis=1).max(axis=1)
-
-    atr = tr.ewm(alpha=1/period, adjust=False).mean()
-
-    plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr)
-    minus_di = 100 * (minus_dm.ewm(alpha=1/period, adjust=False).mean() / atr)
-
-    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
-    adx = dx.ewm(alpha=1/period, adjust=False).mean()
-
-    return adx
-
-# ==============================
+# =============================
 # メイン処理
-# ==============================
-results = []
-
-for t in tickers:
+# =============================
+for t in nikkei225_tickers:
     try:
-        df = yf.download(
-            t,
-            period="1y",
-            interval="1d",
-            auto_adjust=True,
-            progress=False
-        )
-
-        if len(df) < 50:
+        df = yf.download(t, period="1y", interval="1d", progress=False)
+        if df.empty or len(df) < 60:
             continue
 
-        # --- ATR% ---
-        high, low, close = df["High"], df["Low"], df["Close"]
-        tr = pd.concat([
-            high - low,
-            (high - close.shift()).abs(),
-            (low - close.shift()).abs()
-        ], axis=1).max(axis=1)
+        atr = AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range()
+        atr_pct = atr / df["Close"] * 100
 
-        atr = tr.rolling(14).mean()
-        atr_pct = atr / close * 100
+        adx = ADXIndicator(df["High"], df["Low"], df["Close"], window=14).adx()
 
-        # --- ADX ---
-        adx = calc_adx(df)
+        bb = BollingerBands(df["Close"], window=20, window_dev=1)
+        upper = bb.bollinger_hband()
+        lower = bb.bollinger_lband()
 
-        # --- Bollinger ±1σ ---
-        sma20 = close.rolling(20).mean()
-        std20 = close.rolling(20).std()
-        upper_1 = sma20 + std20
-        lower_1 = sma20 - std20
+        sigma_touch = ((df["High"] >= upper) | (df["Low"] <= lower)).rolling(20).sum()
 
-        sigma_touch = (
-            (high >= upper_1) | (low <= lower_1)
-        ).rolling(20).sum()
+        sma25 = df["Close"].rolling(25).mean()
+        sma_slope = sma25.diff()
 
-        # --- SMA25 slope（直近5日差分） ---
-        sma25 = close.rolling(25).mean()
-        sma25_slope = sma25.diff(5)
+        # ★ CSV作成時と完全一致（NaN除外の最後）
+        atr_v = atr_pct.dropna().iloc[-1]
+        adx_v = adx.dropna().iloc[-1]
+        sigma_v = sigma_touch.dropna().iloc[-1]
+        sma_v = sma_slope.dropna().iloc[-1]
 
-        # --- 最新日だけ評価 ---
         if (
-            atr_pct.iloc[-1] >= ATR_THRESHOLD and
-            adx.iloc[-1] >= ADX_THRESHOLD and
-            sigma_touch.iloc[-1] >= SIGMA_TOUCH_MIN and
-            sma25_slope.iloc[-1] > SMA_SLOPE_MIN
+            ATR_MIN <= atr_v <= ATR_MAX and
+            adx_v <= ADX_MAX and
+            sigma_v >= SIGMA_TOUCH_MIN and
+            abs(sma_v) <= SMA_SLOPE_MAX
         ):
-            results.append({
-                "Ticker": t,
-                "Name": ticker_name_map.get(t, t),
-                "ATR_%": round(atr_pct.iloc[-1], 2),
-                "ADX": round(adx.iloc[-1], 1),
-                "SigmaTouch": int(sigma_touch.iloc[-1]),
-                "SMA25_Slope": round(sma25_slope.iloc[-1], 2)
-            })
+            send_discord(
+                f"📊 ATR Swing検出\n"
+                f"{t} {ticker_name_map.get(t, '')}\n"
+                f"ATR%:{atr_v:.2f} ADX:{adx_v:.2f}\n"
+                f"±1σ:{sigma_v} SMA傾き:{sma_v:.4f}"
+            )
 
     except Exception as e:
-        print(f"{t} error: {e}")
-
-# ==============================
-# 結果表示
-# ==============================
-result_df = pd.DataFrame(results)
-print(result_df)
+        print(f"ERROR {t}: {e}")
