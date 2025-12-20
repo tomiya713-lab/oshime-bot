@@ -1,25 +1,19 @@
-# -*- coding: utf-8 -*-
-"""ATR_swing_5pct.py
-
-- 余計なところは極力触らず、(1) nikkei225_tickers / ticker_name_map を復活
-- (2) yfinance の auto_adjust 変更による挙動ブレを避けるため auto_adjust=False を明示
-- (3) 「候補0件でもDiscordに“0件”通知」を出して、ジョブが動いたか分かるようにする
-- (4) 抽出条件は、あなたがTableauで厳密に処理していた “indicators_latest_by_ticker_v2.csv 相当” の列だけで判定
-"""
-
-import os
-from typing import Dict, List
-
-import numpy as np
 import pandas as pd
+import numpy as np
+import os
 import requests
-import yfinance as yf
+
+# ==============================
+# 設定
+# ==============================
+FORCE_RUN = os.getenv("FORCE_RUN", "0") == "1"
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 # ===== 日経225ティッカー ====3D
 nikkei225_tickers = [ '4151.T','4502.T','4503.T','4506.T','4507.T','4519.T','4523.T','4568.T','4578.T','6479.T','6501.T','6503.T','6504.T','6506.T','6526.T','6594.T','6645.T','6674.T','6701.T','6702.T','6723.T','6724.T','6752.T','6753.T','6758.T','6762.T','6770.T','6841.T','6857.T','6861.T','6902.T','6920.T','6952.T','6954.T','6971.T','6976.T','6981.T','7735.T','7751.T','7752.T','8035.T','7201.T','7202.T','7203.T','7205.T','7211.T','7261.T','7267.T','7269.T','7270.T','7272.T','4543.T','4902.T','6146.T','7731.T','7733.T','7741.T','7762.T','9432.T','9433.T','9434.T','6963.T','9984.T','5831.T','7186.T','8304.T','8306.T','8308.T','8309.T','8316.T','8331.T','8354.T','8411.T','8253.T','8591.T','8697.T','8601.T','8604.T','8630.T','8725.T','8750.T','8766.T','8795.T','1332.T','2002.T','2269.T','2282.T','2501.T','2502.T','2503.T','2801.T','2802.T','2871.T','2914.T','3086.T','3092.T','3099.T','3382.T','7453.T','8233.T','8252.T','8267.T','9843.T','9983.T','2413.T','2432.T','3659.T','4307.T','4324.T','4385.T','4661.T','4689.T','4704.T','4751.T','4755.T','6098.T','6178.T','7974.T','9602.T','9735.T','9766.T','1605.T','3401.T','3402.T','3861.T','3405.T','3407.T','4004.T','4005.T','4021.T','4042.T','4043.T','4061.T','4063.T','4183.T','4188.T','4208.T','4452.T','4901.T','4911.T','6988.T','5019.T','5020.T','5101.T','5108.T','5201.T','5214.T','5233.T','5301.T','5332.T','5333.T','5401.T','5406.T','5411.T','3436.T','5706.T','5711.T','5713.T','5714.T','5801.T','5802.T','5803.T','2768.T','8001.T','8002.T','8015.T','8031.T','8053.T','8058.T','1721.T','1801.T','1802.T','1803.T','1808.T','1812.T','1925.T','1928.T','1963.T','5631.T','6103.T','6113.T','6273.T','6301.T','6302.T','6305.T','6326.T','6361.T','6367.T','6471.T','6472.T','6473.T','7004.T','7011.T','7013.T','7012.T','7832.T','7911.T','7912.T','7951.T','3289.T','8801.T','8802.T','8804.T','8830.T','9001.T','9005.T','9007.T','9008.T','9009.T','9020.T','9021.T','9022.T','9064.T','9147.T','9101.T','9104.T','9107.T','9201.T','9202.T','9301.T','9501.T','9502.T','9503.T','9531.T','9532.T' ]
 
 # ===== 短縮名マップ =====
-ticker_name_map: Dict[str, str] = {
+ticker_name_map = {
     "1332.T": "日水", "1333.T": "マルハニチロ", "1605.T": "INPEX", "1801.T": "大成建",
     "1802.T": "清水建", "1803.T": "飛島建", "1808.T": "長谷工", "1812.T": "鹿島",
     "1925.T": "大和ハウス", "1928.T": "積水ハウス", "1963.T": "日揮HD", "2002.T": "日清粉G",
@@ -75,212 +69,122 @@ ticker_name_map: Dict[str, str] = {
     "9984.T": "ソフトバンクG",
 }
 
-# ========= 設定 =========
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+# ==============================
+# Wilder系インジケータ
+# ==============================
+def wilder_ema(series, period):
+    return series.ewm(alpha=1/period, adjust=False).mean()
 
-# （Tableauで合わせていた前提の抽出条件：csvの列のみで判定）
-ATR_MIN_PCT = 1.8
-ATR_MAX_PCT = 4.0
-ADX_MAX = 25
-BB_TOUCH_MIN = 3
+def calc_atr(df, period=20):
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    return wilder_ema(tr, period)
 
-# 出力
-OUT_INDICATORS_CSV = "indicators_latest_by_ticker_v2.csv"
-OUT_CANDIDATES_CSV = "atr_swing_candidates.csv"
+def calc_adx(df, period=14):
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
 
+    plus_dm = high.diff()
+    minus_dm = low.diff().abs()
 
-def _chunk_text(s: str, limit: int = 1900) -> List[str]:
-    if len(s) <= limit:
-        return [s]
-    chunks = []
-    buf = []
-    cur = 0
-    for line in s.splitlines():
-        add = len(line) + 1
-        if cur + add > limit and buf:
-            chunks.append("\n".join(buf))
-            buf = []
-            cur = 0
-        buf.append(line)
-        cur += add
-    if buf:
-        chunks.append("\n".join(buf))
-    return chunks
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
 
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
 
-def send_discord(message: str) -> None:
-    """Discord webhookに送信。URLがなければ標準出力だけ。"""
-    if not message.strip():
-        return
+    atr = wilder_ema(tr, period)
+    plus_di = 100 * wilder_ema(pd.Series(plus_dm), period) / atr
+    minus_di = 100 * wilder_ema(pd.Series(minus_dm), period) / atr
 
-    if not DISCORD_WEBHOOK_URL:
-        print("[WARN] DISCORD_WEBHOOK_URL is empty. message preview:")
-        print(message)
-        return
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+    adx = wilder_ema(dx, period)
+    return adx
 
-    for part in _chunk_text(message):
-        try:
-            r = requests.post(DISCORD_WEBHOOK_URL, json={"content": part}, timeout=20)
-            if r.status_code >= 300:
-                print(f"[WARN] Discord send failed: {r.status_code} {r.text[:300]}")
-        except Exception as e:
-            print(f"[WARN] Discord send exception: {e}")
+# ==============================
+# メイン処理
+# ==============================
+df_all = pd.read_csv("adjusted_close_prices_vertical.csv")
+results = []
 
+for ticker in nikkei225_tickers:
+    try:
+        df = df_all[df_all["Ticker"] == ticker].copy()
+        if len(df) < 100:
+            continue
 
-def compute_indicators_from_raw(raw_df: pd.DataFrame, ticker: str) -> Dict:
-    """yfinanceのMultiIndex DataFrame（field,ticker）から、csv用の指標を計算。"""
-    close = raw_df[("Close", ticker)].dropna().astype(float)
-    high = raw_df[("High", ticker)].dropna().astype(float)
-    low = raw_df[("Low", ticker)].dropna().astype(float)
+        df = df.sort_values("Date")
 
-    # index揃え
-    df = pd.DataFrame({"Close": close, "High": high, "Low": low}).dropna()
+        # Closeを基準にHigh/Lowを再構成（CSV作成時と同じ）
+        df["Close"] = df["Adj_Close"]
+        df["High"] = df["Adj_Close"]
+        df["Low"] = df["Adj_Close"]
 
-    if len(df) < 60:
-        raise ValueError("not enough rows")
+        # === 指標 ===
+        df["ATR20"] = calc_atr(df, 20)
+        df["ATR_pct"] = df["ATR20"] / df["Close"] * 100
+        df["ADX14"] = calc_adx(df, 14)
 
-    # SMA25
-    sma25 = df["Close"].rolling(25).mean()
+        df["SMA20"] = df["Close"].rolling(20).mean()
+        df["STD20"] = df["Close"].rolling(20).std()
+        df["BB_upper"] = df["SMA20"] + df["STD20"]
+        df["BB_lower"] = df["SMA20"] - df["STD20"]
 
-    # Bollinger (20, ±1σ) ※あなたのCSVの列名に合わせる
-    bb_mid = df["Close"].rolling(20).mean()
-    bb_std = df["Close"].rolling(20).std(ddof=0)
-    bb_up_1s = bb_mid + 1.0 * bb_std
-    bb_dn_1s = bb_mid - 1.0 * bb_std
+        df["SMA25"] = df["Close"].rolling(25).mean()
+        df["SMA25_diff"] = (df["Close"] - df["SMA25"]) / df["Close"] * 100
 
-    # ADX14（簡易実装：Wilder）
-    period = 14
-    up_move = df["High"].diff()
-    down_move = -df["Low"].diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+        recent = df.tail(60)
+        bb_touch = (
+            (recent["High"] >= recent["BB_upper"]) |
+            (recent["Low"] <= recent["BB_lower"])
+        ).sum()
 
-    tr1 = df["High"] - df["Low"]
-    tr2 = (df["High"] - df["Close"].shift()).abs()
-    tr3 = (df["Low"] - df["Close"].shift()).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        last = df.iloc[-1]
 
-    atr14 = tr.ewm(alpha=1 / period, adjust=False).mean()
-    plus_di = (
-        100
-        * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean()
-        / atr14
-    )
-    minus_di = (
-        100
-        * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean()
-        / atr14
-    )
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    adx14 = dx.ewm(alpha=1 / period, adjust=False).mean()
+        # === 抽出条件（CSVと完全一致） ===
+        if not (
+            last["ADX14"] <= 25 and
+            1.8 <= last["ATR_pct"] <= 4 and
+            abs(last["SMA25_diff"]) <= 0.5 and
+            bb_touch >= 3
+        ):
+            continue
 
-    # ATR20%（TRの20 EMAをCloseで割る）
-    atr20 = tr.ewm(span=20, adjust=False).mean()
-    atr20_pct = (atr20 / df["Close"]) * 100
+        results.append({
+            "Ticker": ticker,
+            "Name": ticker_name_map.get(ticker, ticker),
+            "Close": round(last["Close"], 1),
+            "SMA25": round(last["SMA25"], 1),
+            "ATR_pct": round(last["ATR_pct"], 2),
+            "ADX14": round(last["ADX14"], 1),
+            "BBtouch": bb_touch
+        })
 
-    # タッチ回数（直近20営業日、Highが上バンド以上 / Lowが下バンド以下）
-    w = 20
-    up_touch_cnt20 = int((df["High"].tail(w) >= bb_up_1s.tail(w)).sum())
-    dn_touch_cnt20 = int((df["Low"].tail(w) <= bb_dn_1s.tail(w)).sum())
+    except Exception as e:
+        print(f"Error {ticker}: {e}")
 
-    latest = df.index[-1]
-    out = {
-        "Ticker": ticker,
-        "Latest_Date": pd.to_datetime(latest).date().isoformat(),
-        "Close": float(df["Close"].iloc[-1]),
-        "SMA25": float(sma25.iloc[-1]),
-        "ATR20_pct": float(atr20_pct.iloc[-1]),
-        "ADX14": float(adx14.iloc[-1]),
-        "BB_up_1sigma_touch_cnt20": up_touch_cnt20,
-        "BB_dn_1sigma_touch_cnt20": dn_touch_cnt20,
-    }
-    return out
-
-
-def fetch_market_data(tickers: List[str]) -> pd.DataFrame:
-    """複数ティッカーを一括DL（MultiIndex: field x ticker）。"""
-    raw = yf.download(
-        tickers,
-        period="1y",
-        interval="1d",
-        progress=False,
-        group_by="column",
-        auto_adjust=False,  # ★ FutureWarning対策＆挙動固定
-        threads=True,
-    )
-
-    if not isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = pd.MultiIndex.from_product([raw.columns, tickers])
-    return raw
-
-
-def build_indicators_csv(raw: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
-    rows = []
-    failed = []
-    for t in tickers:
-        try:
-            if ("Close", t) not in raw.columns:
-                failed.append((t, "missing in download result"))
-                continue
-            rows.append(compute_indicators_from_raw(raw, t))
-        except Exception as e:
-            failed.append((t, str(e)))
-
-    df = pd.DataFrame(rows)
-    df.to_csv(OUT_INDICATORS_CSV, index=False, encoding="utf-8-sig")
-
-    if failed:
-        print("[WARN] indicator calc failed tickers (top 10):")
-        for t, reason in failed[:10]:
-            print(" -", t, reason)
-
-    return df
-
-
-def apply_tableau_equivalent_filter(ind: pd.DataFrame) -> pd.DataFrame:
-    """Tableauでやっていた抽出と同じ“列だけ”で判定（※ルールはここだけ）。"""
-    cond = (
-        (ind["ATR20_pct"] >= ATR_MIN_PCT)
-        & (ind["ATR20_pct"] <= ATR_MAX_PCT)
-        & (ind["ADX14"] <= ADX_MAX)
-        & (ind["BB_up_1sigma_touch_cnt20"] >= BB_TOUCH_MIN)
-        & (ind["BB_dn_1sigma_touch_cnt20"] >= BB_TOUCH_MIN)
-        & (ind["Close"] >= ind["SMA25"])
-    )
-    out = ind.loc[cond].copy()
-    out = out.sort_values(["ATR20_pct", "ADX14"], ascending=[False, True])
-    out.to_csv(OUT_CANDIDATES_CSV, index=False, encoding="utf-8-sig")
-    return out
-
-
-def main() -> None:
-    raw = fetch_market_data(nikkei225_tickers)
-    ind = build_indicators_csv(raw, nikkei225_tickers)
-
-    cands = apply_tableau_equivalent_filter(ind)
-
-    # ===== 通知（0件でも通知）=====
-    if cands.empty:
-        msg = "【ATR Swing】本日の候補：0件（条件一致なし）"
-        send_discord(msg)
-        print(msg)
-        return
-
-    lines = [f"【ATR Swing】本日の候補：{len(cands)}件", ""]
-    for _, row in cands.iterrows():
-        t = row["Ticker"]
-        nm = ticker_name_map.get(t, "")
-        label = f"{t} {nm}".strip()
+# ==============================
+# Discord通知（既存仕様）
+# ==============================
+if results or FORCE_RUN:
+    lines = [f"【ATR Swing】本日の候補：{len(results)}件"]
+    for r in results:
         lines.append(
-            f"- {label} | Close={row['Close']:.1f} SMA25={row['SMA25']:.1f} "
-            f"ATR20%={row['ATR20_pct']:.2f} ADX14={row['ADX14']:.1f} "
-            f"BBtouch(up/dn)={int(row['BB_up_1sigma_touch_cnt20'])}/{int(row['BB_dn_1sigma_touch_cnt20'])}"
+            f"- {r['Ticker']} {r['Name']} | "
+            f"Close={r['Close']} SMA25={r['SMA25']} "
+            f"ATR20%={r['ATR_pct']} ADX14={r['ADX14']} "
+            f"BBtouch={r['BBtouch']}"
         )
 
-    msg = "\n".join(lines)
-    send_discord(msg)
-    print(msg)
-
-
-if __name__ == "__main__":
-    main()
+    payload = {"content": "\n".join(lines)}
+    requests.post(DISCORD_WEBHOOK_URL, json=payload)
