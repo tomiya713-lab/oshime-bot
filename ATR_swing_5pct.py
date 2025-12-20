@@ -106,27 +106,37 @@ def download_prices(tickers, period="1y", interval="1d"):
         period=period,
         interval=interval,
         progress=False,
-        auto_adjust=True,   # ★調整後OHLCに統一（分割など吸収）
+        auto_adjust=True,   # ★重要：調整後OHLCに統一
         threads=True,
     )
     return df
 
 # ==========================
-# Indicator calculations
+# Indicator calculations（最小差分：ATR/ADXをWilder方式へ）
 # ==========================
 def calc_sma(series, window):
     return series.rolling(window).mean()
 
-def _wilder_rma(series: pd.Series, window: int) -> pd.Series:
-    # Wilderの平滑化（RMA）= ewm(alpha=1/window, adjust=False)
-    return series.ewm(alpha=1/window, adjust=False).mean()
+def _rma_wilder(series: pd.Series, length: int) -> pd.Series:
+    """
+    Wilder's RMA (RMA/SMMA): alpha = 1/length
+    - 最初の値は最初length本のSMA
+    - 以降は prev*(length-1)/length + cur/length
+    """
+    s = series.astype(float)
+    out = pd.Series(np.nan, index=s.index, dtype=float)
+    if len(s) < length:
+        return out
+
+    first = s.iloc[:length].mean()
+    out.iloc[length - 1] = first
+    for i in range(length, len(s)):
+        out.iloc[i] = (out.iloc[i - 1] * (length - 1) + s.iloc[i]) / length
+    return out
 
 def calc_atr_pct(high, low, close, window=20):
     """
-    ATR20_pct：
-    - TR を計算
-    - ATR は Wilder 方式（RMA）
-    - %化 = ATR / Close * 100
+    ATR% = Wilder ATR / Close * 100
     """
     prev_close = close.shift(1)
     tr = pd.concat(
@@ -134,19 +144,19 @@ def calc_atr_pct(high, low, close, window=20):
         axis=1
     ).max(axis=1)
 
-    atr = _wilder_rma(tr, window)
+    atr = _rma_wilder(tr, window)   # ★Wilder
     atr_pct = (atr / close) * 100.0
     return atr_pct
 
 def calc_adx(high, low, close, window=14):
     """
-    ADX14（Wilder方式）：
-    - +DM/-DM は upMove と downMove の比較で定義
-    - TR, +DM, -DM を Wilder で平滑化
-    - +DI/-DI -> DX -> ADX を Wilder で平滑化
+    ADX (Wilder):
+    1) +DM/-DM は「上昇幅/下落幅の大きい方だけ採用」ルール
+    2) TR, +DM, -DM を Wilder(RMA) で平滑化
+    3) +DI/-DI -> DX -> ADX を Wilder(RMA)
     """
     up_move = high.diff()
-    down_move = -low.diff()  # lowが下がるほどプラス
+    down_move = -low.diff()
 
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
@@ -159,26 +169,20 @@ def calc_adx(high, low, close, window=14):
         axis=1
     ).max(axis=1)
 
-    tr_rma = _wilder_rma(tr, window)
-    plus_dm_rma = _wilder_rma(plus_dm, window)
-    minus_dm_rma = _wilder_rma(minus_dm, window)
+    atr = _rma_wilder(tr, window)          # Wilder ATR(=TRのRMA)
+    plus_dm_sm = _rma_wilder(plus_dm, window)
+    minus_dm_sm = _rma_wilder(minus_dm, window)
 
-    plus_di = 100.0 * (plus_dm_rma / tr_rma)
-    minus_di = 100.0 * (minus_dm_rma / tr_rma)
+    plus_di = 100.0 * (plus_dm_sm / atr)
+    minus_di = 100.0 * (minus_dm_sm / atr)
 
-    denom = (plus_di + minus_di).replace(0, np.nan)
-    dx = 100.0 * (plus_di - minus_di).abs() / denom
-
-    adx = _wilder_rma(dx, window)
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    adx = _rma_wilder(dx, window)          # ★Wilder ADX
     return adx
 
 def calc_bb_touch_counts(close, high, low, window=20, sigma=1.0):
-    """
-    BB ±1σ タッチ回数（直近20営業日を rolling(window).sum() で算出）
-    - 標準偏差の ddof を 0 に固定（CSV作成時のズレ要因を潰す）
-    """
     ma = close.rolling(window).mean()
-    sd = close.rolling(window).std(ddof=0)  # ★重要（ddof固定）
+    sd = close.rolling(window).std()
     upper = ma + sigma * sd
     lower = ma - sigma * sd
 
@@ -194,12 +198,17 @@ def latest_atr_swing_from_raw(raw_df: pd.DataFrame, tickers: list):
     for ticker in tickers:
         try:
             if isinstance(raw_df.columns, pd.MultiIndex):
-                # auto_adjust=True なら通常 Adj Close は無い（Closeを使う）
-                close = raw_df[("Close", ticker)].dropna()
+                if ("Adj Close", ticker) in raw_df.columns:
+                    close = raw_df[("Adj Close", ticker)].dropna()
+                else:
+                    close = raw_df[("Close", ticker)].dropna()
                 high = raw_df[("High", ticker)].reindex(close.index)
                 low = raw_df[("Low", ticker)].reindex(close.index)
             else:
-                close = raw_df["Close"].dropna()
+                if "Adj Close" in raw_df.columns:
+                    close = raw_df["Adj Close"].dropna()
+                else:
+                    close = raw_df["Close"].dropna()
                 high = raw_df["High"].reindex(close.index)
                 low = raw_df["Low"].reindex(close.index)
 
@@ -257,6 +266,10 @@ def main():
         return
 
     # ---- 抽出ロジック（既存のまま） ----
+    # ① ADX<=25
+    # ② ±1σタッチ回数>=3（上・下それぞれ>=3）
+    # ③ 1.8<=ATR<=4
+    # ④ SMA25乖離率(|%|)<=0.5
     latest_df["BB_up_1sigma_touch_cnt20"] = pd.to_numeric(latest_df["BB_up_1sigma_touch_cnt20"], errors="coerce")
     latest_df["BB_dn_1sigma_touch_cnt20"] = pd.to_numeric(latest_df["BB_dn_1sigma_touch_cnt20"], errors="coerce")
     latest_df["ATR20_pct"] = pd.to_numeric(latest_df["ATR20_pct"], errors="coerce")
@@ -279,7 +292,10 @@ def main():
     for _, r in filtered.iterrows():
         t = r["Ticker"]
         name = ticker_name_map.get(t, "")
-        disp = f"{t} {name}" if name else f"{t}"
+        if name:
+            disp = f"{t} {name}"
+        else:
+            disp = f"{t}"
         lines.append(
             f"- {disp} | "
             f"Close={r['Close']:.1f} "
