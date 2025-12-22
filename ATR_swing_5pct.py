@@ -277,11 +277,11 @@ def main():
     latest_df["SMA_dev_abs"] = pd.to_numeric(latest_df["SMA_dev_abs"], errors="coerce")
 
     filtered = latest_df[
-        (latest_df["ADX14"] <= 25) &
+        (latest_df["ADX14"] <= 20) &
         (latest_df["BB_up_1sigma_touch_cnt20"] >= 3) &
         (latest_df["BB_dn_1sigma_touch_cnt20"] >= 3) &
         (latest_df["ATR20_pct"] >= 1.8) & (latest_df["ATR20_pct"] <= 4.0) &
-        (latest_df["SMA_dev_abs"] <= 0.5)
+        (latest_df["SMA_dev_abs"] <= 0.8)
     ].copy()
 
     filtered = filtered.sort_values(["ATR20_pct"], ascending=False)
