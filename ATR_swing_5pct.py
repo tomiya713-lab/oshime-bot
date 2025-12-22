@@ -9,6 +9,7 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 
+# ===== Chart (optional) =====
 try:
     import mplfinance as mpf
     MPF_AVAILABLE = True
@@ -88,13 +89,112 @@ def safe_float(x):
     except Exception:
         return None
 
-def post_discord(message: str):
+def post_discord(message: str, file_paths=None):
+    """Discord webhook post.
+    - message only: JSON post
+    - with files: multipart/form-data with payload_json + files[]
+    """
     if not DISCORD_WEBHOOK_URL:
         print("[WARN] DISCORD_WEBHOOK_URL is empty. Skip posting.")
         return
-    payload = {"content": message}
-    r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
-    r.raise_for_status()
+
+    try:
+        if file_paths:
+            # Discord expects multipart with 'payload_json' plus 'files[n]'
+            files = {}
+            opened = []
+            for i, fp in enumerate(file_paths):
+                try:
+                    f = open(fp, "rb")
+                    opened.append(f)
+                    files[f"files[{i}]"] = (os.path.basename(fp), f, "image/png")
+                except Exception as e:
+                    print(f"[WARN] cannot open file for discord: {fp} ({e})")
+
+            payload = {"content": message}
+            data = {"payload_json": json.dumps(payload, ensure_ascii=False)}
+            r = requests.post(DISCORD_WEBHOOK_URL, data=data, files=files, timeout=60)
+
+            for f in opened:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+            r.raise_for_status()
+        else:
+            payload = {"content": message}
+            r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
+            r.raise_for_status()
+    except Exception as e:
+        # Do not crash the whole job because Discord failed
+        print(f"[WARN] Discord post failed: {e}")
+
+# ==========================
+# Chart helpers (do NOT affect screening logic)
+# ==========================
+def _extract_ohlcv_for_ticker(raw_df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Return OHLCV dataframe for one ticker from yfinance download result."""
+    if isinstance(raw_df.columns, pd.MultiIndex):
+        cols = ["Open", "High", "Low", "Close", "Volume"]
+        data = {}
+        for c in cols:
+            if (c, ticker) in raw_df.columns:
+                data[c] = raw_df[(c, ticker)]
+        df = pd.DataFrame(data).dropna()
+    else:
+        # single ticker
+        need = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in raw_df.columns]
+        df = raw_df[need].copy().dropna()
+
+    # mplfinance expects DatetimeIndex
+    if not isinstance(df.index, pd.DatetimeIndex):
+        try:
+            df.index = pd.to_datetime(df.index)
+        except Exception:
+            pass
+    return df
+
+def _make_chart_png(raw_df: pd.DataFrame, ticker: str, out_path: str, bars: int = 80) -> bool:
+    """Create a candlestick chart PNG with SMA25 (optional)."""
+    if not MPF_AVAILABLE:
+        return False
+
+    try:
+        df = _extract_ohlcv_for_ticker(raw_df, ticker)
+        if df.empty:
+            return False
+
+        # use last N bars
+        df = df.tail(bars).copy()
+
+        # add SMA25 for readability (doesn't change screening)
+        if "Close" in df.columns and len(df) >= 25:
+            df["SMA25"] = df["Close"].rolling(25).mean()
+            apds = [mpf.make_addplot(df["SMA25"])]
+        else:
+            apds = None
+
+        title = ticker_name_map.get(ticker, "")
+        if title:
+            chart_title = f"{ticker} {title}"
+        else:
+            chart_title = ticker
+
+        mpf.plot(
+            df,
+            type="candle",
+            volume=("Volume" in df.columns),
+            addplot=apds,
+            title=chart_title,
+            style="yahoo",
+            datetime_format="%Y-%m-%d",
+            xrotation=0,
+            savefig=dict(fname=out_path, dpi=150, bbox_inches="tight"),
+        )
+        return True
+    except Exception as e:
+        print(f"[WARN] chart create failed ticker={ticker}: {e}")
+        return False
 
 # ==========================
 # Data download
@@ -112,78 +212,43 @@ def download_prices(tickers, period="1y", interval="1d"):
         period=period,
         interval=interval,
         progress=False,
-        auto_adjust=True,   # ★重要：調整後OHLCに統一
+        auto_adjust=True,
         threads=True,
     )
     return df
 
 # ==========================
-# Indicator calculations（最小差分：ATR/ADXをWilder方式へ）
+# Indicator calculations（既存ロジックのまま）
 # ==========================
 def calc_sma(series, window):
     return series.rolling(window).mean()
 
-def _rma_wilder(series: pd.Series, length: int) -> pd.Series:
-    """
-    Wilder's RMA (RMA/SMMA): alpha = 1/length
-    - 最初の値は最初length本のSMA
-    - 以降は prev*(length-1)/length + cur/length
-    """
-    s = series.astype(float)
-    out = pd.Series(np.nan, index=s.index, dtype=float)
-    if len(s) < length:
-        return out
-
-    first = s.iloc[:length].mean()
-    out.iloc[length - 1] = first
-    for i in range(length, len(s)):
-        out.iloc[i] = (out.iloc[i - 1] * (length - 1) + s.iloc[i]) / length
-    return out
-
 def calc_atr_pct(high, low, close, window=20):
-    """
-    ATR% = Wilder ATR / Close * 100
-    """
     prev_close = close.shift(1)
     tr = pd.concat(
         [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
         axis=1
     ).max(axis=1)
-
-    atr = _rma_wilder(tr, window)   # ★Wilder
+    atr = tr.rolling(window).mean()
     atr_pct = (atr / close) * 100.0
     return atr_pct
 
 def calc_adx(high, low, close, window=14):
-    """
-    ADX (Wilder):
-    1) +DM/-DM は「上昇幅/下落幅の大きい方だけ採用」ルール
-    2) TR, +DM, -DM を Wilder(RMA) で平滑化
-    3) +DI/-DI -> DX -> ADX を Wilder(RMA)
-    """
-    up_move = high.diff()
-    down_move = -low.diff()
+    plus_dm = (high.diff()).clip(lower=0)
+    minus_dm = (-low.diff()).clip(lower=0)
 
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    plus_dm = pd.Series(plus_dm, index=high.index)
-    minus_dm = pd.Series(minus_dm, index=high.index)
+    tr1 = (high - low).abs()
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
-        axis=1
-    ).max(axis=1)
+    atr = tr.rolling(window).sum()
 
-    atr = _rma_wilder(tr, window)          # Wilder ATR(=TRのRMA)
-    plus_dm_sm = _rma_wilder(plus_dm, window)
-    minus_dm_sm = _rma_wilder(minus_dm, window)
+    plus_di = 100 * plus_dm.rolling(window).sum() / atr
+    minus_di = 100 * minus_dm.rolling(window).sum() / atr
 
-    plus_di = 100.0 * (plus_dm_sm / atr)
-    minus_di = 100.0 * (minus_dm_sm / atr)
-
-    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di)
-    adx = _rma_wilder(dx, window)          # ★Wilder ADX
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    adx = dx.rolling(window).mean()
     return adx
 
 def calc_bb_touch_counts(close, high, low, window=20, sigma=1.0):
@@ -224,7 +289,6 @@ def latest_atr_swing_from_raw(raw_df: pd.DataFrame, tickers: list):
             sma25 = calc_sma(close, 25)
             atr20_pct = calc_atr_pct(high, low, close, 20)
             adx14 = calc_adx(high, low, close, 14)
-
             up_cnt, dn_cnt = calc_bb_touch_counts(close, high, low, 20, sigma=1.0)
 
             last_dt = close.index[-1]
@@ -272,10 +336,6 @@ def main():
         return
 
     # ---- 抽出ロジック（既存のまま） ----
-    # ① ADX<=25
-    # ② ±1σタッチ回数>=3（上・下それぞれ>=3）
-    # ③ 1.8<=ATR<=4
-    # ④ SMA25乖離率(|%|)<=0.5
     latest_df["BB_up_1sigma_touch_cnt20"] = pd.to_numeric(latest_df["BB_up_1sigma_touch_cnt20"], errors="coerce")
     latest_df["BB_dn_1sigma_touch_cnt20"] = pd.to_numeric(latest_df["BB_dn_1sigma_touch_cnt20"], errors="coerce")
     latest_df["ATR20_pct"] = pd.to_numeric(latest_df["ATR20_pct"], errors="coerce")
@@ -283,11 +343,11 @@ def main():
     latest_df["SMA_dev_abs"] = pd.to_numeric(latest_df["SMA_dev_abs"], errors="coerce")
 
     filtered = latest_df[
-        (latest_df["ADX14"] <= 20) &
+        (latest_df["ADX14"] <= 25) &
         (latest_df["BB_up_1sigma_touch_cnt20"] >= 3) &
         (latest_df["BB_dn_1sigma_touch_cnt20"] >= 3) &
         (latest_df["ATR20_pct"] >= 1.8) & (latest_df["ATR20_pct"] <= 4.0) &
-        (latest_df["SMA_dev_abs"] <= 0.8)
+        (latest_df["SMA_dev_abs"] <= 0.5)
     ].copy()
 
     filtered = filtered.sort_values(["ATR20_pct"], ascending=False)
@@ -311,7 +371,28 @@ def main():
             f"BBtouch(up/dn)={int(r['BB_up_1sigma_touch_cnt20'])}/{int(r['BB_dn_1sigma_touch_cnt20'])}"
         )
 
-    post_discord("\n".join(lines))
+    message = "\n".join(lines)
+
+    # ---- chart images (optional) ----
+    file_paths = []
+    if MPF_AVAILABLE and len(filtered) > 0:
+        try:
+            # generate up to 10 charts to avoid huge payload
+            max_charts = 10
+            tmp_dir = os.path.join(os.getcwd(), "_charts_tmp")
+            os.makedirs(tmp_dir, exist_ok=True)
+
+            for i, t in enumerate(filtered["Ticker"].tolist()):
+                if i >= max_charts:
+                    break
+                out_path = os.path.join(tmp_dir, f"{t.replace('.', '_')}.png")
+                ok = _make_chart_png(raw, t, out_path, bars=80)
+                if ok and os.path.exists(out_path):
+                    file_paths.append(out_path)
+        except Exception as e:
+            print(f"[WARN] chart batch failed: {e}")
+
+    post_discord(message, file_paths=file_paths)
 
 if __name__ == "__main__":
     main()
