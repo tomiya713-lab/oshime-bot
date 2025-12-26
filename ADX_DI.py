@@ -76,7 +76,7 @@ ticker_name_map = {
     "9104.T": "商船三井", "9107.T": "川崎汽船", "9147.T": "NXHD", "9201.T": "JAL",
     "9202.T": "ANAHD", "9301.T": "三菱倉庫", "9432.T": "NTT", "9433.T": "KDDI",
     "9434.T": "ソフトバンク", "9501.T": "東電HD", "9502.T": "中部電", "9503.T": "関西電",
-    "9531.T": "東ガス", "9532.T": "大阪ガス", "9602.T": "東宝", "9613.T": "NTTデータ",
+    "9531.T": "東ガス", "9532.T": "大阪ガス", "9602.T": "東宝", "6963.T": "ローム",
     "9735.T": "セコム", "9766.T": "コナミG", "9843.T": "ニトリHD", "9983.T": "ファーストリテ",
     "9984.T": "ソフトバンクG",
 }
@@ -102,6 +102,7 @@ def chunk_text(text: str, limit: int = 1900):
     if buf:
         out.append("\n".join(buf))
     return out
+
 
 def discord_post(payload: dict, files=None):
     if not DISCORD_WEBHOOK_URL:
@@ -172,8 +173,16 @@ ATR_MIN_PCT = 1.8
 ATR_MAX_PCT = 4.0
 BB_TOUCH_MIN = 3
 SMA_SLOPE_MAX_PCT = 0.5
-DI_DIFF_MAX = float(os.getenv("DI_DIFF_MAX", "5.0"))
+
+# ★ DI差分フィルタ（|+DI14 - -DI14| が小さいほど「方向感が薄い」）
+DI_DIFF_MAX = float(os.getenv("DI_DIFF_MAX", "7.0"))
+
+# ★ 底値上昇比率（+DI14 ÷ -DI14 が 3%以上 = 1.03以上）
 BOTTOM_RISE_RATIO_MIN = float(os.getenv("BOTTOM_RISE_RATIO_MIN", "1.03"))
+
+# ★ 指標CSV出力（GitHub ActionsでArtifacts化する前提でもOK）
+METRICS_OUT_DIR = os.getenv("METRICS_OUT_DIR", "reports")
+METRICS_PREFIX = os.getenv("METRICS_PREFIX", "atr_swing_metrics")
 
 # チャート設定（既存のまま使う想定。未設定ならデフォルトで安全に動作）
 CHART_OUT_DIR = os.getenv("CHART_OUT_DIR", "charts")
@@ -189,23 +198,79 @@ def calc_latest_metrics_from_raw(raw_df: pd.DataFrame, ticker: str):
       - 直近20日で BB(20,±1σ) +1σ/-1σ タッチ回数 >= 3
       - |SMA25の20日傾き(%)| <= 0.5
       - |+DI14 - -DI14| <= DI_DIFF_MAX
-      - (+DI14 / -DI14) >= BOTTOM_RISE_RATIO_MIN  ★追加★
+      - (+DI14 / -DI14) >= BOTTOM_RISE_RATIO_MIN
 
     通知追加用
       - Close（最新終値）
       - BB(20,±1σ)の価格（最新日の上下1σ）
       - +DI14 / -DI14 / DI_diff / bottom_rise_ratio
     """
+    m = calc_latest_metrics_all_from_raw(raw_df, ticker)
+    if m is None:
+        return None
+
+    if not bool(m.get("Pass", False)):
+        return None
+
+    # 抽出条件を通ったものだけ返す
+    return {
+        "Ticker": m["Ticker"],
+        "Name": m["Name"],
+        "Close": m["Close"],
+        "ATR20_pct": m["ATR20_pct"],
+        "ADX14": m["ADX14"],
+        "BB_up_touch_cnt20": m["BB_up_touch_cnt20"],
+        "BB_dn_touch_cnt20": m["BB_dn_touch_cnt20"],
+        "BB_up_1": m["BB_up_1"],
+        "BB_dn_1": m["BB_dn_1"],
+        "SMA25_slope20_pct": m["SMA25_slope20_pct"],
+        "PLUS_DI14": m["PLUS_DI14"],
+        "MINUS_DI14": m["MINUS_DI14"],
+        "DI_diff": m["DI_diff"],
+        "Bottom_Rise_Ratio": m["Bottom_Rise_Ratio"],
+    }
+
+
+def calc_latest_metrics_all_from_raw(raw_df: pd.DataFrame, ticker: str):
+    """
+    ★全銘柄CSV用：指標を計算できたら必ず返す（抽出条件で落とさない）
+    - Pass/Fail と、各条件の判定列も返す（閾値調整用）
+    """
     try:
         if not isinstance(raw_df.columns, pd.MultiIndex):
             return None
 
+        # yfinance multi-index の想定
         close = raw_df[("Close", ticker)].dropna()
         high = raw_df[("High", ticker)].reindex(close.index)
         low = raw_df[("Low", ticker)].reindex(close.index)
 
         if len(close) < 60:
-            return None
+            # データ不足でも行は作りたいので、NaN行を返す
+            return {
+                "Ticker": ticker,
+                "Name": ticker_name_map.get(ticker, ""),
+                "Close": np.nan,
+                "ATR20_pct": np.nan,
+                "ADX14": np.nan,
+                "BB_up_touch_cnt20": np.nan,
+                "BB_dn_touch_cnt20": np.nan,
+                "BB_up_1": np.nan,
+                "BB_dn_1": np.nan,
+                "SMA25_slope20_pct": np.nan,
+                "PLUS_DI14": np.nan,
+                "MINUS_DI14": np.nan,
+                "DI_diff": np.nan,
+                "Bottom_Rise_Ratio": np.nan,
+                "Pass_ADX": False,
+                "Pass_ATR": False,
+                "Pass_BB": False,
+                "Pass_SMA_Slope": False,
+                "Pass_DI_Diff": False,
+                "Pass_Bottom_Rise_Ratio": False,
+                "Pass": False,
+                "Reason": "insufficient_data",
+            }
 
         # --- ATR20% ---
         prev_close = close.shift(1)
@@ -236,10 +301,10 @@ def calc_latest_metrics_from_raw(raw_df: pd.DataFrame, ticker: str):
         dx = 100.0 * (plus_di14 - minus_di14).abs() / (plus_di14 + minus_di14)
         adx14 = dx.rolling(14, min_periods=14).mean()
 
-        # 追加：DI差分
+        # DI差分
         di_diff = (plus_di14 - minus_di14).abs()
 
-        # ★追加：底値上昇比率（+DI14 ÷ -DI14）
+        # 底値上昇比率（+DI14 ÷ -DI14）※ゼロ除算回避
         bottom_rise_ratio = plus_di14 / minus_di14.replace(0, np.nan)
 
         # --- BB(20,±1σ) & タッチ回数（直近20日） ---
@@ -274,29 +339,45 @@ def calc_latest_metrics_from_raw(raw_df: pd.DataFrame, ticker: str):
         di_diff_v = di_diff.iloc[-1]
         bottom_rise_ratio_v = bottom_rise_ratio.iloc[-1]
 
+        # 欠損なら「計算不能」として返す（行は残す）
         if any(pd.isna(x) for x in [
             close_v, atr_v, adx_v, up_cnt, dn_cnt, sma_slope_v, bb_up_v, bb_dn_v,
             plus_di_v, minus_di_v, di_diff_v, bottom_rise_ratio_v
         ]):
-            return None
+            return {
+                "Ticker": ticker,
+                "Name": ticker_name_map.get(ticker, ""),
+                "Close": float(close_v) if not pd.isna(close_v) else np.nan,
+                "ATR20_pct": float(atr_v) if not pd.isna(atr_v) else np.nan,
+                "ADX14": float(adx_v) if not pd.isna(adx_v) else np.nan,
+                "BB_up_touch_cnt20": int(up_cnt) if not pd.isna(up_cnt) else np.nan,
+                "BB_dn_touch_cnt20": int(dn_cnt) if not pd.isna(dn_cnt) else np.nan,
+                "BB_up_1": float(bb_up_v) if not pd.isna(bb_up_v) else np.nan,
+                "BB_dn_1": float(bb_dn_v) if not pd.isna(bb_dn_v) else np.nan,
+                "SMA25_slope20_pct": float(sma_slope_v) if not pd.isna(sma_slope_v) else np.nan,
+                "PLUS_DI14": float(plus_di_v) if not pd.isna(plus_di_v) else np.nan,
+                "MINUS_DI14": float(minus_di_v) if not pd.isna(minus_di_v) else np.nan,
+                "DI_diff": float(di_diff_v) if not pd.isna(di_diff_v) else np.nan,
+                "Bottom_Rise_Ratio": float(bottom_rise_ratio_v) if not pd.isna(bottom_rise_ratio_v) else np.nan,
+                "Pass_ADX": False,
+                "Pass_ATR": False,
+                "Pass_BB": False,
+                "Pass_SMA_Slope": False,
+                "Pass_DI_Diff": False,
+                "Pass_Bottom_Rise_Ratio": False,
+                "Pass": False,
+                "Reason": "nan_metrics",
+            }
 
-        # --- 条件判定 ---
-        if float(adx_v) > ADX_MAX:
-            return None
-        if not (ATR_MIN_PCT <= float(atr_v) <= ATR_MAX_PCT):
-            return None
-        if int(up_cnt) < BB_TOUCH_MIN or int(dn_cnt) < BB_TOUCH_MIN:
-            return None
-        if abs(float(sma_slope_v)) > SMA_SLOPE_MAX_PCT:
-            return None
+        # --- 条件判定（抽出条件と同一） ---
+        pass_adx = float(adx_v) <= ADX_MAX
+        pass_atr = (ATR_MIN_PCT <= float(atr_v) <= ATR_MAX_PCT)
+        pass_bb = (int(up_cnt) >= BB_TOUCH_MIN) and (int(dn_cnt) >= BB_TOUCH_MIN)
+        pass_sma = abs(float(sma_slope_v)) <= SMA_SLOPE_MAX_PCT
+        pass_di_diff = float(di_diff_v) <= DI_DIFF_MAX
+        pass_bottom_ratio = float(bottom_rise_ratio_v) >= BOTTOM_RISE_RATIO_MIN
 
-        # 追加：DI差分条件
-        if float(di_diff_v) > DI_DIFF_MAX:
-            return None
-
-        # ★追加：底値上昇比率条件（+DI14 ÷ -DI14 が 3%以上）
-        if float(bottom_rise_ratio_v) < BOTTOM_RISE_RATIO_MIN:
-            return None
+        passed = all([pass_adx, pass_atr, pass_bb, pass_sma, pass_di_diff, pass_bottom_ratio])
 
         return {
             "Ticker": ticker,
@@ -313,10 +394,41 @@ def calc_latest_metrics_from_raw(raw_df: pd.DataFrame, ticker: str):
             "MINUS_DI14": float(minus_di_v),
             "DI_diff": float(di_diff_v),
             "Bottom_Rise_Ratio": float(bottom_rise_ratio_v),
+            "Pass_ADX": bool(pass_adx),
+            "Pass_ATR": bool(pass_atr),
+            "Pass_BB": bool(pass_bb),
+            "Pass_SMA_Slope": bool(pass_sma),
+            "Pass_DI_Diff": bool(pass_di_diff),
+            "Pass_Bottom_Rise_Ratio": bool(pass_bottom_ratio),
+            "Pass": bool(passed),
+            "Reason": "",
         }
 
     except Exception:
-        return None
+        return {
+            "Ticker": ticker,
+            "Name": ticker_name_map.get(ticker, ""),
+            "Close": np.nan,
+            "ATR20_pct": np.nan,
+            "ADX14": np.nan,
+            "BB_up_touch_cnt20": np.nan,
+            "BB_dn_touch_cnt20": np.nan,
+            "BB_up_1": np.nan,
+            "BB_dn_1": np.nan,
+            "SMA25_slope20_pct": np.nan,
+            "PLUS_DI14": np.nan,
+            "MINUS_DI14": np.nan,
+            "DI_diff": np.nan,
+            "Bottom_Rise_Ratio": np.nan,
+            "Pass_ADX": False,
+            "Pass_ATR": False,
+            "Pass_BB": False,
+            "Pass_SMA_Slope": False,
+            "Pass_DI_Diff": False,
+            "Pass_Bottom_Rise_Ratio": False,
+            "Pass": False,
+            "Reason": "exception",
+        }
 
 
 def screen_candidates(raw_df: pd.DataFrame, tickers):
@@ -331,6 +443,29 @@ def screen_candidates(raw_df: pd.DataFrame, tickers):
 
     df = pd.DataFrame(rows)
     df = df.sort_values(["ADX14", "ATR20_pct"], ascending=[True, False]).reset_index(drop=True)
+    return df
+
+
+def compute_all_metrics(raw_df: pd.DataFrame, tickers):
+    """
+    全銘柄分：計算できた指標を全部出す（抽出条件で落とさない）。
+    Pass/Failと、各条件の判定列も含める（閾値調整用）。
+    """
+    rows = []
+    for t in tickers:
+        m = calc_latest_metrics_all_from_raw(raw_df, t)
+        if m is None:
+            continue
+        rows.append(m)
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+
+    # 見やすい並び
+    df = df.sort_values(["Pass", "Ticker"], ascending=[False, True]).reset_index(drop=True)
+
     return df
 
 
@@ -420,16 +555,16 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
         t = r["Ticker"]
         name = r.get("Name", "")
 
-        # ★指定の順番・表記に変更（価格は小数点不要）
+        # 現在価格 → BB(±1σ) → 底値上昇比率 → 以降は今の順番
         desc = (
             f"現在価格:{fp(r['Close'],0)}  "
             f"BB(±1σ):{fp(r['BB_dn_1'],0)}–{fp(r['BB_up_1'],0)}  "
-            f"底値上昇比率:{fp(r['Bottom_Rise_Ratio'],1)}  "
-            f"ATR%:{fp(r['ATR20_pct'],1)}  "
+            f"底値上昇比率:{fp(r['Bottom_Rise_Ratio'],2)}  "
+            f"ATR%:{fp(r['ATR20_pct'],2)}  "
             f"ADX:{fp(r['ADX14'],1)}  "
             f"DI_diff:{fp(r['DI_diff'],1)}  "
             f"BB(+/-):{int(r['BB_up_touch_cnt20'])}/{int(r['BB_dn_touch_cnt20'])}  "
-            f"SMA_slope%:{fp(r['SMA25_slope20_pct'],1)}"
+            f"SMA_slope%:{fp(r['SMA25_slope20_pct'],2)}"
         )
 
         img = save_chart_image_with_bb1sigma(raw_df, t, out_dir=CHART_OUT_DIR)
@@ -451,6 +586,18 @@ def main():
         discord_send_text(f"【ATRレンジ候補】 {now_jst():%m/%d %H:%M}\nデータ取得失敗")
         return
 
+    # ===== 全銘柄 指標CSV出力（閾値調整用）=====
+    all_df = compute_all_metrics(raw, tickers)
+    if all_df is not None and not all_df.empty:
+        os.makedirs(METRICS_OUT_DIR, exist_ok=True)
+        ts = now_jst().strftime("%Y%m%d_%H%M")
+        out_path = os.path.join(METRICS_OUT_DIR, f"{METRICS_PREFIX}_{ts}.csv")
+        all_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+        print(f"[INFO] metrics csv saved: {out_path}")
+    else:
+        print("[WARN] metrics csv not created (no rows).", file=sys.stderr)
+
+    # ===== 抽出 → 通知 =====
     df = screen_candidates(raw, tickers)
     notify(df, raw)
 
