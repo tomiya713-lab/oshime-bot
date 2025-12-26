@@ -15,7 +15,7 @@ except Exception:
     MPF_AVAILABLE = False
 
 
-# ===== 基本設定（通知・環境変数などは変更しない想定） =====
+# ====== 基本設定（通知・環境変数などは変更しない想定） =====
 TZ_OFFSET = 9  # JST
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "180"))
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
@@ -81,7 +81,6 @@ ticker_name_map = {
     "9984.T": "ソフトバンクG",
 }
 
-
 # ===== ユーティリティ（既存運用のまま） =====
 def now_jst() -> datetime:
     return datetime.utcnow() + timedelta(hours=TZ_OFFSET)
@@ -103,7 +102,6 @@ def chunk_text(text: str, limit: int = 1900):
     if buf:
         out.append("\n".join(buf))
     return out
-
 
 def discord_post(payload: dict, files=None):
     if not DISCORD_WEBHOOK_URL:
@@ -174,9 +172,8 @@ ATR_MIN_PCT = 1.8
 ATR_MAX_PCT = 4.0
 BB_TOUCH_MIN = 3
 SMA_SLOPE_MAX_PCT = 0.5
-
-# ★ 追加：DI差分フィルタ（|+DI14 - -DI14| が小さいほど「方向感が薄い」）
-DI_DIFF_MAX = float(os.getenv("DI_DIFF_MAX", "7.0"))
+DI_DIFF_MAX = float(os.getenv("DI_DIFF_MAX", "5.0"))
+BOTTOM_RISE_RATIO_MIN = float(os.getenv("BOTTOM_RISE_RATIO_MIN", "1.03"))
 
 # チャート設定（既存のまま使う想定。未設定ならデフォルトで安全に動作）
 CHART_OUT_DIR = os.getenv("CHART_OUT_DIR", "charts")
@@ -191,12 +188,13 @@ def calc_latest_metrics_from_raw(raw_df: pd.DataFrame, ticker: str):
       - 1.8% <= ATR20% <= 4.0%
       - 直近20日で BB(20,±1σ) +1σ/-1σ タッチ回数 >= 3
       - |SMA25の20日傾き(%)| <= 0.5
-      - |+DI14 - -DI14| <= DI_DIFF_MAX  ★追加★
+      - |+DI14 - -DI14| <= DI_DIFF_MAX
+      - (+DI14 / -DI14) >= BOTTOM_RISE_RATIO_MIN  ★追加★
 
     通知追加用
       - Close（最新終値）
       - BB(20,±1σ)の価格（最新日の上下1σ）
-      - +DI14 / -DI14 / DI_diff
+      - +DI14 / -DI14 / DI_diff / bottom_rise_ratio
     """
     try:
         if not isinstance(raw_df.columns, pd.MultiIndex):
@@ -238,8 +236,11 @@ def calc_latest_metrics_from_raw(raw_df: pd.DataFrame, ticker: str):
         dx = 100.0 * (plus_di14 - minus_di14).abs() / (plus_di14 + minus_di14)
         adx14 = dx.rolling(14, min_periods=14).mean()
 
-        # ★追加：DI差分（方向感の強さを落とす）
+        # 追加：DI差分
         di_diff = (plus_di14 - minus_di14).abs()
+
+        # ★追加：底値上昇比率（+DI14 ÷ -DI14）
+        bottom_rise_ratio = plus_di14 / minus_di14.replace(0, np.nan)
 
         # --- BB(20,±1σ) & タッチ回数（直近20日） ---
         bb_mid = close.rolling(20, min_periods=20).mean()
@@ -271,10 +272,11 @@ def calc_latest_metrics_from_raw(raw_df: pd.DataFrame, ticker: str):
         plus_di_v = plus_di14.iloc[-1]
         minus_di_v = minus_di14.iloc[-1]
         di_diff_v = di_diff.iloc[-1]
+        bottom_rise_ratio_v = bottom_rise_ratio.iloc[-1]
 
         if any(pd.isna(x) for x in [
             close_v, atr_v, adx_v, up_cnt, dn_cnt, sma_slope_v, bb_up_v, bb_dn_v,
-            plus_di_v, minus_di_v, di_diff_v
+            plus_di_v, minus_di_v, di_diff_v, bottom_rise_ratio_v
         ]):
             return None
 
@@ -288,8 +290,12 @@ def calc_latest_metrics_from_raw(raw_df: pd.DataFrame, ticker: str):
         if abs(float(sma_slope_v)) > SMA_SLOPE_MAX_PCT:
             return None
 
-        # ★追加：DI差分条件
+        # 追加：DI差分条件
         if float(di_diff_v) > DI_DIFF_MAX:
+            return None
+
+        # ★追加：底値上昇比率条件（+DI14 ÷ -DI14 が 3%以上）
+        if float(bottom_rise_ratio_v) < BOTTOM_RISE_RATIO_MIN:
             return None
 
         return {
@@ -306,6 +312,7 @@ def calc_latest_metrics_from_raw(raw_df: pd.DataFrame, ticker: str):
             "PLUS_DI14": float(plus_di_v),
             "MINUS_DI14": float(minus_di_v),
             "DI_diff": float(di_diff_v),
+            "Bottom_Rise_Ratio": float(bottom_rise_ratio_v),
         }
 
     except Exception:
@@ -373,28 +380,35 @@ def save_chart_image_with_bb1sigma(raw_df: pd.DataFrame, ticker: str, out_dir: s
 
 
 def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
-    title = f"【ATRレンジ候補（ADX≤25 × ATR(1.8-4)% × BB±1σ>=3 × SMA傾き小 × DI_diff≤{DI_DIFF_MAX:g}）】"
+    title = (
+        f"【ATRレンジ候補（ADX≤25 × ATR(1.8-4)% × BB±1σ>=3 × SMA傾き小 × "
+        f"DI_diff≤{DI_DIFF_MAX:g} × 底値上昇比率≥{BOTTOM_RISE_RATIO_MIN:g}）】"
+    )
 
     if df is None or df.empty:
         discord_send_text(f"{title} {now_jst():%m/%d %H:%M}\n対象なし")
         return
 
     lines = [f"{title} {now_jst():%m/%d %H:%M}"]
-    lines.append("Ticker   名称       Close   ATR%   ADX   DIΔ   BB(+/-)   BB_dn1σ   BB_up1σ   SMA_slope%")
+    lines.append("Ticker   名称       現在価格   ATR%   ADX   DIΔ   底値上昇比率   BB(+/-)   BB_dn1σ   BB_up1σ   SMA_slope%")
 
     for _, r in df.iterrows():
         t = r["Ticker"]
         name = r.get("Name", "")
-        close = fp(r["Close"], 2)
+        close = fp(r["Close"], 0)
         atr = fp(r["ATR20_pct"], 2)
         adx = fp(r["ADX14"], 1)
         did = fp(r["DI_diff"], 1)
+        br = fp(r["Bottom_Rise_Ratio"], 2)
         upc = str(int(r["BB_up_touch_cnt20"]))
         dnc = str(int(r["BB_dn_touch_cnt20"]))
-        bb_dn = fp(r["BB_dn_1"], 2)
-        bb_up = fp(r["BB_up_1"], 2)
+        bb_dn = fp(r["BB_dn_1"], 0)
+        bb_up = fp(r["BB_up_1"], 0)
         smas = fp(r["SMA25_slope20_pct"], 2)
-        lines.append(f"{t:<7} {name:<8} {close:>7} {atr:>6} {adx:>6} {did:>5}   {upc:>2}/{dnc:<2}   {bb_dn:>7}   {bb_up:>7}   {smas:>9}")
+        lines.append(
+            f"{t:<7} {name:<8} {close:>8} {atr:>6} {adx:>6} {did:>5} {br:>12}   "
+            f"{upc:>2}/{dnc:<2}   {bb_dn:>7}   {bb_up:>7}   {smas:>9}"
+        )
 
     for part in chunk_text("\n".join(lines)):
         discord_send_text(part)
@@ -405,13 +419,19 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
     for _, r in df.head(CHART_TOP_N).iterrows():
         t = r["Ticker"]
         name = r.get("Name", "")
+
+        # ★指定の順番・表記に変更（価格は小数点不要）
         desc = (
-            f"Close:{fp(r['Close'],2)}  ATR%:{fp(r['ATR20_pct'],2)}  ADX:{fp(r['ADX14'],1)}  "
+            f"現在価格:{fp(r['Close'],0)}  "
+            f"BB(±1σ):{fp(r['BB_dn_1'],0)}–{fp(r['BB_up_1'],0)}  "
+            f"底値上昇比率:{fp(r['Bottom_Rise_Ratio'],1)}  "
+            f"ATR%:{fp(r['ATR20_pct'],1)}  "
+            f"ADX:{fp(r['ADX14'],1)}  "
             f"DI_diff:{fp(r['DI_diff'],1)}  "
             f"BB(+/-):{int(r['BB_up_touch_cnt20'])}/{int(r['BB_dn_touch_cnt20'])}  "
-            f"BB(±1σ):{fp(r['BB_dn_1'],2)}–{fp(r['BB_up_1'],2)}  "
-            f"SMA_slope%:{fp(r['SMA25_slope20_pct'],2)}"
+            f"SMA_slope%:{fp(r['SMA25_slope20_pct'],1)}"
         )
+
         img = save_chart_image_with_bb1sigma(raw_df, t, out_dir=CHART_OUT_DIR)
         if img:
             discord_send_image_file(img, title=f"{t} {name}".strip(), description=desc)
