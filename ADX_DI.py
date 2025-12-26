@@ -21,7 +21,7 @@ LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "180"))
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 FORCE_RUN = os.getenv("FORCE_RUN", "0") == "1"
 
-# ===== 日経225ティッカー =====
+===== 日経225ティッカー =====
 nikkei225_tickers = [ '4151.T','4502.T','4503.T','4506.T','4507.T','4519.T','4523.T','4568.T','4578.T','6479.T','6501.T','6503.T','6504.T','6506.T','6526.T','6594.T','6645.T','6674.T','6701.T','6702.T','6723.T','6724.T','6752.T','6753.T','6758.T','6762.T','6770.T','6841.T','6857.T','6861.T','6902.T','6920.T','6952.T','6954.T','6971.T','6976.T','6981.T','7735.T','7751.T','7752.T','8035.T','7201.T','7202.T','7203.T','7205.T','7211.T','7261.T','7267.T','7269.T','7270.T','7272.T','4543.T','4902.T','6146.T','7731.T','7733.T','7741.T','7762.T','9432.T','9433.T','9434.T','6963.T','9984.T','5831.T','7186.T','8304.T','8306.T','8308.T','8309.T','8316.T','8331.T','8354.T','8411.T','8253.T','8591.T','8697.T','8601.T','8604.T','8630.T','8725.T','8750.T','8766.T','8795.T','1332.T','2002.T','2269.T','2282.T','2501.T','2502.T','2503.T','2801.T','2802.T','2871.T','2914.T','3086.T','3092.T','3099.T','3382.T','7453.T','8233.T','8252.T','8267.T','9843.T','9983.T','2413.T','2432.T','3659.T','4307.T','4324.T','4385.T','4661.T','4689.T','4704.T','4751.T','4755.T','6098.T','6178.T','7974.T','9602.T','9735.T','9766.T','1605.T','3401.T','3402.T','3861.T','3405.T','3407.T','4004.T','4005.T','4021.T','4042.T','4043.T','4061.T','4063.T','4183.T','4188.T','4208.T','4452.T','4901.T','4911.T','6988.T','5019.T','5020.T','5101.T','5108.T','5201.T','5214.T','5233.T','5301.T','5332.T','5333.T','5401.T','5406.T','5411.T','3436.T','5706.T','5711.T','5713.T','5714.T','5801.T','5802.T','5803.T','2768.T','8001.T','8002.T','8015.T','8031.T','8053.T','8058.T','1721.T','1801.T','1802.T','1803.T','1808.T','1812.T','1925.T','1928.T','1963.T','5631.T','6103.T','6113.T','6273.T','6301.T','6302.T','6305.T','6326.T','6361.T','6367.T','6471.T','6472.T','6473.T','7004.T','7011.T','7013.T','7012.T','7832.T','7911.T','7912.T','7951.T','3289.T','8801.T','8802.T','8804.T','8830.T','9001.T','9005.T','9007.T','9008.T','9009.T','9020.T','9021.T','9022.T','9064.T','9147.T','9101.T','9104.T','9107.T','9201.T','9202.T','9301.T','9501.T','9502.T','9503.T','9531.T','9532.T' ]
 
 # ===== 短縮名マップ =====
@@ -76,7 +76,7 @@ ticker_name_map = {
     "9104.T": "商船三井", "9107.T": "川崎汽船", "9147.T": "NXHD", "9201.T": "JAL",
     "9202.T": "ANAHD", "9301.T": "三菱倉庫", "9432.T": "NTT", "9433.T": "KDDI",
     "9434.T": "ソフトバンク", "9501.T": "東電HD", "9502.T": "中部電", "9503.T": "関西電",
-    "9531.T": "東ガス", "9532.T": "大阪ガス", "9602.T": "東宝", "6963.T": "ローム",
+    "9531.T": "東ガス", "9532.T": "大阪ガス", "9602.T": "東宝", "9613.T": "NTTデータ",
     "9735.T": "セコム", "9766.T": "コナミG", "9843.T": "ニトリHD", "9983.T": "ファーストリテ",
     "9984.T": "ソフトバンクG",
 }
@@ -177,8 +177,8 @@ SMA_SLOPE_MAX_PCT = 0.5
 # ★ DI差分フィルタ（|+DI14 - -DI14| が小さいほど「方向感が薄い」）
 DI_DIFF_MAX = float(os.getenv("DI_DIFF_MAX", "7.0"))
 
-# ★ 底値上昇比率（+DI14 ÷ -DI14 が 3%以上 = 1.03以上）
-BOTTOM_RISE_RATIO_MIN = float(os.getenv("BOTTOM_RISE_RATIO_MIN", "1.03"))
+# ★ DI比率（+DI14 ÷ -DI14 が 3%以上 = 1.03以上）
+DI_RATIO_MIN = float(os.getenv("DI_RATIO_MIN", "1.03"))
 
 # ★ 指標CSV出力（GitHub ActionsでArtifacts化する前提でもOK）
 METRICS_OUT_DIR = os.getenv("METRICS_OUT_DIR", "reports")
@@ -196,14 +196,14 @@ def calc_latest_metrics_from_raw(raw_df: pd.DataFrame, ticker: str):
       - ADX14 <= 25
       - 1.8% <= ATR20% <= 4.0%
       - 直近20日で BB(20,±1σ) +1σ/-1σ タッチ回数 >= 3
-      - |SMA25の20日傾き(%)| <= 5
+      - |SMA25の20日傾き(%)| <= 0.5
       - |+DI14 - -DI14| <= DI_DIFF_MAX
-      - (+DI14 / -DI14) >= BOTTOM_RISE_RATIO_MIN
+      - (+DI14 / -DI14) >= DI_RATIO_MIN
 
     通知追加用
       - Close（最新終値）
       - BB(20,±1σ)の価格（最新日の上下1σ）
-      - +DI14 / -DI14 / DI_diff / bottom_rise_ratio
+      - Bottom_Rise_Ratio = BB_up_1 / BB_dn_1（価格レンジ比率）
     """
     m = calc_latest_metrics_all_from_raw(raw_df, ticker)
     if m is None:
@@ -212,7 +212,6 @@ def calc_latest_metrics_from_raw(raw_df: pd.DataFrame, ticker: str):
     if not bool(m.get("Pass", False)):
         return None
 
-    # 抽出条件を通ったものだけ返す
     return {
         "Ticker": m["Ticker"],
         "Name": m["Name"],
@@ -227,7 +226,8 @@ def calc_latest_metrics_from_raw(raw_df: pd.DataFrame, ticker: str):
         "PLUS_DI14": m["PLUS_DI14"],
         "MINUS_DI14": m["MINUS_DI14"],
         "DI_diff": m["DI_diff"],
-        "Bottom_Rise_Ratio": m["Bottom_Rise_Ratio"],
+        "DI_Ratio": m["DI_Ratio"],
+        "Bottom_Rise_Ratio": m["Bottom_Rise_Ratio"],  # BB_up_1 / BB_dn_1
     }
 
 
@@ -240,13 +240,11 @@ def calc_latest_metrics_all_from_raw(raw_df: pd.DataFrame, ticker: str):
         if not isinstance(raw_df.columns, pd.MultiIndex):
             return None
 
-        # yfinance multi-index の想定
         close = raw_df[("Close", ticker)].dropna()
         high = raw_df[("High", ticker)].reindex(close.index)
         low = raw_df[("Low", ticker)].reindex(close.index)
 
         if len(close) < 60:
-            # データ不足でも行は作りたいので、NaN行を返す
             return {
                 "Ticker": ticker,
                 "Name": ticker_name_map.get(ticker, ""),
@@ -261,13 +259,14 @@ def calc_latest_metrics_all_from_raw(raw_df: pd.DataFrame, ticker: str):
                 "PLUS_DI14": np.nan,
                 "MINUS_DI14": np.nan,
                 "DI_diff": np.nan,
+                "DI_Ratio": np.nan,
                 "Bottom_Rise_Ratio": np.nan,
                 "Pass_ADX": False,
                 "Pass_ATR": False,
                 "Pass_BB": False,
                 "Pass_SMA_Slope": False,
                 "Pass_DI_Diff": False,
-                "Pass_Bottom_Rise_Ratio": False,
+                "Pass_DI_Ratio": False,
                 "Pass": False,
                 "Reason": "insufficient_data",
             }
@@ -304,8 +303,8 @@ def calc_latest_metrics_all_from_raw(raw_df: pd.DataFrame, ticker: str):
         # DI差分
         di_diff = (plus_di14 - minus_di14).abs()
 
-        # 底値上昇比率（+DI14 ÷ -DI14）※ゼロ除算回避
-        bottom_rise_ratio = plus_di14 / minus_di14.replace(0, np.nan)
+        # DI比率（+DI14 ÷ -DI14）※ゼロ除算回避
+        di_ratio = plus_di14 / minus_di14.replace(0, np.nan)
 
         # --- BB(20,±1σ) & タッチ回数（直近20日） ---
         bb_mid = close.rolling(20, min_periods=20).mean()
@@ -337,12 +336,14 @@ def calc_latest_metrics_all_from_raw(raw_df: pd.DataFrame, ticker: str):
         plus_di_v = plus_di14.iloc[-1]
         minus_di_v = minus_di14.iloc[-1]
         di_diff_v = di_diff.iloc[-1]
-        bottom_rise_ratio_v = bottom_rise_ratio.iloc[-1]
+        di_ratio_v = di_ratio.iloc[-1]
 
-        # 欠損なら「計算不能」として返す（行は残す）
+        # 底値上昇比率（BB_up_1 ÷ BB_dn_1）
+        bb_range_ratio_v = bb_up_v / bb_dn_v if float(bb_dn_v) != 0.0 else np.nan
+
         if any(pd.isna(x) for x in [
             close_v, atr_v, adx_v, up_cnt, dn_cnt, sma_slope_v, bb_up_v, bb_dn_v,
-            plus_di_v, minus_di_v, di_diff_v, bottom_rise_ratio_v
+            plus_di_v, minus_di_v, di_diff_v, di_ratio_v, bb_range_ratio_v
         ]):
             return {
                 "Ticker": ticker,
@@ -358,13 +359,14 @@ def calc_latest_metrics_all_from_raw(raw_df: pd.DataFrame, ticker: str):
                 "PLUS_DI14": float(plus_di_v) if not pd.isna(plus_di_v) else np.nan,
                 "MINUS_DI14": float(minus_di_v) if not pd.isna(minus_di_v) else np.nan,
                 "DI_diff": float(di_diff_v) if not pd.isna(di_diff_v) else np.nan,
-                "Bottom_Rise_Ratio": float(bottom_rise_ratio_v) if not pd.isna(bottom_rise_ratio_v) else np.nan,
+                "DI_Ratio": float(di_ratio_v) if not pd.isna(di_ratio_v) else np.nan,
+                "Bottom_Rise_Ratio": float(bb_range_ratio_v) if not pd.isna(bb_range_ratio_v) else np.nan,
                 "Pass_ADX": False,
                 "Pass_ATR": False,
                 "Pass_BB": False,
                 "Pass_SMA_Slope": False,
                 "Pass_DI_Diff": False,
-                "Pass_Bottom_Rise_Ratio": False,
+                "Pass_DI_Ratio": False,
                 "Pass": False,
                 "Reason": "nan_metrics",
             }
@@ -375,9 +377,9 @@ def calc_latest_metrics_all_from_raw(raw_df: pd.DataFrame, ticker: str):
         pass_bb = (int(up_cnt) >= BB_TOUCH_MIN) and (int(dn_cnt) >= BB_TOUCH_MIN)
         pass_sma = abs(float(sma_slope_v)) <= SMA_SLOPE_MAX_PCT
         pass_di_diff = float(di_diff_v) <= DI_DIFF_MAX
-        pass_bottom_ratio = float(bottom_rise_ratio_v) >= BOTTOM_RISE_RATIO_MIN
+        pass_di_ratio = float(di_ratio_v) >= DI_RATIO_MIN
 
-        passed = all([pass_adx, pass_atr, pass_bb, pass_sma, pass_di_diff, pass_bottom_ratio])
+        passed = all([pass_adx, pass_atr, pass_bb, pass_sma, pass_di_diff, pass_di_ratio])
 
         return {
             "Ticker": ticker,
@@ -393,13 +395,14 @@ def calc_latest_metrics_all_from_raw(raw_df: pd.DataFrame, ticker: str):
             "PLUS_DI14": float(plus_di_v),
             "MINUS_DI14": float(minus_di_v),
             "DI_diff": float(di_diff_v),
-            "Bottom_Rise_Ratio": float(bottom_rise_ratio_v),
+            "DI_Ratio": float(di_ratio_v),                      # +DI14 / -DI14
+            "Bottom_Rise_Ratio": float(bb_range_ratio_v),        # BB_up_1 / BB_dn_1
             "Pass_ADX": bool(pass_adx),
             "Pass_ATR": bool(pass_atr),
             "Pass_BB": bool(pass_bb),
             "Pass_SMA_Slope": bool(pass_sma),
             "Pass_DI_Diff": bool(pass_di_diff),
-            "Pass_Bottom_Rise_Ratio": bool(pass_bottom_ratio),
+            "Pass_DI_Ratio": bool(pass_di_ratio),
             "Pass": bool(passed),
             "Reason": "",
         }
@@ -419,13 +422,14 @@ def calc_latest_metrics_all_from_raw(raw_df: pd.DataFrame, ticker: str):
             "PLUS_DI14": np.nan,
             "MINUS_DI14": np.nan,
             "DI_diff": np.nan,
+            "DI_Ratio": np.nan,
             "Bottom_Rise_Ratio": np.nan,
             "Pass_ADX": False,
             "Pass_ATR": False,
             "Pass_BB": False,
             "Pass_SMA_Slope": False,
             "Pass_DI_Diff": False,
-            "Pass_Bottom_Rise_Ratio": False,
+            "Pass_DI_Ratio": False,
             "Pass": False,
             "Reason": "exception",
         }
@@ -462,10 +466,7 @@ def compute_all_metrics(raw_df: pd.DataFrame, tickers):
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
-
-    # 見やすい並び
     df = df.sort_values(["Pass", "Ticker"], ascending=[False, True]).reset_index(drop=True)
-
     return df
 
 
@@ -517,7 +518,7 @@ def save_chart_image_with_bb1sigma(raw_df: pd.DataFrame, ticker: str, out_dir: s
 def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
     title = (
         f"【ATRレンジ候補（ADX≤25 × ATR(1.8-4)% × BB±1σ>=3 × SMA傾き小 × "
-        f"DI_diff≤{DI_DIFF_MAX:g} × 底値上昇比率≥{BOTTOM_RISE_RATIO_MIN:g}）】"
+        f"DI_diff≤{DI_DIFF_MAX:g} × DI比率≥{DI_RATIO_MIN:g}）】"
     )
 
     if df is None or df.empty:
@@ -534,7 +535,7 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
         atr = fp(r["ATR20_pct"], 2)
         adx = fp(r["ADX14"], 1)
         did = fp(r["DI_diff"], 1)
-        br = fp(r["Bottom_Rise_Ratio"], 2)
+        br = fp(r["Bottom_Rise_Ratio"], 3)  # BB比率なので小数は残す方が便利
         upc = str(int(r["BB_up_touch_cnt20"]))
         dnc = str(int(r["BB_dn_touch_cnt20"]))
         bb_dn = fp(r["BB_dn_1"], 0)
@@ -555,11 +556,11 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
         t = r["Ticker"]
         name = r.get("Name", "")
 
-        # 現在価格 → BB(±1σ) → 底値上昇比率 → 以降は今の順番
+        # 現在価格 → BB(±1σ) → 底値上昇比率（BB比率） → 以降は今の順番
         desc = (
             f"現在価格:{fp(r['Close'],0)}  "
             f"BB(±1σ):{fp(r['BB_dn_1'],0)}–{fp(r['BB_up_1'],0)}  "
-            f"底値上昇比率:{fp(r['Bottom_Rise_Ratio'],2)}  "
+            f"底値上昇比率:{fp(r['Bottom_Rise_Ratio'],3)}  "
             f"ATR%:{fp(r['ATR20_pct'],2)}  "
             f"ADX:{fp(r['ADX14'],1)}  "
             f"DI_diff:{fp(r['DI_diff'],1)}  "
