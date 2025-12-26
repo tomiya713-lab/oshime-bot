@@ -196,7 +196,7 @@ def calc_latest_metrics_from_raw(raw_df: pd.DataFrame, ticker: str):
       - ADX14 <= 25
       - 1.8% <= ATR20% <= 4.0%
       - 直近20日で BB(20,±1σ) +1σ/-1σ タッチ回数 >= 3
-      - |SMA25の20日傾き(%)| <= 0.5
+      - |SMA25の20日傾き(%)| <= 5
       - |+DI14 - -DI14| <= DI_DIFF_MAX
       - (+DI14 / -DI14) >= BOTTOM_RISE_RATIO_MIN
 
