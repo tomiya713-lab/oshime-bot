@@ -46,3 +46,13 @@ jobs:
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force && '1' || '' }}
         run: |
           python ADX_DI.py
+
+      # ★追加：全銘柄指標CSV（reports/*.csv）をArtifactsとして保存
+      - name: Upload metrics CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atr-swing-metrics
+          path: reports/*.csv
+          if-no-files-found: warn
+          retention-days: 14
