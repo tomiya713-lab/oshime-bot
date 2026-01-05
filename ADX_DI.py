@@ -172,7 +172,7 @@ ADX_MAX = 25.0
 ATR_MIN_PCT = 1.8
 ATR_MAX_PCT = 6.0
 BB_TOUCH_MIN = 2
-SMA_SLOPE_MAX_PCT = 0.5
+SMA_SLOPE_MAX_PCT = 5
 
 # ★ DI差分フィルタ（|+DI14 - -DI14| が小さいほど「方向感が薄い」）
 DI_DIFF_MAX = float(os.getenv("DI_DIFF_MAX", "7.0"))
