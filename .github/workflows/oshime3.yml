@@ -46,6 +46,7 @@ jobs:
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force && '1' || '' }}
         run: |
           python ADX_DI.py
+          python market_regime_notify.py
           python GC_MACD_BB.py
           pytbon main_rsi.py
 
