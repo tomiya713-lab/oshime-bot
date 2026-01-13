@@ -48,7 +48,7 @@ jobs:
           python ADX_DI.py
           python market_regime_notify.py
           python GC_MACD_BB.py
-          pytbon main_rsi.py
+          python main_rsi.py
 
       # ★追加：全銘柄指標CSV（reports/*.csv）をArtifactsとして保存
       - name: Upload metrics CSV
