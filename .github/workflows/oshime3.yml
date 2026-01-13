@@ -50,7 +50,7 @@ jobs:
 
           # --- AI動作設定（お好みで） ---
           ENABLE_AI: "1"
-          AI_ONLY_ON_ALERT: "1"           # NORMAL時はAIスキップ（節約）
+          AI_ONLY_ON_ALERT: ${{ github.event_name == 'workflow_dispatch' && '0' || '1' }}
           OPENAI_MODEL: "gpt-4.1-mini"    # さらに節約なら gpt-4.1-nano
           OPENAI_MAX_OUTPUT_TOKENS: "700"
           OPENAI_TIMEOUT_SEC: "30"
