@@ -398,7 +398,7 @@ def ai_propose_rss_queries(feat: pd.DataFrame, regime: str):
         "role": "user",
         "content": [
             {
-                "type": "text",
+                "type": "input_text",
                 "text": (
                     "あなたはマーケット監視AI。与えられた指標（VIX/円/日経先物/SPXなど）から、"
                     "今の相場変動に効きやすい『地政学/マクロ』ニュースを探すためのGoogle News RSS検索クエリを提案して。"
@@ -477,7 +477,7 @@ def ai_build_messages(feat: pd.DataFrame, regime: str, reason_line: str, news_it
         "role": "user",
         "content": [
             {
-                "type": "text",
+                "type": "input_text",
                 "text": (
                     "あなたはマーケット監視の解釈担当。出力は日本語。"
                     "ただし、ニュースの見出しは元の言語のままでもよい（=日英ミックス）。"
