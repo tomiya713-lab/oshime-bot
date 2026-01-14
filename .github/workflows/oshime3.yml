@@ -1,4 +1,4 @@
-name: Run RSI Bot (main_rsi)
+name: Run Bots (main_rsi + market_regime + others)
 
 on:
   workflow_dispatch:
@@ -7,8 +7,9 @@ on:
         description: "強制実行（取引時間チェック無視）"
         type: boolean
         default: false
-  # JST 9:02–15:32 を 30分おき（混雑回避の4分/34分）
+
   schedule:
+    # JST 9:02–15:32 を 30分おき（混雑回避の4分/34分）
     - cron: '4,34 0-6 * * 1-5'
 
 jobs:
@@ -37,7 +38,6 @@ jobs:
       - name: Check envs
         run: |
           test -n "${{ secrets.DISCORD_WEBHOOK_URL }}" || (echo "Missing DISCORD_WEBHOOK_URL" && exit 1)
-          # OPENAI_API_KEY は「AIを動かす」なら必須。未設定でも落とさず表だけ通知にしたい場合はこのチェックを外してOK
           test -n "${{ secrets.OPENAI_API_KEY }}" || (echo "Missing OPENAI_API_KEY" && exit 1)
 
       - name: Run python
@@ -45,33 +45,21 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
-          # 手動実行で force=true のときだけ週末チェックを無視
+          # 手動実行のときは強制実行ONにできる（既存踏襲）
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force && '1' || '' }}
 
-          # --- AI動作設定（お好みで） ---
+          # ★手動だけAIフル（NORMALでもAI回す）
           ENABLE_AI: "1"
           AI_ONLY_ON_ALERT: ${{ github.event_name == 'workflow_dispatch' && '0' || '1' }}
-          OPENAI_MODEL: "gpt-4.1-mini"    # さらに節約なら gpt-4.1-nano
-          OPENAI_MAX_OUTPUT_TOKENS: "700"
-          OPENAI_TIMEOUT_SEC: "30"
 
-          # --- RSS設定（必要なら調整） ---
-          RSS_LANG_PRIMARY: "ja"
-          RSS_LANG_SECONDARY: "en"
-          MAX_RSS_QUERIES: "3"
-          RSS_ITEMS_PER_QUERY: "8"
-          NEWS_PICK_MAX: "5"
-
+          # 必要なら調整（任意）
+          # OPENAI_MODEL: "gpt-4.1-mini"
+          # OPENAI_MAX_OUTPUT_TOKENS: "450"
         run: |
-          set -u
-
-          # ① 関係ないpyは失敗しても止めない（WARN扱い）
-          python ADX_DI.py || echo "WARN: ADX_DI.py failed (ignored)"
-          python GC_MACD_BB.py || echo "WARN: GC_MACD_BB.py failed (ignored)"
-          python main_rsi.py || echo "WARN: main_rsi.py failed (ignored)"
-
-          # ② これが本命：失敗したらジョブを落とす
+          python ADX_DI.py
           python market_regime_notify.py
+          python GC_MACD_BB.py
+          python main_rsi.py
 
       - name: Upload metrics CSV
         if: always()
