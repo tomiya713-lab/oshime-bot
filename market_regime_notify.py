@@ -101,11 +101,27 @@ def _parse_entry_time(entry) -> Optional[dt.datetime]:
 # =========================
 # Market data + features
 # =========================
+
+def _normalize_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # yfinance が MultiIndex columns を返すケースに対応
+    cols = df.columns
+    # MultiIndex or tuple columns
+    if isinstance(cols, pd.MultiIndex):
+        cols = [c[0] for c in cols]  # 例: ('Close', '^VIX') -> 'Close'
+    norm = []
+    for c in cols:
+        if isinstance(c, tuple):
+            c = c[0] if len(c) > 0 else ""
+        c = str(c).strip().lower()
+        norm.append(c)
+    df.columns = norm
+    return df
+
 def fetch_daily(symbol: str, days: int = 60) -> pd.DataFrame:
     df = yf.download(symbol, period=f"{days}d", interval="1d", progress=False, auto_adjust=True)
     if df is None or df.empty:
         return pd.DataFrame()
-    df = df.rename(columns={c: c.lower() for c in df.columns})
+    df = _normalize_yf_columns(df)
     df.index = pd.to_datetime(df.index)
     return df
 
