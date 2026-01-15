@@ -335,6 +335,67 @@ def openai_client() -> Optional[OpenAI]:
 def _safe_json_extract(text: str) -> Optional[dict]:
     if not text:
         return None
+
+
+def _json_schema_queries(max_q: int):
+    return {
+        "name": "rss_query_plan",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "queries": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": max_q,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "label": {"type": "string"},
+                            "q": {"type": "string"},
+                            "lang": {"type": "string", "enum": ["ja", "en"]},
+                        },
+                        "required": ["label", "q", "lang"],
+                    },
+                }
+            },
+            "required": ["queries"],
+        },
+    }
+
+def _json_schema_messages(max_news: int):
+    return {
+        "name": "discord_messages",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "msg1": {"type": "string"},
+                "news": {
+                    "type": "array",
+                    "maxItems": max_news,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "title": {"type": "string"},
+                            "source": {"type": "string"},
+                            "summary_ja": {"type": "string"},
+                            "why": {"type": "string"},
+                            "url": {"type": "string"},
+                        },
+                        "required": ["title", "source", "summary_ja", "why", "url"],
+                    },
+                },
+                "notes": {"type": "string"},
+            },
+            "required": ["msg1", "news", "notes"],
+        },
+    }
+
     # Try direct
     try:
         return json.loads(text)
@@ -415,11 +476,11 @@ JSON形式:
         resp = client.responses.create(
             model=OPENAI_MODEL,
             input=prompt,
+            response_format={"type": "json_schema", "json_schema": _json_schema_queries(MAX_RSS_QUERIES)},
             max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
             timeout=OPENAI_TIMEOUT_SEC,
         )
-        text = (resp.output_text or "").strip()
-        data = _safe_json_extract(text)
+        data = _safe_json_extract((resp.output_text or "").strip())
         if not data or "queries" not in data:
             raise ValueError("No queries JSON")
 
@@ -571,11 +632,11 @@ def ai_build_messages(
         resp = client.responses.create(
             model=OPENAI_MODEL,
             input=prompt,
+            response_format={"type": "json_schema", "json_schema": _json_schema_messages(NEWS_PICK_MAX)},
             max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
             timeout=OPENAI_TIMEOUT_SEC,
         )
-        text = (resp.output_text or "").strip()
-        data = _safe_json_extract(text)
+        data = _safe_json_extract((resp.output_text or "").strip())
         if not data or "msg1" not in data:
             raise ValueError("Invalid JSON from model")
 
