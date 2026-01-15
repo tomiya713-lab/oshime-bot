@@ -129,7 +129,7 @@ def fetch_intraday(symbol: str, interval: str = "15m", lookback_days: int = 7) -
     df = yf.download(symbol, period=f"{lookback_days}d", interval=interval, progress=False, auto_adjust=True)
     if df is None or df.empty:
         return pd.DataFrame()
-    df = df.rename(columns={c: c.lower() for c in df.columns})
+    df = _normalize_yf_columns(df)
     df.index = pd.to_datetime(df.index)
     return df
 
