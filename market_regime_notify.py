@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Market Regime Monitor + Geopolitics News (Discord)
+Market Regime Monitor + Geopolitics News (Discord) - TEXT MODE (most robust)
 
-This build uses OpenAI **Chat Completions** with `response_format={"type":"json_object"}` to make JSON output stable.
-It avoids `responses.create(..., response_format=...)` which can be unsupported depending on OpenAI SDK build.
+Why this version:
+- JSON output from the model still broke in your GitHub Actions logs (json.loads Unterminated string...).
+- To make it bulletproof, we STOP parsing model JSON and instead ask GPT to output TWO messages in plain text
+  with strict delimiters. We then extract the blocks reliably.
 
-Outputs to Discord:
+Discord outputs:
 (1) Regime速報 (short JP)
 (2) 地政学ニュース（最大5本、JP要約＋なぜ効く＋URL）＋RSS参照
 (3) 表画像（PNG、数値は小数点1桁）
 
 Env:
 - DISCORD_WEBHOOK_URL (required)
-- OPENAI_API_KEY (optional; if missing -> fallback)
+- OPENAI_API_KEY (optional; if missing -> fallback RSS only)
 - OPENAI_MODEL (default: gpt-4.1-mini)
 - ENABLE_AI (default: 1)
 - AI_ONLY_ON_ALERT (default: 1)  # set 0 for manual-run always AI
@@ -20,6 +22,7 @@ Env:
 - RSS_ITEMS_PER_QUERY (default: 10)
 - MAX_NEWS_CANDIDATES (default: 30)
 - NEWS_PICK_MAX (default: 5)
+- DEBUG_AI (default: 0)  # set 1 to print raw model output in logs (first 1500 chars)
 """
 
 import os
@@ -35,7 +38,6 @@ import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
-
 import feedparser
 from openai import OpenAI
 
@@ -54,7 +56,7 @@ AI_ONLY_ON_ALERT = os.environ.get("AI_ONLY_ON_ALERT", "1").strip() == "1"
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini").strip()
-OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_OUTPUT_TOKENS", "800"))  # reuse name for compatibility
+OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_OUTPUT_TOKENS", "900"))
 OPENAI_TIMEOUT_SEC = int(os.environ.get("OPENAI_TIMEOUT_SEC", "30"))
 OPENAI_RETRIES = int(os.environ.get("OPENAI_RETRIES", "2"))
 
@@ -62,6 +64,8 @@ MAX_RSS_QUERIES = int(os.environ.get("MAX_RSS_QUERIES", "3"))
 RSS_ITEMS_PER_QUERY = int(os.environ.get("RSS_ITEMS_PER_QUERY", "10"))
 MAX_NEWS_CANDIDATES = int(os.environ.get("MAX_NEWS_CANDIDATES", "30"))
 NEWS_PICK_MAX = int(os.environ.get("NEWS_PICK_MAX", "5"))
+
+DEBUG_AI = os.environ.get("DEBUG_AI", "0").strip() == "1"
 
 INTERVAL_INTRADAY = "15m"
 LOOKBACK_DAYS = 7
@@ -120,6 +124,14 @@ def _extract_source_from_title(title: str) -> str:
     if " - " in title:
         return title.rsplit(" - ", 1)[-1].strip()
     return ""
+
+def _sanitize_for_prompt(s: str, n: int) -> str:
+    """Reduce characters that tend to break structured generations."""
+    s = (s or "")
+    s = s.replace("\r", " ").replace("\n", " ")
+    s = s.replace('"', "'")
+    s = re.sub(r"\s+", " ", s).strip()
+    return clamp_str(s, n)
 
 
 # =========================
@@ -313,7 +325,7 @@ def fetch_rss_items(url: str, per_query: int) -> List[Dict]:
             items.append({
                 "title": title,
                 "url": link,
-                "snippet": clamp_str(summary, 220),
+                "snippet": _sanitize_for_prompt(summary, 200),
                 "published_utc": published.isoformat() if published else None,
                 "source": _extract_source_from_title(title),
             })
@@ -342,7 +354,7 @@ def collect_news_candidates(rss_urls: List[str]) -> List[Dict]:
 
 
 # =========================
-# OpenAI helpers (chat.completions + json_object)
+# OpenAI helpers (TEXT with delimiters)
 # =========================
 def openai_client() -> Optional[OpenAI]:
     if not OPENAI_API_KEY:
@@ -350,7 +362,7 @@ def openai_client() -> Optional[OpenAI]:
         return None
     return OpenAI(api_key=OPENAI_API_KEY)
 
-def call_openai_json(client: OpenAI, system: str, user: str) -> Optional[dict]:
+def call_openai_text(client: OpenAI, system: str, user: str) -> Optional[str]:
     for attempt in range(1 + max(0, OPENAI_RETRIES)):
         try:
             resp = client.chat.completions.create(
@@ -359,17 +371,26 @@ def call_openai_json(client: OpenAI, system: str, user: str) -> Optional[dict]:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                response_format={"type": "json_object"},
-                temperature=0,
+                temperature=0.2,
                 max_tokens=OPENAI_MAX_TOKENS,
                 timeout=OPENAI_TIMEOUT_SEC,
             )
             text = (resp.choices[0].message.content or "").strip()
-            return json.loads(text)
+            if DEBUG_AI:
+                print("[DEBUG] raw model output (head):")
+                print(text[:1500])
+            if text:
+                return text
         except Exception as e:
-            print(f"[WARN] OpenAI chat json failed (attempt {attempt+1}): {e}")
-            time.sleep(0.5)
+            print(f"[WARN] OpenAI text failed (attempt {attempt+1}): {e}")
+            time.sleep(0.6)
     return None
+
+def extract_block(text: str, start: str, end: str) -> Optional[str]:
+    m = re.search(re.escape(start) + r"(.*?)" + re.escape(end), text, flags=re.DOTALL)
+    if not m:
+        return None
+    return m.group(1).strip()
 
 
 def ai_propose_rss_queries(feat: pd.DataFrame, regime: str, reason: str) -> Tuple[List[Dict], List[str]]:
@@ -391,48 +412,50 @@ def ai_propose_rss_queries(feat: pd.DataFrame, regime: str, reason: str) -> Tupl
     vix = safe_float(feat.loc[feat["symbol"] == "VIX", "daily_close"].iloc[0])
     vix15 = safe_float(feat.loc[feat["symbol"] == "VIX", "intraday_%chg_last15m"].iloc[0])
     usdjpy = safe_float(feat.loc[feat["symbol"] == "USDJPY", "daily_close"].iloc[0])
-    nikkei = safe_float(feat.loc[feat["symbol"] == "NIKKEI", "daily_close"].iloc[0])
-    spx = safe_float(feat.loc[feat["symbol"] == "SPX", "daily_close"].iloc[0])
 
-    system = "You output only valid JSON objects, no extra keys unless asked."
+    system = "You are a markets+geopolitics assistant. Follow the output format strictly."
     user = f"""
-あなたは市場の地政学リスク監視アシスタントです。
-以下の市場データから「今このタイミングで関連しやすい地政学/マクロのニュース探索クエリ」を提案してください。
-日英ミックスで最大{MAX_RSS_QUERIES}本。JSONオブジェクトのみ。
+次の市場状況に合う「Google News RSS 検索クエリ」を最大{MAX_RSS_QUERIES}本提案して。
+日英ミックスOK。地政学とマクロ（米金利/原油/制裁/台湾/中東など）を広くカバーしつつ、今の数値に寄せて。
 
-【市場状態】
 Regime: {regime}
 Reason: {reason}
+VIX: {vix}  VIX15m%: {vix15}  USDJPY: {usdjpy}
 
-【主要指標】
-VIX: {vix}
-VIX 15m %: {vix15}
-USDJPY: {usdjpy}
-NIKKEI: {nikkei}
-SPX: {spx}
+出力は必ずこの形式（各行1件、合計{MAX_RSS_QUERIES}行）:
+lang|label|query
 
-出力JSON形式:
-{{
-  "queries": [
-    {{"label":"...", "q":"...", "lang":"ja"}},
-    {{"label":"...", "q":"...", "lang":"en"}}
-  ]
-}}
+lang は ja または en
+label は短い説明（日本語OK）
+query は Google News 検索文字列
+
+例:
+ja|中東原油供給リスク|中東 原油 供給 リスク
+en|Taiwan tension|Taiwan China military tension
 """.strip()
 
-    data = call_openai_json(client, system, user)
-    if not data or "queries" not in data:
+    text = call_openai_text(client, system, user)
+    if not text:
         urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in fallback[:MAX_RSS_QUERIES]]
         return fallback[:MAX_RSS_QUERIES], urls
 
-    queries = data.get("queries", [])[:MAX_RSS_QUERIES]
     norm = []
-    for q in queries:
-        label = clamp_str(str(q.get("label", "")).strip(), 70)
-        qq = str(q.get("q", "")).strip()
-        lang = str(q.get("lang", "")).strip().lower()
-        if label and qq and lang in ("ja", "en"):
-            norm.append({"label": label, "q": qq, "lang": lang})
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        parts = [p.strip() for p in line.split("|", 2)]
+        if len(parts) != 3:
+            continue
+        lang, label, q = parts
+        lang = lang.lower()
+        if lang not in ("ja", "en"):
+            continue
+        if not label or not q:
+            continue
+        norm.append({"label": clamp_str(label, 70), "q": q, "lang": lang})
+        if len(norm) >= MAX_RSS_QUERIES:
+            break
 
     if not norm:
         urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in fallback[:MAX_RSS_QUERIES]]
@@ -469,78 +492,65 @@ def ai_build_messages(
             "z20": safe_float(row.get("zscore_20d")),
         }
 
-    payload = {
-        "ts_jst": fmt_ts_jst(),
-        "regime": regime,
-        "reason": reason,
-        "market": {"VIX": pick("VIX"), "USDJPY": pick("USDJPY"), "NIKKEI": pick("NIKKEI"), "SPX": pick("SPX")},
-        "rss_queries": rss_queries,
-        "news_candidates": news_candidates[:MAX_NEWS_CANDIDATES],
-        "news_pick_max": NEWS_PICK_MAX,
-    }
+    market = {"VIX": pick("VIX"), "USDJPY": pick("USDJPY"), "NIKKEI": pick("NIKKEI"), "SPX": pick("SPX")}
 
-    system = "You output only valid JSON objects. Do not include markdown."
+    # Keep prompt compact and safe
+    cand_lines = []
+    for it in news_candidates[:MAX_NEWS_CANDIDATES]:
+        title = _sanitize_for_prompt(it.get("title", ""), 160)
+        source = _sanitize_for_prompt(it.get("source", ""), 60)
+        url = (it.get("url", "") or "").strip()
+        snippet = _sanitize_for_prompt(it.get("snippet", ""), 200)
+        published = (it.get("published_utc", "") or "")
+        if title and url:
+            cand_lines.append(f"- {title} | {source} | {published} | {snippet} | {url}")
+    cand_blob = "\n".join(cand_lines)
+
+    system = "You are an editor who writes concise, actionable Discord messages in Japanese."
     user = f"""
 あなたは「市場データを解釈し、関連する地政学ニュースを選別して要約する」編集者です。
-以下のJSON入力を読み、Discordに投稿する2つのメッセージを作ってください（要約は日本語）。
-- 1通目: 結論＋解釈（短い）: Regime / なぜそう見えるか(1〜3行) / 監視ポイント(次の1〜2時間)
-- 2通目: 地政学ニュース（最大{NEWS_PICK_MAX}本）
-  - 見出し（ソース）＋一言要約（日本語）
-  - “効く可能性がある理由”を一言
-  - URL（そのまま貼る）
-  - 直近優先、重複回避
+以下を読み、Discord用に2つのメッセージを作成してください。出力は必ず区切り付きの“生テキスト”のみ。
 
-出力JSON形式:
-{{
-  "msg1": "...",
-  "news": [
-    {{"title":"...", "source":"...", "summary_ja":"...", "why":"...", "url":"..."}}
-  ]
-}}
+【市場データ】
+ts_jst: {fmt_ts_jst()}
+regime: {regime}
+reason: {reason}
+market: {json.dumps(market, ensure_ascii=False)}
 
-入力JSON:
-{json.dumps(payload, ensure_ascii=False)}
+【要件】
+(1) 1通目：結論＋解釈（短い）
+- Regime（NORMAL/ALERT/CRISIS）
+- なぜそう見えるか（VIX/円/先物/米株の変化を日本語で1〜3行）
+- 監視ポイント（次の1〜2時間で見るべき指標）
+
+(2) 2通目：地政学ニュース（最大{NEWS_PICK_MAX}本）
+- 候補（最大{MAX_NEWS_CANDIDATES}件）から重要度が高いものだけ選ぶ
+- 各ニュース: 見出し（ソース）＋一言要約（日本語）＋「なぜ効く可能性があるか」＋URL
+- 直近優先、重複回避
+- 最後にRSS候補（参照）も3本つける（label + URL）
+
+【出力フォーマット厳守】
+<<<MSG1>>>
+...ここに1通目...
+<<<ENDMSG1>>>
+<<<MSG2>>>
+...ここに2通目...
+<<<ENDMSG2>>>
+
+【RSS候補】
+{json.dumps(rss_queries, ensure_ascii=False)}
+
+【ニュース候補一覧】
+{cand_blob}
 """.strip()
 
-    data = call_openai_json(client, system, user)
-    if not data or "msg1" not in data:
+    text = call_openai_text(client, system, user)
+    if not text:
         return None
 
-    msg1 = str(data.get("msg1", "")).strip()
-    news = data.get("news", []) or []
-
-    lines = ["【地政学ニュース】"]
-    picked = 0
-    for n in news:
-        if picked >= NEWS_PICK_MAX:
-            break
-        title = clamp_str(str(n.get("title", "")).strip(), 120)
-        source = clamp_str(str(n.get("source", "")).strip(), 40)
-        summary = clamp_str(str(n.get("summary_ja", "")).strip(), 120)
-        why = clamp_str(str(n.get("why", "")).strip(), 90)
-        url = str(n.get("url", "")).strip()
-        if not title or not url:
-            continue
-        lines.append(f"- {title}" + (f"（{source}）" if source else ""))
-        if summary:
-            lines.append(f"  要約: {summary}")
-        if why:
-            lines.append(f"  なぜ効く: {why}")
-        lines.append(f"  {url}")
-        picked += 1
-
-    if picked == 0:
-        lines.append("- 該当のニュースが候補から見つかりませんでした。")
-
-    lines.append("")
-    lines.append("【RSS候補（参照）】")
-    for q in rss_queries:
-        label = q.get("label", "")
-        url = build_google_news_rss_url(q.get("q", ""), q.get("lang", "ja"))
-        lines.append(f"- {label} {url}")
-
-    msg2 = "\n".join(lines).strip()
-    if not msg1:
+    msg1 = extract_block(text, "<<<MSG1>>>", "<<<ENDMSG1>>>")
+    msg2 = extract_block(text, "<<<MSG2>>>", "<<<ENDMSG2>>>")
+    if not msg1 or not msg2:
         return None
     return msg1, msg2
 
@@ -576,11 +586,9 @@ def notify(feat: pd.DataFrame) -> None:
     else:
         msg1, msg2 = msgs
 
-    # (1)(2)
     discord_send_text(DISCORD_WEBHOOK_URL, msg1)
     discord_send_text(DISCORD_WEBHOOK_URL, msg2)
 
-    # (3) table image
     title = f"【Market Regime Monitor】{ts}  Regime={regime}\nReason: {reason}"
     with tempfile.TemporaryDirectory() as d:
         png_path = os.path.join(d, "regime_table.png")
