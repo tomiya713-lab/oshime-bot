@@ -1,17 +1,25 @@
 # -*- coding: utf-8 -*-
 """
 Market Regime Monitor + Geopolitics News (Discord)
-- 1st msg: regime conclusion + interpretation (JP)
-- 2nd msg: geopolitics news (<=5) selected & summarized by GPT from RSS candidates (JP)
-- 3rd msg: table image (PNG), rounded to 0.1
 
-IMPORTANT:
-This version avoids using `response_format=` because some OpenAI Python SDK builds
-do not support it on `client.responses.create()`. Instead we:
-  - strongly instruct JSON-only output
-  - extract JSON safely
-  - validate required keys/types
-  - retry a few times if invalid
+This build uses OpenAI **Chat Completions** with `response_format={"type":"json_object"}` to make JSON output stable.
+It avoids `responses.create(..., response_format=...)` which can be unsupported depending on OpenAI SDK build.
+
+Outputs to Discord:
+(1) Regime速報 (short JP)
+(2) 地政学ニュース（最大5本、JP要約＋なぜ効く＋URL）＋RSS参照
+(3) 表画像（PNG、数値は小数点1桁）
+
+Env:
+- DISCORD_WEBHOOK_URL (required)
+- OPENAI_API_KEY (optional; if missing -> fallback)
+- OPENAI_MODEL (default: gpt-4.1-mini)
+- ENABLE_AI (default: 1)
+- AI_ONLY_ON_ALERT (default: 1)  # set 0 for manual-run always AI
+- MAX_RSS_QUERIES (default: 3)
+- RSS_ITEMS_PER_QUERY (default: 10)
+- MAX_NEWS_CANDIDATES (default: 30)
+- NEWS_PICK_MAX (default: 5)
 """
 
 import os
@@ -28,8 +36,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-import feedparser  # requirements: feedparser
-from openai import OpenAI  # requirements: openai
+import feedparser
+from openai import OpenAI
 
 import matplotlib
 matplotlib.use("Agg")
@@ -46,17 +54,15 @@ AI_ONLY_ON_ALERT = os.environ.get("AI_ONLY_ON_ALERT", "1").strip() == "1"
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini").strip()
-OPENAI_MAX_OUTPUT_TOKENS = int(os.environ.get("OPENAI_MAX_OUTPUT_TOKENS", "700"))
+OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_OUTPUT_TOKENS", "800"))  # reuse name for compatibility
 OPENAI_TIMEOUT_SEC = int(os.environ.get("OPENAI_TIMEOUT_SEC", "30"))
-OPENAI_RETRIES = int(os.environ.get("OPENAI_RETRIES", "2"))  # retries after first attempt
+OPENAI_RETRIES = int(os.environ.get("OPENAI_RETRIES", "2"))
 
-# RSS settings
 MAX_RSS_QUERIES = int(os.environ.get("MAX_RSS_QUERIES", "3"))
 RSS_ITEMS_PER_QUERY = int(os.environ.get("RSS_ITEMS_PER_QUERY", "10"))
 MAX_NEWS_CANDIDATES = int(os.environ.get("MAX_NEWS_CANDIDATES", "30"))
 NEWS_PICK_MAX = int(os.environ.get("NEWS_PICK_MAX", "5"))
 
-# Market data configuration
 INTERVAL_INTRADAY = "15m"
 LOOKBACK_DAYS = 7
 Z_WINDOW = 20
@@ -112,8 +118,7 @@ def _parse_entry_time(entry) -> Optional[dt.datetime]:
 
 def _extract_source_from_title(title: str) -> str:
     if " - " in title:
-        parts = title.rsplit(" - ", 1)
-        return parts[-1].strip()
+        return title.rsplit(" - ", 1)[-1].strip()
     return ""
 
 
@@ -141,16 +146,14 @@ def fetch_daily(symbol: str, days: int = 60) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     df.index = pd.to_datetime(df.index)
-    df = _normalize_yf_columns(df)
-    return df
+    return _normalize_yf_columns(df)
 
 def fetch_intraday(symbol: str, interval: str = "15m", lookback_days: int = 7) -> pd.DataFrame:
     df = yf.download(symbol, period=f"{lookback_days}d", interval=interval, progress=False, auto_adjust=True)
     if df is None or df.empty:
         return pd.DataFrame()
     df.index = pd.to_datetime(df.index)
-    df = _normalize_yf_columns(df)
-    return df
+    return _normalize_yf_columns(df)
 
 def zscore(series: pd.Series, window: int) -> pd.Series:
     mean = series.rolling(window).mean()
@@ -171,7 +174,7 @@ def build_features() -> pd.DataFrame:
                 "daily_%chg_5d": None,
                 "intraday_close_15m": None,
                 "intraday_%chg_last15m": None,
-                "zscore_20d": None
+                "zscore_20d": None,
             })
             continue
 
@@ -180,11 +183,10 @@ def build_features() -> pd.DataFrame:
         chg5 = (daily["close"].pct_change(5).iloc[-1] * 100.0) if len(daily) >= 6 else None
         z20 = zscore(daily["close"], Z_WINDOW).iloc[-1] if len(daily) >= Z_WINDOW else None
 
-        intra_close = None
-        intra_chg = None
+        intra_close, intra_chg = None, None
         if not intra.empty and "close" in intra.columns and len(intra) >= 2:
             intra_close = intra["close"].iloc[-1]
-            intra_chg = (intra["close"].pct_change(1).iloc[-1] * 100.0)
+            intra_chg = intra["close"].pct_change(1).iloc[-1] * 100.0
 
         rows.append({
             "symbol": key,
@@ -193,9 +195,8 @@ def build_features() -> pd.DataFrame:
             "daily_%chg_5d": float(chg5) if chg5 is not None and pd.notna(chg5) else None,
             "intraday_close_15m": float(intra_close) if intra_close is not None and pd.notna(intra_close) else None,
             "intraday_%chg_last15m": float(intra_chg) if intra_chg is not None and pd.notna(intra_chg) else None,
-            "zscore_20d": float(z20) if z20 is not None and pd.notna(z20) else None
+            "zscore_20d": float(z20) if z20 is not None and pd.notna(z20) else None,
         })
-
     return pd.DataFrame(rows)
 
 def eval_regime(feat: pd.DataFrame) -> Tuple[str, str]:
@@ -341,7 +342,7 @@ def collect_news_candidates(rss_urls: List[str]) -> List[Dict]:
 
 
 # =========================
-# OpenAI helpers (robust JSON)
+# OpenAI helpers (chat.completions + json_object)
 # =========================
 def openai_client() -> Optional[OpenAI]:
     if not OPENAI_API_KEY:
@@ -349,47 +350,27 @@ def openai_client() -> Optional[OpenAI]:
         return None
     return OpenAI(api_key=OPENAI_API_KEY)
 
-def _safe_json_extract(text: str) -> Optional[dict]:
-    if not text:
-        return None
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            return None
-    return None
-
-def _call_openai_json(client: OpenAI, prompt: str) -> Optional[dict]:
-    """Call OpenAI, expect JSON-only. Retry if not parseable or missing keys."""
-    # Tighten the instruction with sentinel markers (works well without response_format).
-    wrapped = (
-        "You MUST respond with ONLY valid JSON. No prose, no markdown, no code fences.\n"
-        "If you cannot comply, respond with {\"error\":\"cannot\"}.\n\n"
-        + prompt
-    )
-
+def call_openai_json(client: OpenAI, system: str, user: str) -> Optional[dict]:
     for attempt in range(1 + max(0, OPENAI_RETRIES)):
         try:
-            resp = client.responses.create(
+            resp = client.chat.completions.create(
                 model=OPENAI_MODEL,
-                input=wrapped,
-                max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0,
+                max_tokens=OPENAI_MAX_TOKENS,
                 timeout=OPENAI_TIMEOUT_SEC,
             )
-            text = (resp.output_text or "").strip()
-            data = _safe_json_extract(text)
-            if data is not None:
-                return data
-            raise ValueError("JSON parse failed")
+            text = (resp.choices[0].message.content or "").strip()
+            return json.loads(text)
         except Exception as e:
-            print(f"[WARN] OpenAI call failed/invalid JSON (attempt {attempt+1}): {e}")
-            time.sleep(0.4)
+            print(f"[WARN] OpenAI chat json failed (attempt {attempt+1}): {e}")
+            time.sleep(0.5)
     return None
+
 
 def ai_propose_rss_queries(feat: pd.DataFrame, regime: str, reason: str) -> Tuple[List[Dict], List[str]]:
     fallback = [
@@ -413,23 +394,24 @@ def ai_propose_rss_queries(feat: pd.DataFrame, regime: str, reason: str) -> Tupl
     nikkei = safe_float(feat.loc[feat["symbol"] == "NIKKEI", "daily_close"].iloc[0])
     spx = safe_float(feat.loc[feat["symbol"] == "SPX", "daily_close"].iloc[0])
 
-    prompt = f"""
+    system = "You output only valid JSON objects, no extra keys unless asked."
+    user = f"""
 あなたは市場の地政学リスク監視アシスタントです。
 以下の市場データから「今このタイミングで関連しやすい地政学/マクロのニュース探索クエリ」を提案してください。
-日英ミックスで最大{MAX_RSS_QUERIES}本。出力はJSONのみ。
+日英ミックスで最大{MAX_RSS_QUERIES}本。JSONオブジェクトのみ。
 
 【市場状態】
 Regime: {regime}
 Reason: {reason}
 
-【主要指標（参考）】
+【主要指標】
 VIX: {vix}
 VIX 15m %: {vix15}
 USDJPY: {usdjpy}
 NIKKEI: {nikkei}
 SPX: {spx}
 
-JSON形式:
+出力JSON形式:
 {{
   "queries": [
     {{"label":"...", "q":"...", "lang":"ja"}},
@@ -438,7 +420,7 @@ JSON形式:
 }}
 """.strip()
 
-    data = _call_openai_json(client, prompt)
+    data = call_openai_json(client, system, user)
     if not data or "queries" not in data:
         urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in fallback[:MAX_RSS_QUERIES]]
         return fallback[:MAX_RSS_QUERIES], urls
@@ -446,15 +428,11 @@ JSON形式:
     queries = data.get("queries", [])[:MAX_RSS_QUERIES]
     norm = []
     for q in queries:
-        try:
-            label = clamp_str(str(q.get("label", "")).strip(), 60)
-            qq = str(q.get("q", "")).strip()
-            lang = str(q.get("lang", "")).strip().lower()
-            if not label or not qq or lang not in ("ja", "en"):
-                continue
+        label = clamp_str(str(q.get("label", "")).strip(), 70)
+        qq = str(q.get("q", "")).strip()
+        lang = str(q.get("lang", "")).strip().lower()
+        if label and qq and lang in ("ja", "en"):
             norm.append({"label": label, "q": qq, "lang": lang})
-        except Exception:
-            continue
 
     if not norm:
         urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in fallback[:MAX_RSS_QUERIES]]
@@ -462,6 +440,7 @@ JSON形式:
 
     urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in norm]
     return norm, urls
+
 
 def ai_build_messages(
     feat: pd.DataFrame,
@@ -500,9 +479,10 @@ def ai_build_messages(
         "news_pick_max": NEWS_PICK_MAX,
     }
 
-    prompt = f"""
+    system = "You output only valid JSON objects. Do not include markdown."
+    user = f"""
 あなたは「市場データを解釈し、関連する地政学ニュースを選別して要約する」編集者です。
-以下のJSON入力を読み、Discordに投稿する2つのメッセージを作ってください（日本語）。
+以下のJSON入力を読み、Discordに投稿する2つのメッセージを作ってください（要約は日本語）。
 - 1通目: 結論＋解釈（短い）: Regime / なぜそう見えるか(1〜3行) / 監視ポイント(次の1〜2時間)
 - 2通目: 地政学ニュース（最大{NEWS_PICK_MAX}本）
   - 見出し（ソース）＋一言要約（日本語）
@@ -510,7 +490,7 @@ def ai_build_messages(
   - URL（そのまま貼る）
   - 直近優先、重複回避
 
-出力はJSONのみ。形式:
+出力JSON形式:
 {{
   "msg1": "...",
   "news": [
@@ -522,7 +502,7 @@ def ai_build_messages(
 {json.dumps(payload, ensure_ascii=False)}
 """.strip()
 
-    data = _call_openai_json(client, prompt)
+    data = call_openai_json(client, system, user)
     if not data or "msg1" not in data:
         return None
 
@@ -541,8 +521,7 @@ def ai_build_messages(
         url = str(n.get("url", "")).strip()
         if not title or not url:
             continue
-        head = f"- {title}" + (f"（{source}）" if source else "")
-        lines.append(head)
+        lines.append(f"- {title}" + (f"（{source}）" if source else ""))
         if summary:
             lines.append(f"  要約: {summary}")
         if why:
@@ -551,7 +530,7 @@ def ai_build_messages(
         picked += 1
 
     if picked == 0:
-        lines.append("- 該当の強い地政学ニュースが候補から見つかりませんでした。")
+        lines.append("- 該当のニュースが候補から見つかりませんでした。")
 
     lines.append("")
     lines.append("【RSS候補（参照）】")
@@ -561,7 +540,6 @@ def ai_build_messages(
         lines.append(f"- {label} {url}")
 
     msg2 = "\n".join(lines).strip()
-
     if not msg1:
         return None
     return msg1, msg2
@@ -598,7 +576,7 @@ def notify(feat: pd.DataFrame) -> None:
     else:
         msg1, msg2 = msgs
 
-    # (1)(2) text
+    # (1)(2)
     discord_send_text(DISCORD_WEBHOOK_URL, msg1)
     discord_send_text(DISCORD_WEBHOOK_URL, msg2)
 
@@ -606,7 +584,7 @@ def notify(feat: pd.DataFrame) -> None:
     title = f"【Market Regime Monitor】{ts}  Regime={regime}\nReason: {reason}"
     with tempfile.TemporaryDirectory() as d:
         png_path = os.path.join(d, "regime_table.png")
-        render_table_png(feat, title="Market Regime Table (rounded to 0.1)", out_path=png_path)
+        render_table_png(feat, title=title, out_path=png_path)
         discord_send_file(DISCORD_WEBHOOK_URL, title, png_path)
 
 def main():
