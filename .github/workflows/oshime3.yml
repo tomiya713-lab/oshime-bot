@@ -51,6 +51,7 @@ jobs:
           # ★手動だけAIフル（NORMALでもAI回す）
           ENABLE_AI: "1"
           AI_ONLY_ON_ALERT: ${{ github.event_name == 'workflow_dispatch' && '0' || '1' }}
+          DEBUG_AI: "1"
 
           # 必要なら調整（任意）
           # OPENAI_MODEL: "gpt-4.1-mini"
