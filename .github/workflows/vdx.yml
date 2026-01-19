@@ -1,0 +1,66 @@
+name: Market Regime Night (21:00/24:00/06:00 JST)
+
+on:
+  workflow_dispatch:
+    inputs:
+      debug_ai:
+        description: "DEBUG_AI=1（ログにAIの生出力など）"
+        type: boolean
+        default: false
+
+  schedule:
+    # GitHub cron is UTC
+    # JST 21:00 -> UTC 12:00
+    # JST 24:00 -> UTC 15:00
+    # JST 06:00 -> UTC 21:00
+    - cron: '0 12,15,21 * * *'
+
+jobs:
+  run_market_regime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: market-regime-night
+      cancel-in-progress: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: '**/requirements.txt'
+
+      - name: Upgrade pip
+        run: python -m pip install -U pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Check envs
+        run: |
+          test -n "${{ secrets.DISCORD_WEBHOOK_URL }}" || (echo "Missing DISCORD_WEBHOOK_URL" && exit 1)
+          test -n "${{ secrets.OPENAI_API_KEY }}" || (echo "Missing OPENAI_API_KEY" && exit 1)
+
+      - name: Run market regime notify
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+          # ★常にAIを使う（夜間はNORMALでもコメント欲しいなら0）
+          ENABLE_AI: "1"
+          AI_ONLY_ON_ALERT: "0"
+
+          # ニュース鮮度フィルタ（あなたの方針：無ければゼロでOK）
+          NEWS_MAX_AGE_HOURS: "6"
+          NEWS_FALLBACK_MAX_AGE_HOURS: "12"
+
+          # 手動デバッグ時だけログ増やす
+          DEBUG_AI: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_ai && '1' || '0' }}
+
+          # 必要なら固定（任意）
+          # OPENAI_MODEL: "gpt-4.1-mini"
+          # OPENAI_MAX_OUTPUT_TOKENS: "900"
+        run: |
+          python market_regime_notify.py
