@@ -58,7 +58,6 @@ jobs:
           # OPENAI_MAX_OUTPUT_TOKENS: "450"
         run: |
           python ADX_DI.py
-          python market_regime_notify.py
           python GC_MACD_BB.py
           python main_rsi.py
 
