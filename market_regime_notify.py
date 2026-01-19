@@ -65,6 +65,10 @@ RSS_ITEMS_PER_QUERY = int(os.environ.get("RSS_ITEMS_PER_QUERY", "10"))
 MAX_NEWS_CANDIDATES = int(os.environ.get("MAX_NEWS_CANDIDATES", "30"))
 NEWS_PICK_MAX = int(os.environ.get("NEWS_PICK_MAX", "5"))
 
+# News recency filter (hours)
+NEWS_MAX_AGE_HOURS = float(os.environ.get("NEWS_MAX_AGE_HOURS", "6"))
+NEWS_FALLBACK_MAX_AGE_HOURS = float(os.environ.get("NEWS_FALLBACK_MAX_AGE_HOURS", "12"))
+
 DEBUG_AI = os.environ.get("DEBUG_AI", "0").strip() == "1"
 
 INTERVAL_INTRADAY = "15m"
@@ -334,12 +338,36 @@ def fetch_rss_items(url: str, per_query: int) -> List[Dict]:
         print(f"[WARN] RSS fetch failed: {url} ({e})")
         return []
 
+def _dt_from_iso(s: str) -> Optional[dt.datetime]:
+    if not s:
+        return None
+    try:
+        # Accept "2026-01-19T12:34:56" or "...Z"
+        s2 = s.replace("Z", "")
+        return dt.datetime.fromisoformat(s2)
+    except Exception:
+        return None
+
+def _filter_by_age(items: List[Dict], max_age_hours: float) -> List[Dict]:
+    """Keep items whose published_utc is within max_age_hours from now (UTC)."""
+    now_utc = dt.datetime.utcnow()
+    out = []
+    for it in items:
+        t = _dt_from_iso((it.get("published_utc") or "").strip())
+        if t is None:
+            continue
+        age_h = (now_utc - t).total_seconds() / 3600.0
+        if age_h <= max_age_hours:
+            out.append(it)
+    return out
+
 def collect_news_candidates(rss_urls: List[str]) -> List[Dict]:
     all_items: List[Dict] = []
     for url in rss_urls:
         all_items.extend(fetch_rss_items(url, RSS_ITEMS_PER_QUERY))
         time.sleep(0.2)
 
+    # Deduplicate by URL first
     uniq: Dict[str, Dict] = {}
     for it in all_items:
         u = it.get("url", "")
@@ -350,7 +378,25 @@ def collect_news_candidates(rss_urls: List[str]) -> List[Dict]:
 
     items = list(uniq.values())
     items.sort(key=lambda x: x.get("published_utc") or "", reverse=True)
-    return items[:MAX_NEWS_CANDIDATES]
+
+    # Hard recency filter (machine)
+    fresh = _filter_by_age(items, NEWS_MAX_AGE_HOURS)
+    if len(fresh) >= min(5, MAX_NEWS_CANDIDATES):
+        items_use = fresh
+        age_used = NEWS_MAX_AGE_HOURS
+    else:
+        # Fallback: allow a bit older if news volume is low
+        items_use = _filter_by_age(items, NEWS_FALLBACK_MAX_AGE_HOURS)
+        age_used = NEWS_FALLBACK_MAX_AGE_HOURS
+
+    items_use = items_use[:MAX_NEWS_CANDIDATES]
+
+    if DEBUG_AI:
+        print(f"[DEBUG] news candidates: total={len(items)} within{NEWS_MAX_AGE_HOURS}h={len(fresh)} using<= {age_used}h -> {len(items_use)}")
+        if items_use:
+            print("[DEBUG] newest candidate published_utc:", items_use[0].get("published_utc"))
+
+    return items_use
 
 
 # =========================
@@ -542,6 +588,8 @@ market: {json.dumps(market, ensure_ascii=False)}
 
 【ニュース候補一覧】
 {cand_blob}
+
+【重要】原則として直近6時間以内のニュースを最優先で選ぶこと。6時間以内が少ない場合のみ、12時間以内まで許容。
 """.strip()
 
     text = call_openai_text(client, system, user)
