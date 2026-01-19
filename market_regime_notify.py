@@ -31,6 +31,7 @@ import json
 import time
 import math
 import tempfile
+import email.utils
 import datetime as dt
 from typing import Dict, List, Optional, Tuple
 
@@ -116,12 +117,28 @@ def _clean_html(text: str) -> str:
     return text
 
 def _parse_entry_time(entry) -> Optional[dt.datetime]:
+    # Prefer parsed structs (feedparser)
     tt = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
     if tt:
         try:
             return dt.datetime(*tt[:6])
         except Exception:
-            return None
+            pass
+    # Fallback: parse RFC822-like strings if present
+    for key in ("published", "updated"):
+        s = getattr(entry, key, None)
+        if not s:
+            continue
+        try:
+            d = email.utils.parsedate_to_datetime(s)
+            if d is None:
+                continue
+            # Convert to naive UTC datetime
+            if d.tzinfo is not None:
+                d = d.astimezone(dt.timezone.utc).replace(tzinfo=None)
+            return d
+        except Exception:
+            continue
     return None
 
 def _extract_source_from_title(title: str) -> str:
@@ -348,13 +365,15 @@ def _dt_from_iso(s: str) -> Optional[dt.datetime]:
     except Exception:
         return None
 
-def _filter_by_age(items: List[Dict], max_age_hours: float) -> List[Dict]:
-    """Keep items whose published_utc is within max_age_hours from now (UTC)."""
+def _filter_by_age(items: List[Dict], max_age_hours: float, keep_undated: bool = False) -> List[Dict]:
+    """Keep items within max_age_hours from now (UTC). If keep_undated=True, include items with no timestamp."""
     now_utc = dt.datetime.utcnow()
     out = []
     for it in items:
-        t = _dt_from_iso((it.get("published_utc") or "").strip())
+        t = _dt_from_iso((it.get('published_utc') or '').strip())
         if t is None:
+            if keep_undated:
+                out.append(it)
             continue
         age_h = (now_utc - t).total_seconds() / 3600.0
         if age_h <= max_age_hours:
@@ -380,13 +399,13 @@ def collect_news_candidates(rss_urls: List[str]) -> List[Dict]:
     items.sort(key=lambda x: x.get("published_utc") or "", reverse=True)
 
     # Hard recency filter (machine)
-    fresh = _filter_by_age(items, NEWS_MAX_AGE_HOURS)
+    fresh = _filter_by_age(items, NEWS_MAX_AGE_HOURS, keep_undated=False)
     if len(fresh) >= min(5, MAX_NEWS_CANDIDATES):
         items_use = fresh
         age_used = NEWS_MAX_AGE_HOURS
     else:
         # Fallback: allow a bit older if news volume is low
-        items_use = _filter_by_age(items, NEWS_FALLBACK_MAX_AGE_HOURS)
+        items_use = _filter_by_age(items, NEWS_FALLBACK_MAX_AGE_HOURS, keep_undated=True)
         age_used = NEWS_FALLBACK_MAX_AGE_HOURS
 
     items_use = items_use[:MAX_NEWS_CANDIDATES]
