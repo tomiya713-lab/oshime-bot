@@ -63,5 +63,5 @@ jobs:
           # OPENAI_MODEL: "gpt-4.1-mini"
           # OPENAI_MAX_OUTPUT_TOKENS: "900"
         run: |
-         # python market_regime_notify.py
-          python market_regime_notify_breaking_a_fixed.py
+         python market_regime_notify.py
+         # python market_regime_notify_breaking_a_fixed.py
