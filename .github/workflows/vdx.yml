@@ -64,4 +64,4 @@ jobs:
           # OPENAI_MAX_OUTPUT_TOKENS: "900"
         run: |
           python market_regime_notify.py
-          market_regime_notify_breaking_a_fixed.py
+          python market_regime_notify_breaking_a_fixed.py
