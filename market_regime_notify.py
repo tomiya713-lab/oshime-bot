@@ -325,12 +325,6 @@ def render_table_png(feat: pd.DataFrame, title: str, out_path: str) -> None:
 # Google News RSS fetch
 # =========================
 def build_google_news_rss_url(query: str, lang: str) -> str:
-    # Freshness bias: Google News supports query operator like "when:6h".
-    # We append it unless caller already specifies "when:".
-    query = (query or "").strip()
-    if "when:" not in query:
-        query = f"{query} when:6h".strip()
-
     if lang == "ja":
         hl, gl, ceid = "ja", "JP", "JP:ja"
     else:
@@ -465,222 +459,75 @@ def extract_block(text: str, start: str, end: str) -> Optional[str]:
 
 
 def ai_propose_rss_queries(feat: pd.DataFrame, regime: str, reason: str) -> Tuple[List[Dict], List[str]]:
-    """
-    Goals:
-    - Pick up market-moving news broadly (macro + geopolitics + FX + energy + policy).
-    - Still keep the existing Discord output mechanics unchanged:
-        * rss_queries (for display/reference) remains MAX_RSS_QUERIES items.
-        * rss_urls (for fetching) can be broader than rss_queries.
-    Strategy:
-    1) Always include strong "buckets" that often move markets (FX intervention, rates, energy, sanctions, Taiwan/China, Mideast/shipping).
-    2) Add dynamic bucket(s) based on current market moves (VIX/USDJPY/SPX/NIKKEI).
-    3) Ask GPT to propose a few additional non-overlapping queries to cover today's context.
-    """
-
-    # -------------------------
-    # Strong always-on buckets
-    # -------------------------
-    base_fetch = [
-        # FX / intervention / BOJ-MoF
-        {"label": "円相場 介入/レートチェック（6h）", "q": "ドル円 介入 リスク レートチェック 財務省 日銀", "lang": "ja"},
-        {"label": "Yen intervention risk / rate check（6h）", "q": "yen intervention risk rate check Japan MoF BOJ", "lang": "en"},
-
-        # Rates / Fed / bonds
-        {"label": "米金利/Fedと株の反応（6h）", "q": "米国債 利回り 上昇 株式 市場 反応 FRB", "lang": "ja"},
-        {"label": "US yields/Fed risk-off（6h）", "q": "US Treasury yields spike Fed commentary risk-off markets", "lang": "en"},
-
-        # Energy / oil / OPEC / LNG
-        {"label": "原油/中東/OPEC（6h）", "q": "原油 価格 中東 OPEC 供給 リスク 市場", "lang": "ja"},
-        {"label": "Oil supply shock / OPEC+（6h）", "q": "oil supply risk OPEC+ production cuts market impact", "lang": "en"},
-
-        # China/Taiwan
-        {"label": "台湾・米中緊張（6h）", "q": "台湾 海峡 緊張 中国 米国 市場 影響", "lang": "ja"},
-        {"label": "Taiwan Strait / China tensions（6h）", "q": "Taiwan Strait tensions China military drills market impact", "lang": "en"},
-
-        # Sanctions / war
-        {"label": "制裁/戦争・供給網（6h）", "q": "制裁 強化 供給網 企業 影響 株式", "lang": "ja"},
-        {"label": "Sanctions escalation / supply chain（6h）", "q": "sanctions escalation supply chain disruption market impact", "lang": "en"},
-
-        # Shipping chokepoints (Red Sea / Hormuz)
-        {"label": "紅海/ホルムズ 航路リスク（6h）", "q": "紅海 航路 攻撃 海運 保険料 原油 影響", "lang": "ja"},
-        {"label": "Red Sea / Hormuz shipping risk（6h）", "q": "Red Sea attacks shipping disruption insurance costs oil prices", "lang": "en"},
-    ]
-
-    # -------------------------
-    # Dynamic buckets from market features
-    # -------------------------
-    def _get(sym: str, col: str) -> Optional[float]:
-        try:
-            return safe_float(feat.loc[feat["symbol"] == sym, col].iloc[0])
-        except Exception:
-            return None
-
-    vix = _get("VIX", "daily_close")
-    vix15 = _get("VIX", "intraday_%chg_last15m")
-    usdjpy = _get("USDJPY", "daily_close")
-    usdjpy15 = _get("USDJPY", "intraday_%chg_last15m")
-    spx15 = _get("SPX", "intraday_%chg_last15m")
-    nikkei15 = _get("NIKKEI", "intraday_%chg_last15m")
-    z_usdjpy = _get("USDJPY", "zscore_20d")
-    z_vix = _get("VIX", "zscore_20d")
-
-    dynamic_fetch: List[Dict] = []
-
-    # If FX move is notable → add intervention/policy specific angle
-    if (usdjpy15 is not None and abs(usdjpy15) >= 0.25) or (z_usdjpy is not None and abs(z_usdjpy) >= 1.5):
-        dynamic_fetch += [
-            {"label": "為替急変の材料（6h）", "q": "ドル円 急変 材料 介入 リスク レートチェック", "lang": "ja"},
-            {"label": "FX volatility driver（6h）", "q": "USDJPY spike driver intervention warning official comments", "lang": "en"},
-        ]
-
-    # If VIX jumps or high → add volatility/risk-off trigger angle
-    if (vix is not None and vix >= 18) or (vix15 is not None and vix15 >= 6) or (z_vix is not None and z_vix >= 1.2):
-        dynamic_fetch += [
-            {"label": "リスクオフ要因（6h）", "q": "リスクオフ 要因 VIX 上昇 株 下落 背景", "lang": "ja"},
-            {"label": "Volatility spike catalysts（6h）", "q": "volatility spike catalysts VIX surge risk-off drivers", "lang": "en"},
-        ]
-
-    # If equities swing → add “equity selloff driver” bucket
-    if (spx15 is not None and abs(spx15) >= 0.4) or (nikkei15 is not None and abs(nikkei15) >= 0.4):
-        dynamic_fetch += [
-            {"label": "株急変の材料（6h）", "q": "株価 急落 急騰 材料 先物 ヘッドライン", "lang": "ja"},
-            {"label": "Equity selloff driver（6h）", "q": "equity selloff driver headline risk futures", "lang": "en"},
-        ]
-
-    # -------------------------
-    # GPT: fill a few extra queries for today's context (non-overlapping)
-    # -------------------------
-    # Fallback for display (kept small)
-    fallback_display = [
-        {"label": "円相場 介入/レートチェック", "q": "ドル円 介入 リスク レートチェック 財務省 日銀", "lang": "ja"},
-        {"label": "米金利/Fedと株の反応", "q": "US Treasury yields spike Fed commentary risk-off markets", "lang": "en"},
-        {"label": "原油/中東/OPEC", "q": "原油 価格 中東 OPEC 供給 リスク 市場", "lang": "ja"},
+    fallback = [
+        {"label": "中東 原油 供給 リスク - risk-off時の定番", "q": "中東 原油 供給 リスク", "lang": "ja"},
+        {"label": "Taiwan China military tension - 地政学リスク", "q": "Taiwan China military tension", "lang": "en"},
+        {"label": "Russia Ukraine sanctions energy prices - 制裁/エネルギー", "q": "Russia Ukraine sanctions energy prices", "lang": "en"},
     ]
 
     if not ENABLE_AI:
-        # Fetch broadly even without AI; display only MAX_RSS_QUERIES.
-        fetch_list = base_fetch + dynamic_fetch
-        # de-dup by q
-        seen = set()
-        fetch_list_uniq = []
-        for it in fetch_list:
-            q = (it.get("q") or "").strip()
-            if not q or q in seen:
-                continue
-            seen.add(q)
-            fetch_list_uniq.append(it)
-        display = fetch_list_uniq[:MAX_RSS_QUERIES] if fetch_list_uniq else fallback_display[:MAX_RSS_QUERIES]
-        urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in fetch_list_uniq[: max(10, MAX_RSS_QUERIES)]]
-        return display, urls
+        urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in fallback[:MAX_RSS_QUERIES]]
+        return fallback[:MAX_RSS_QUERIES], urls
 
     client = openai_client()
     if client is None:
-        fetch_list = base_fetch + dynamic_fetch
-        seen = set()
-        fetch_list_uniq = []
-        for it in fetch_list:
-            q = (it.get("q") or "").strip()
-            if not q or q in seen:
-                continue
-            seen.add(q)
-            fetch_list_uniq.append(it)
-        display = fetch_list_uniq[:MAX_RSS_QUERIES] if fetch_list_uniq else fallback_display[:MAX_RSS_QUERIES]
-        urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in fetch_list_uniq[: max(10, MAX_RSS_QUERIES)]]
-        return display, urls
+        urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in fallback[:MAX_RSS_QUERIES]]
+        return fallback[:MAX_RSS_QUERIES], urls
 
-    system = "You are a markets assistant. Propose market-moving news search queries, avoid gossip."
+    vix = safe_float(feat.loc[feat["symbol"] == "VIX", "daily_close"].iloc[0])
+    vix15 = safe_float(feat.loc[feat["symbol"] == "VIX", "intraday_%chg_last15m"].iloc[0])
+    usdjpy = safe_float(feat.loc[feat["symbol"] == "USDJPY", "daily_close"].iloc[0])
+
+    system = "You are a markets+geopolitics assistant. Follow the output format strictly."
     user = f"""
-市場を動かしやすいニュース（地政学 + マクロ + 政策 + エネルギー + 為替）を幅広く拾いたいです。
-以下の市場状況に合わせて、被りの少ない追加のGoogle News検索クエリを提案してください（ノイズ/ゴシップは禁止）。
+次の市場状況に合う「Google News RSS 検索クエリ」を最大{MAX_RSS_QUERIES}本提案して。
+日英ミックスOK。地政学とマクロ（米金利/原油/制裁/台湾/中東など）を広くカバーしつつ、今の数値に寄せて。
 
 Regime: {regime}
 Reason: {reason}
-VIX={vix} VIX15m%={vix15}
-USDJPY={usdjpy} USDJPY15m%={usdjpy15}
-SPX15m%={spx15} NIKKEI15m%={nikkei15}
+VIX: {vix}  VIX15m%: {vix15}  USDJPY: {usdjpy}
 
-制約:
-- 最大4件
-- 各行: lang|label|query
-- lang は ja または en
-- 介入/金利/原油/制裁/軍事/関税/輸出規制/海運/サプライチェーン/政策発言 を優先
-- ゴシップ、芸能、スキャンダルは禁止
+出力は必ずこの形式（各行1件、合計{MAX_RSS_QUERIES}行）:
+lang|label|query
+
+lang は ja または en
+label は短い説明（日本語OK）
+query は Google News 検索文字列
+
+例:
+ja|中東原油供給リスク|中東 原油 供給 リスク
+en|Taiwan tension|Taiwan China military tension
 """.strip()
 
     text = call_openai_text(client, system, user)
+    if not text:
+        urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in fallback[:MAX_RSS_QUERIES]]
+        return fallback[:MAX_RSS_QUERIES], urls
 
-    ai_extra: List[Dict] = []
-    if text:
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or "|" not in line:
-                continue
-            parts = [p.strip() for p in line.split("|", 2)]
-            if len(parts) != 3:
-                continue
-            lang, label, q = parts
-            lang = lang.lower()
-            if lang not in ("ja", "en"):
-                continue
-            if not label or not q:
-                continue
-            ai_extra.append({"label": clamp_str(label, 70), "q": q, "lang": lang})
-            if len(ai_extra) >= 4:
-                break
-
-    # -------------------------
-    # Build final fetch list (broad) + display list (small)
-    # -------------------------
-    fetch_list = base_fetch + dynamic_fetch + ai_extra
-
-    # De-dup by query text (q)
-    seen_q = set()
-    fetch_list_uniq: List[Dict] = []
-    for it in fetch_list:
-        q = (it.get("q") or "").strip()
-        if not q:
+    norm = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
             continue
-        if q in seen_q:
+        parts = [p.strip() for p in line.split("|", 2)]
+        if len(parts) != 3:
             continue
-        seen_q.add(q)
-        fetch_list_uniq.append(it)
+        lang, label, q = parts
+        lang = lang.lower()
+        if lang not in ("ja", "en"):
+            continue
+        if not label or not q:
+            continue
+        norm.append({"label": clamp_str(label, 70), "q": q, "lang": lang})
+        if len(norm) >= MAX_RSS_QUERIES:
+            break
 
-    # Pick display queries: prioritize (1) FX/intervention if FX moving, (2) rates, (3) energy, else take top
-    def _pick_display(cands: List[Dict]) -> List[Dict]:
-        picked: List[Dict] = []
+    if not norm:
+        urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in fallback[:MAX_RSS_QUERIES]]
+        return fallback[:MAX_RSS_QUERIES], urls
 
-        def take_if(pred):
-            nonlocal picked
-            for it in cands:
-                if it in picked:
-                    continue
-                if pred(it):
-                    picked.append(it)
-                    if len(picked) >= MAX_RSS_QUERIES:
-                        return
-
-        if (usdjpy15 is not None and abs(usdjpy15) >= 0.25) or (z_usdjpy is not None and abs(z_usdjpy) >= 1.5):
-            take_if(lambda it: "介入" in it.get("label","") or "intervention" in (it.get("q","").lower()))
-        take_if(lambda it: "金利" in it.get("label","") or "yields" in (it.get("q","").lower()) or "Fed" in it.get("q",""))
-        take_if(lambda it: "原油" in it.get("label","") or "oil" in (it.get("q","").lower()) or "OPEC" in it.get("q",""))
-
-        # Fill remaining
-        for it in cands:
-            if it in picked:
-                continue
-            picked.append(it)
-            if len(picked) >= MAX_RSS_QUERIES:
-                break
-
-        return picked[:MAX_RSS_QUERIES] if picked else fallback_display[:MAX_RSS_QUERIES]
-
-    rss_display = _pick_display(fetch_list_uniq)
-
-    # Fetch URLs: use more than display to widen coverage (cap to 12 to keep time reasonable)
-    fetch_cap = max(12, MAX_RSS_QUERIES)
-    rss_urls = [build_google_news_rss_url(x["q"], x.get("lang", "en")) for x in fetch_list_uniq[:fetch_cap]]
-
-    return rss_display, rss_urls
+    urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in norm]
+    return norm, urls
 
 
 def ai_build_messages(
@@ -690,6 +537,14 @@ def ai_build_messages(
     rss_queries: List[Dict],
     news_candidates: List[Dict],
 ) -> Optional[Tuple[str, str]]:
+    """
+    Build two Discord text messages using GPT, but keep the model output SHORT and structured.
+
+    Key idea:
+    - We do NOT ask the model to paste long URLs (Google News article links are huge and often cause truncation).
+    - The model selects items by ID. We then attach the URLs programmatically.
+    This dramatically reduces truncation risk and makes delimiter parsing stable.
+    """
     if not ENABLE_AI:
         return None
 
@@ -712,22 +567,25 @@ def ai_build_messages(
 
     market = {"VIX": pick("VIX"), "USDJPY": pick("USDJPY"), "NIKKEI": pick("NIKKEI"), "SPX": pick("SPX")}
 
-    # Keep prompt compact and safe
-    cand_lines = []
-    for it in news_candidates[:MAX_NEWS_CANDIDATES]:
-        title = _sanitize_for_prompt(it.get("title", ""), 160)
-        source = _sanitize_for_prompt(it.get("source", ""), 60)
-        url = (it.get("url", "") or "").strip()
-        snippet = _sanitize_for_prompt(it.get("snippet", ""), 200)
+    # Create a compact candidate list with stable numeric IDs (1..N)
+    id_to_url: Dict[int, str] = {}
+    cand_lines: List[str] = []
+    for i, it in enumerate(news_candidates[:MAX_NEWS_CANDIDATES], start=1):
+        title = _sanitize_for_prompt(it.get("title", ""), 140)
+        source = _sanitize_for_prompt(it.get("source", ""), 50)
+        snippet = _sanitize_for_prompt(it.get("snippet", ""), 180)
         published = (it.get("published_utc", "") or "")
+        url = (it.get("url", "") or "").strip()
         if title and url:
-            cand_lines.append(f"- {title} | {source} | {published} | {snippet} | {url}")
+            id_to_url[i] = url
+            # Note: no URL in prompt (to avoid token bloat)
+            cand_lines.append(f"{i}. {title} | {source} | {published} | {snippet}")
     cand_blob = "\n".join(cand_lines)
 
     system = "You are an editor who writes concise, actionable Discord messages in Japanese."
     user = f"""
-あなたは「市場データを解釈し、関連する地政学ニュースを選別して要約する」編集者です。
-以下を読み、Discord用に2つのメッセージを作成してください。出力は必ず区切り付きの“生テキスト”のみ。
+あなたは「市場データを解釈し、関連する地政学/マクロのニュースを候補から選別して要約する」編集者です。
+以下を読み、Discord用に2つのメッセージを作成してください。
 
 【市場データ】
 ts_jst: {fmt_ts_jst()}
@@ -736,18 +594,21 @@ reason: {reason}
 market: {json.dumps(market, ensure_ascii=False)}
 
 【要件】
-(1) 1通目：結論＋解釈（短い）
+(1) 1通目：結論＋解釈（短い、日本語）
 - Regime（NORMAL/ALERT/CRISIS）
-- なぜそう見えるか（VIX/円/先物/米株の変化を日本語で1〜3行）
+- なぜそう見えるか（VIX/ドル円/先物/米株の変化を日本語で1〜3行）
 - 監視ポイント（次の1〜2時間で見るべき指標）
 
-(2) 2通目：地政学ニュース（最大{NEWS_PICK_MAX}本）
-- 候補（最大{MAX_NEWS_CANDIDATES}件）から重要度が高いものだけ選ぶ
-- 各ニュース: 見出し（ソース）＋一言要約（日本語）＋「なぜ効く可能性があるか」＋URL
+(2) 2通目：重要ニュース（最大{NEWS_PICK_MAX}本、日本語）
+- 下の「ニュース候補一覧」(最大{MAX_NEWS_CANDIDATES}件) から重要度が高いものだけ選ぶ
+- 出力は必ず次の形式（URLは書かない、IDで指定する）
+  例:
+  [ID=12] 見出し（ソース）: 要約（1行） / なぜ効く可能性（1行）
 - 直近優先、重複回避
-- 最後にRSS候補（参照）も3本つける（label + URL）
+- 候補が弱い/無い場合は「直近{NEWS_MAX_AGE_HOURS}時間以内の重要ニュースは確認できませんでした」と明記してOK
+- 最後に「【RSS候補】」として3本（label + URL）を付ける（これはURLを書いてOK）
 
-【出力フォーマット厳守】
+【出力フォーマット厳守】区切りを絶対に省略しないこと
 <<<MSG1>>>
 ...ここに1通目...
 <<<ENDMSG1>>>
@@ -758,22 +619,35 @@ market: {json.dumps(market, ensure_ascii=False)}
 【RSS候補】
 {json.dumps(rss_queries, ensure_ascii=False)}
 
-【ニュース候補一覧】
+【ニュース候補一覧】（重要：この一覧の番号をIDとして使う）
 {cand_blob}
 
-【重要】原則として直近6時間以内のニュースを最優先で選ぶこと。6時間以内が少ない場合のみ、12時間以内まで許容。
+【重要】原則として直近{NEWS_MAX_AGE_HOURS}時間以内のニュースを最優先で選ぶこと。足りない場合のみ{NEWS_FALLBACK_MAX_AGE_HOURS}時間以内まで許容。
 """.strip()
 
-    text = call_openai_text(client, system, user)
-    if not text:
+    text_out = call_openai_text(client, system, user)
+    if not text_out:
         return None
 
-    msg1 = extract_block(text, "<<<MSG1>>>", "<<<ENDMSG1>>>")
-    msg2 = extract_block(text, "<<<MSG2>>>", "<<<ENDMSG2>>>")
-    if not msg1 or not msg2:
+    msg1 = extract_block(text_out, "<<<MSG1>>>", "<<<ENDMSG1>>>")
+    msg2_raw = extract_block(text_out, "<<<MSG2>>>", "<<<ENDMSG2>>>")
+    if not msg1 or not msg2_raw:
         return None
+
+    # Post-process MSG2: attach URLs based on selected IDs
+    lines = msg2_raw.splitlines()
+    out_lines: List[str] = []
+    for line in lines:
+        out_lines.append(line)
+        m = re.search(r"\[ID\s*=\s*(\d+)\]", line)
+        if m:
+            idx = int(m.group(1))
+            url = id_to_url.get(idx)
+            if url:
+                out_lines.append(url)
+
+    msg2 = "\n".join(out_lines).strip()
     return msg1, msg2
-
 
 # =========================
 # Fallback messages
