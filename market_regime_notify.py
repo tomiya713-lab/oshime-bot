@@ -61,9 +61,9 @@ OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_OUTPUT_TOKENS", "900"))
 OPENAI_TIMEOUT_SEC = int(os.environ.get("OPENAI_TIMEOUT_SEC", "30"))
 OPENAI_RETRIES = int(os.environ.get("OPENAI_RETRIES", "2"))
 
-MAX_RSS_QUERIES = int(os.environ.get("MAX_RSS_QUERIES", "3"))
-RSS_ITEMS_PER_QUERY = int(os.environ.get("RSS_ITEMS_PER_QUERY", "10"))
-MAX_NEWS_CANDIDATES = int(os.environ.get("MAX_NEWS_CANDIDATES", "30"))
+MAX_RSS_QUERIES = int(os.environ.get("MAX_RSS_QUERIES", "6"))
+RSS_ITEMS_PER_QUERY = int(os.environ.get("RSS_ITEMS_PER_QUERY", "12"))
+MAX_NEWS_CANDIDATES = int(os.environ.get("MAX_NEWS_CANDIDATES", "40"))
 NEWS_PICK_MAX = int(os.environ.get("NEWS_PICK_MAX", "5"))
 
 # News recency filter (hours)
@@ -325,12 +325,26 @@ def render_table_png(feat: pd.DataFrame, title: str, out_path: str) -> None:
 # Google News RSS fetch
 # =========================
 def build_google_news_rss_url(query: str, lang: str) -> str:
+    """Build Google News RSS URL. We also add a `when:Nh` operator to the query
+    to bias Google News toward very fresh items (helps picking up breaking FX intervention stories).
+    """
     if lang == "ja":
         hl, gl, ceid = "ja", "JP", "JP:ja"
     else:
         hl, gl, ceid = "en-US", "US", "US:en"
-    q = requests.utils.quote(query)
+
+    q_raw = (query or "").strip()
+    # If the caller didn't specify recency, add when:6h (or from env NEWS_MAX_AGE_HOURS)
+    try:
+        max_h = int(float(os.environ.get("NEWS_MAX_AGE_HOURS", "6")))
+    except Exception:
+        max_h = 6
+    if "when:" not in q_raw.lower():
+        q_raw = f"{q_raw} when:{max_h}h".strip()
+
+    q = requests.utils.quote(q_raw)
     return f"https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}"
+
 
 def fetch_rss_items(url: str, per_query: int) -> List[Dict]:
     try:
@@ -376,7 +390,7 @@ def _filter_by_age(items: List[Dict], max_age_hours: float, keep_undated: bool =
                 out.append(it)
             continue
         age_h = (now_utc - t).total_seconds() / 3600.0
-        if age_h <= max_age_hours:
+        if age_h <= (max_age_hours + 0.25):
             out.append(it)
     return out
 
@@ -460,9 +474,12 @@ def extract_block(text: str, start: str, end: str) -> Optional[str]:
 
 def ai_propose_rss_queries(feat: pd.DataFrame, regime: str, reason: str) -> Tuple[List[Dict], List[str]]:
     fallback = [
-        {"label": "中東 原油 供給 リスク - risk-off時の定番", "q": "中東 原油 供給 リスク", "lang": "ja"},
-        {"label": "Taiwan China military tension - 地政学リスク", "q": "Taiwan China military tension", "lang": "en"},
-        {"label": "Russia Ukraine sanctions energy prices - 制裁/エネルギー", "q": "Russia Ukraine sanctions energy prices", "lang": "en"},
+        {"label": "円相場 介入/レートチェック/財務省（日銀）", "q": "円 介入 レートチェック 財務省 日銀 米当局 when:6h", "lang": "ja"},
+        {"label": "Yen intervention risk / rate check (US Treasury, MoF)", "q": "yen intervention risk rate check US Treasury Japan MoF BOJ when:6h", "lang": "en"},
+        {"label": "米金利・Fed発言（利回り/ドル高）", "q": "米金利 利回り Fed 発言 ドル高 USDJPY when:6h", "lang": "ja"},
+        {"label": "中東 原油 供給 リスク（OPEC/紅海）", "q": "中東 原油 供給 リスク OPEC 紅海 ホルムズ when:6h", "lang": "ja"},
+        {"label": "Taiwan/China tensions (defense, sanctions)", "q": "Taiwan China tensions military sanctions when:6h", "lang": "en"},
+        {"label": "Russia/Ukraine sanctions & energy prices", "q": "Russia Ukraine sanctions energy prices when:6h", "lang": "en"},
     ]
 
     if not ENABLE_AI:
@@ -481,7 +498,7 @@ def ai_propose_rss_queries(feat: pd.DataFrame, regime: str, reason: str) -> Tupl
     system = "You are a markets+geopolitics assistant. Follow the output format strictly."
     user = f"""
 次の市場状況に合う「Google News RSS 検索クエリ」を最大{MAX_RSS_QUERIES}本提案して。
-日英ミックスOK。地政学とマクロ（米金利/原油/制裁/台湾/中東など）を広くカバーしつつ、今の数値に寄せて。
+日英ミックスOK。地政学とマクロ（米金利/原油/制裁/台湾/中東など）を広くカバーしつつ、今の数値に寄せて。特にUSDJPYが大きく動いている/水準が高い場合は、必ず『為替介入』『レートチェック』『財務省』『米当局/US Treasury』など介入系を最低1本含めて。
 
 Regime: {regime}
 Reason: {reason}
@@ -537,14 +554,6 @@ def ai_build_messages(
     rss_queries: List[Dict],
     news_candidates: List[Dict],
 ) -> Optional[Tuple[str, str]]:
-    """
-    Build two Discord text messages using GPT, but keep the model output SHORT and structured.
-
-    Key idea:
-    - We do NOT ask the model to paste long URLs (Google News article links are huge and often cause truncation).
-    - The model selects items by ID. We then attach the URLs programmatically.
-    This dramatically reduces truncation risk and makes delimiter parsing stable.
-    """
     if not ENABLE_AI:
         return None
 
@@ -567,25 +576,22 @@ def ai_build_messages(
 
     market = {"VIX": pick("VIX"), "USDJPY": pick("USDJPY"), "NIKKEI": pick("NIKKEI"), "SPX": pick("SPX")}
 
-    # Create a compact candidate list with stable numeric IDs (1..N)
-    id_to_url: Dict[int, str] = {}
-    cand_lines: List[str] = []
-    for i, it in enumerate(news_candidates[:MAX_NEWS_CANDIDATES], start=1):
-        title = _sanitize_for_prompt(it.get("title", ""), 140)
-        source = _sanitize_for_prompt(it.get("source", ""), 50)
-        snippet = _sanitize_for_prompt(it.get("snippet", ""), 180)
-        published = (it.get("published_utc", "") or "")
+    # Keep prompt compact and safe
+    cand_lines = []
+    for it in news_candidates[:MAX_NEWS_CANDIDATES]:
+        title = _sanitize_for_prompt(it.get("title", ""), 160)
+        source = _sanitize_for_prompt(it.get("source", ""), 60)
         url = (it.get("url", "") or "").strip()
+        snippet = _sanitize_for_prompt(it.get("snippet", ""), 200)
+        published = (it.get("published_utc", "") or "")
         if title and url:
-            id_to_url[i] = url
-            # Note: no URL in prompt (to avoid token bloat)
-            cand_lines.append(f"{i}. {title} | {source} | {published} | {snippet}")
+            cand_lines.append(f"- {title} | {source} | {published} | {snippet} | {url}")
     cand_blob = "\n".join(cand_lines)
 
     system = "You are an editor who writes concise, actionable Discord messages in Japanese."
     user = f"""
-あなたは「市場データを解釈し、関連する地政学/マクロのニュースを候補から選別して要約する」編集者です。
-以下を読み、Discord用に2つのメッセージを作成してください。
+あなたは「市場データを解釈し、関連する地政学ニュースを選別して要約する」編集者です。
+以下を読み、Discord用に2つのメッセージを作成してください。出力は必ず区切り付きの“生テキスト”のみ。
 
 【市場データ】
 ts_jst: {fmt_ts_jst()}
@@ -594,21 +600,18 @@ reason: {reason}
 market: {json.dumps(market, ensure_ascii=False)}
 
 【要件】
-(1) 1通目：結論＋解釈（短い、日本語）
+(1) 1通目：結論＋解釈（短い）
 - Regime（NORMAL/ALERT/CRISIS）
-- なぜそう見えるか（VIX/ドル円/先物/米株の変化を日本語で1〜3行）
+- なぜそう見えるか（VIX/円/先物/米株の変化を日本語で1〜3行）
 - 監視ポイント（次の1〜2時間で見るべき指標）
 
-(2) 2通目：重要ニュース（最大{NEWS_PICK_MAX}本、日本語）
-- 下の「ニュース候補一覧」(最大{MAX_NEWS_CANDIDATES}件) から重要度が高いものだけ選ぶ
-- 出力は必ず次の形式（URLは書かない、IDで指定する）
-  例:
-  [ID=12] 見出し（ソース）: 要約（1行） / なぜ効く可能性（1行）
+(2) 2通目：地政学ニュース（最大{NEWS_PICK_MAX}本）
+- 候補（最大{MAX_NEWS_CANDIDATES}件）から重要度が高いものだけ選ぶ
+- 各ニュース: 見出し（ソース）＋一言要約（日本語）＋「なぜ効く可能性があるか」＋URL
 - 直近優先、重複回避
-- 候補が弱い/無い場合は「直近{NEWS_MAX_AGE_HOURS}時間以内の重要ニュースは確認できませんでした」と明記してOK
-- 最後に「【RSS候補】」として3本（label + URL）を付ける（これはURLを書いてOK）
+- 最後にRSS候補（参照）も3本つける（label + URL）
 
-【出力フォーマット厳守】区切りを絶対に省略しないこと
+【出力フォーマット厳守】
 <<<MSG1>>>
 ...ここに1通目...
 <<<ENDMSG1>>>
@@ -619,35 +622,31 @@ market: {json.dumps(market, ensure_ascii=False)}
 【RSS候補】
 {json.dumps(rss_queries, ensure_ascii=False)}
 
-【ニュース候補一覧】（重要：この一覧の番号をIDとして使う）
+【ニュース候補一覧】
 {cand_blob}
 
-【重要】原則として直近{NEWS_MAX_AGE_HOURS}時間以内のニュースを最優先で選ぶこと。足りない場合のみ{NEWS_FALLBACK_MAX_AGE_HOURS}時間以内まで許容。
+【重要】原則として直近6時間以内のニュースを最優先で選ぶこと。6時間以内が少ない場合のみ、12時間以内まで許容。
 """.strip()
 
-    text_out = call_openai_text(client, system, user)
-    if not text_out:
+    text = call_openai_text(client, system, user)
+    if not text:
         return None
 
-    msg1 = extract_block(text_out, "<<<MSG1>>>", "<<<ENDMSG1>>>")
-    msg2_raw = extract_block(text_out, "<<<MSG2>>>", "<<<ENDMSG2>>>")
-    if not msg1 or not msg2_raw:
+    msg1 = extract_block(text, "<<<MSG1>>>", "<<<ENDMSG1>>>")
+    msg2 = extract_block(text, "<<<MSG2>>>", "<<<ENDMSG2>>>")
+    # The model sometimes outputs long google.com/search links (or too many URLs) which is noisy.
+    # We keep the main body, but we always append our own clickable Google News RSS links from rss_queries.
+    if msg2:
+        msg2_main = msg2.split("【RSS候補】")[0].rstrip()
+        rss_lines = ["", "【RSS候補】"]
+        for q in rss_queries[:MAX_RSS_QUERIES]:
+            rss_lines.append(f"{q['label']}: {build_google_news_rss_url(q['q'], q['lang'])}")
+        msg2 = (msg2_main + "\n" + "\n".join(rss_lines)).strip()
+
+    if not msg1 or not msg2:
         return None
-
-    # Post-process MSG2: attach URLs based on selected IDs
-    lines = msg2_raw.splitlines()
-    out_lines: List[str] = []
-    for line in lines:
-        out_lines.append(line)
-        m = re.search(r"\[ID\s*=\s*(\d+)\]", line)
-        if m:
-            idx = int(m.group(1))
-            url = id_to_url.get(idx)
-            if url:
-                out_lines.append(url)
-
-    msg2 = "\n".join(out_lines).strip()
     return msg1, msg2
+
 
 # =========================
 # Fallback messages
