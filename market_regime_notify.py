@@ -80,7 +80,7 @@ SYMBOLS = {
     "VIX": "^VIX",
     "USDJPY": "JPY=X",
     "NIKKEI": "^N225",
-    "NIKKEI_FUT": "NK=F",
+    "NIKKEI_FUT": "NIY=F",
     "SPX": "^GSPC",
 }
 
