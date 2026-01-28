@@ -68,7 +68,7 @@ NEWS_PICK_MAX = int(os.environ.get("NEWS_PICK_MAX", "5"))
 
 # News recency filter (hours)
 NEWS_MAX_AGE_HOURS = float(os.environ.get("NEWS_MAX_AGE_HOURS", "6"))
-NEWS_FALLBACK_MAX_AGE_HOURS = float(os.environ.get("NEWS_FALLBACK_MAX_AGE_HOURS", "12"))
+NEWS_FALLBACK_MAX_AGE_HOURS = float(os.environ.get("NEWS_FALLBACK_MAX_AGE_HOURS", "24"))
 
 DEBUG_AI = os.environ.get("DEBUG_AI", "0").strip() == "1"
 
@@ -255,12 +255,50 @@ def eval_regime(feat: pd.DataFrame) -> Tuple[str, str]:
 # Discord senders
 # =========================
 def discord_send_text(webhook_url: str, content: str) -> None:
+    """Discord content limit is 2000 chars.
+    We split long messages to avoid silent drop of the 'news summary' message.
+    """
     if not webhook_url:
         print("[WARN] DISCORD_WEBHOOK_URL is empty")
         return
-    r = requests.post(webhook_url, json={"content": content}, timeout=20)
-    if r.status_code >= 300:
-        print(f"[WARN] Discord send text failed: {r.status_code} {r.text[:200]}")
+    if content is None:
+        return
+
+    # Discord hard limit ~2000. Keep some margin for safety.
+    limit = 1900
+    chunks: List[str] = []
+    buf = ""
+
+    for line in str(content).splitlines():
+        # Keep line breaks
+        piece = (line + "\n")
+        if len(piece) > limit:
+            # If a single line is too long, hard-split it.
+            for i in range(0, len(piece), limit):
+                sub = piece[i:i+limit]
+                if sub.strip():
+                    chunks.append(sub.strip())
+            continue
+
+        if len(buf) + len(piece) > limit:
+            if buf.strip():
+                chunks.append(buf.strip())
+            buf = piece
+        else:
+            buf += piece
+
+    if buf.strip():
+        chunks.append(buf.strip())
+
+    # Send sequentially; avoid rate limit bursts
+    for i, ch in enumerate(chunks):
+        r = requests.post(webhook_url, json={"content": ch}, timeout=20)
+        if r.status_code >= 300:
+            print(f"[WARN] Discord send text failed (part {i+1}/{len(chunks)}): {r.status_code} {r.text[:200]}")
+            # Don't spam retries; just stop.
+            break
+        time.sleep(0.2)
+
 
 def discord_send_file(webhook_url: str, content: str, filepath: str) -> None:
     if not webhook_url:
@@ -476,6 +514,7 @@ def ai_propose_rss_queries(feat: pd.DataFrame, regime: str, reason: str) -> Tupl
     fallback = [
         {"label": "円相場 介入/レートチェック/財務省（日銀）", "q": "円 介入 レートチェック 財務省 日銀 米当局 when:6h", "lang": "ja"},
         {"label": "Yen intervention risk / rate check (US Treasury, MoF)", "q": "yen intervention risk rate check US Treasury Japan MoF BOJ when:6h", "lang": "en"},
+        {"label": "Reuters: FX intervention / rate check", "q": "yen intervention risk rate check site:reuters.com OR Reuters USDJPY when:12h", "lang": "en"},
         {"label": "米金利・Fed発言（利回り/ドル高）", "q": "米金利 利回り Fed 発言 ドル高 USDJPY when:6h", "lang": "ja"},
         {"label": "中東 原油 供給 リスク（OPEC/紅海）", "q": "中東 原油 供給 リスク OPEC 紅海 ホルムズ when:6h", "lang": "ja"},
         {"label": "Taiwan/China tensions (defense, sanctions)", "q": "Taiwan China tensions military sanctions when:6h", "lang": "en"},
@@ -640,7 +679,7 @@ market: {json.dumps(market, ensure_ascii=False)}
         msg2_main = msg2.split("【RSS候補】")[0].rstrip()
         rss_lines = ["", "【RSS候補】"]
         for q in rss_queries[:MAX_RSS_QUERIES]:
-            rss_lines.append(f"{q['label']}: {build_google_news_rss_url(q['q'], q['lang'])}")
+            rss_lines.append(f"・{q['label']}: {build_google_news_rss_url(q['q'], q['lang'])}")
         msg2 = (msg2_main + "\n" + "\n".join(rss_lines)).strip()
 
     if not msg1 or not msg2:
@@ -658,7 +697,7 @@ def build_fallback_messages(regime: str, reason: str, rss_queries: List[Dict]) -
     for q in rss_queries:
         label = q.get("label", "")
         url = build_google_news_rss_url(q.get("q", ""), q.get("lang", "ja"))
-        lines.append(f"{label}{url}")
+        lines.append(f"・{label}: {url}")
     msg2 = "\n".join(lines)
     return msg1, msg2
 
