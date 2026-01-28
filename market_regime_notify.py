@@ -61,7 +61,7 @@ OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_OUTPUT_TOKENS", "900"))
 OPENAI_TIMEOUT_SEC = int(os.environ.get("OPENAI_TIMEOUT_SEC", "30"))
 OPENAI_RETRIES = int(os.environ.get("OPENAI_RETRIES", "2"))
 
-MAX_RSS_QUERIES = int(os.environ.get("MAX_RSS_QUERIES", "6"))
+MAX_RSS_QUERIES = int(os.environ.get("MAX_RSS_QUERIES", "3"))
 RSS_ITEMS_PER_QUERY = int(os.environ.get("RSS_ITEMS_PER_QUERY", "10"))
 MAX_NEWS_CANDIDATES = int(os.environ.get("MAX_NEWS_CANDIDATES", "30"))
 NEWS_PICK_MAX = int(os.environ.get("NEWS_PICK_MAX", "5"))
@@ -325,10 +325,12 @@ def render_table_png(feat: pd.DataFrame, title: str, out_path: str) -> None:
 # Google News RSS fetch
 # =========================
 def build_google_news_rss_url(query: str, lang: str) -> str:
-    """Base Google News RSS search URL (no time filter in query).
-    We handle recency using a machine-side published_at filter, and optionally add `when:Xh`
-    only for the RSS fetch step (see build_google_news_rss_url_when).
-    """
+    # Freshness bias: Google News supports query operator like "when:6h".
+    # We append it unless caller already specifies "when:".
+    query = (query or "").strip()
+    if "when:" not in query:
+        query = f"{query} when:6h".strip()
+
     if lang == "ja":
         hl, gl, ceid = "ja", "JP", "JP:ja"
     else:
@@ -336,17 +338,6 @@ def build_google_news_rss_url(query: str, lang: str) -> str:
     q = requests.utils.quote(query)
     return f"https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}"
 
-def build_google_news_rss_url_when(query: str, lang: str, hours: float) -> str:
-    """Google News RSS URL with a soft recency hint in the search query.
-    This is NOT fully reliable, so we still keep machine-side filtering.
-    """
-    # Google News search supports `when:6h` style hints in many locales.
-    q = query.strip()
-    if hours and hours > 0:
-        # add only if user didn't specify when:
-        if re.search(r"\bwhen:\s*\d+\s*[hdwmy]\b", q, flags=re.I) is None:
-            q = f"{q} when:{int(round(hours))}h"
-    return build_google_news_rss_url(q, lang)
 def fetch_rss_items(url: str, per_query: int) -> List[Dict]:
     try:
         r = requests.get(url, timeout=15)
@@ -395,28 +386,13 @@ def _filter_by_age(items: List[Dict], max_age_hours: float, keep_undated: bool =
             out.append(it)
     return out
 
-def collect_news_candidates(rss_queries: List[Dict]) -> List[Dict]:
-    """Collect RSS items from multiple queries, then apply a strict recency filter.
+def collect_news_candidates(rss_urls: List[str]) -> List[Dict]:
+    all_items: List[Dict] = []
+    for url in rss_urls:
+        all_items.extend(fetch_rss_items(url, RSS_ITEMS_PER_QUERY))
+        time.sleep(0.2)
 
-    We intentionally do *two passes*:
-      - pass A: add `when:NEWS_MAX_AGE_HOURS` hint in the query
-      - pass B (fallback): if pass A yields too few fresh candidates, also fetch with `when:NEWS_FALLBACK_MAX_AGE_HOURS`
-
-    This avoids the common issue where Google News RSS doesn't surface an important source (e.g., Reuters)
-    within the strict window even though it exists on the web.
-    """
-    def _fetch(pass_hours: float) -> List[Dict]:
-        items: List[Dict] = []
-        for q in rss_queries:
-            url = build_google_news_rss_url_when(q.get("q",""), q.get("lang","en"), pass_hours)
-            items.extend(fetch_rss_items(url, RSS_ITEMS_PER_QUERY))
-            time.sleep(0.15)
-        return items
-
-    # Pass A (strict)
-    all_items = _fetch(NEWS_MAX_AGE_HOURS)
-
-    # Deduplicate by URL
+    # Deduplicate by URL first
     uniq: Dict[str, Dict] = {}
     for it in all_items:
         u = it.get("url", "")
@@ -428,24 +404,13 @@ def collect_news_candidates(rss_queries: List[Dict]) -> List[Dict]:
     items = list(uniq.values())
     items.sort(key=lambda x: x.get("published_utc") or "", reverse=True)
 
+    # Hard recency filter (machine)
     fresh = _filter_by_age(items, NEWS_MAX_AGE_HOURS, keep_undated=False)
-
-    # Pass B (fallback fetch) if too few candidates
-    if len(fresh) < min(5, MAX_NEWS_CANDIDATES):
-        more = _fetch(NEWS_FALLBACK_MAX_AGE_HOURS)
-        for it in more:
-            u = it.get("url", "")
-            if u and u not in uniq:
-                uniq[u] = it
-        items = list(uniq.values())
-        items.sort(key=lambda x: x.get("published_utc") or "", reverse=True)
-        fresh = _filter_by_age(items, NEWS_MAX_AGE_HOURS, keep_undated=False)
-
-    # Now decide which window to use for final selection
     if len(fresh) >= min(5, MAX_NEWS_CANDIDATES):
         items_use = fresh
         age_used = NEWS_MAX_AGE_HOURS
     else:
+        # Fallback: allow a bit older if news volume is low
         items_use = _filter_by_age(items, NEWS_FALLBACK_MAX_AGE_HOURS, keep_undated=True)
         age_used = NEWS_FALLBACK_MAX_AGE_HOURS
 
@@ -453,9 +418,10 @@ def collect_news_candidates(rss_queries: List[Dict]) -> List[Dict]:
 
     if DEBUG_AI:
         print(f"[DEBUG] news candidates: total={len(items)} within{NEWS_MAX_AGE_HOURS}h={len(fresh)} using<= {age_used}h -> {len(items_use)}")
+        if items_use:
+            print("[DEBUG] newest candidate published_utc:", items_use[0].get("published_utc"))
 
     return items_use
-
 
 
 # =========================
@@ -499,156 +465,222 @@ def extract_block(text: str, start: str, end: str) -> Optional[str]:
 
 
 def ai_propose_rss_queries(feat: pd.DataFrame, regime: str, reason: str) -> Tuple[List[Dict], List[str]]:
-    """Propose RSS queries to maximize coverage of market-moving news.
-
-    Notes:
-    - We still rely on Google News RSS, so we must express "what to fetch" as queries.
-    - To reduce "misses" (e.g., important Reuters items not showing up), we:
-        (1) Always include strong fixed buckets (FX intervention / rates / oil / sanctions / Taiwan / shipping)
-        (2) Let the model add additional *diverse* queries based on the current tape
-    - We add simple EN negative keywords to avoid obvious gossip noise.
+    """
+    Goals:
+    - Pick up market-moving news broadly (macro + geopolitics + FX + energy + policy).
+    - Still keep the existing Discord output mechanics unchanged:
+        * rss_queries (for display/reference) remains MAX_RSS_QUERIES items.
+        * rss_urls (for fetching) can be broader than rss_queries.
+    Strategy:
+    1) Always include strong "buckets" that often move markets (FX intervention, rates, energy, sanctions, Taiwan/China, Mideast/shipping).
+    2) Add dynamic bucket(s) based on current market moves (VIX/USDJPY/SPX/NIKKEI).
+    3) Ask GPT to propose a few additional non-overlapping queries to cover today's context.
     """
 
-    # ---------- Fixed buckets (high recall) ----------
-    fixed: List[Dict] = [
-        {"label": "円・介入/レートチェック（財務省/日銀）", "q": "ドル円 介入 リスク レートチェック 財務省 日銀", "lang": "ja"},
-        {"label": "US rates / yields / Fed (macro driver)", "q": "US Treasury yields Fed rates inflation risk -scandal -affair -celebrity", "lang": "en"},
-        {"label": "Oil supply / Middle East / OPEC (commodities)", "q": "oil supply disruption Middle East OPEC sanctions -scandal -affair -celebrity", "lang": "en"},
-        {"label": "Taiwan/China security (geopolitics)", "q": "Taiwan China military tension Strait -scandal -affair -celebrity", "lang": "en"},
-        {"label": "Russia/Ukraine sanctions & energy", "q": "Russia Ukraine sanctions energy prices -scandal -affair -celebrity", "lang": "en"},
-        {"label": "Shipping chokepoints (Red Sea / Hormuz)", "q": "Red Sea shipping disruption Strait of Hormuz risk -scandal -affair -celebrity", "lang": "en"},
+    # -------------------------
+    # Strong always-on buckets
+    # -------------------------
+    base_fetch = [
+        # FX / intervention / BOJ-MoF
+        {"label": "円相場 介入/レートチェック（6h）", "q": "ドル円 介入 リスク レートチェック 財務省 日銀", "lang": "ja"},
+        {"label": "Yen intervention risk / rate check（6h）", "q": "yen intervention risk rate check Japan MoF BOJ", "lang": "en"},
+
+        # Rates / Fed / bonds
+        {"label": "米金利/Fedと株の反応（6h）", "q": "米国債 利回り 上昇 株式 市場 反応 FRB", "lang": "ja"},
+        {"label": "US yields/Fed risk-off（6h）", "q": "US Treasury yields spike Fed commentary risk-off markets", "lang": "en"},
+
+        # Energy / oil / OPEC / LNG
+        {"label": "原油/中東/OPEC（6h）", "q": "原油 価格 中東 OPEC 供給 リスク 市場", "lang": "ja"},
+        {"label": "Oil supply shock / OPEC+（6h）", "q": "oil supply risk OPEC+ production cuts market impact", "lang": "en"},
+
+        # China/Taiwan
+        {"label": "台湾・米中緊張（6h）", "q": "台湾 海峡 緊張 中国 米国 市場 影響", "lang": "ja"},
+        {"label": "Taiwan Strait / China tensions（6h）", "q": "Taiwan Strait tensions China military drills market impact", "lang": "en"},
+
+        # Sanctions / war
+        {"label": "制裁/戦争・供給網（6h）", "q": "制裁 強化 供給網 企業 影響 株式", "lang": "ja"},
+        {"label": "Sanctions escalation / supply chain（6h）", "q": "sanctions escalation supply chain disruption market impact", "lang": "en"},
+
+        # Shipping chokepoints (Red Sea / Hormuz)
+        {"label": "紅海/ホルムズ 航路リスク（6h）", "q": "紅海 航路 攻撃 海運 保険料 原油 影響", "lang": "ja"},
+        {"label": "Red Sea / Hormuz shipping risk（6h）", "q": "Red Sea attacks shipping disruption insurance costs oil prices", "lang": "en"},
     ]
 
-    # ---------- Dynamic extras ----------
-    def _get(sym: str, col: str) -> float:
+    # -------------------------
+    # Dynamic buckets from market features
+    # -------------------------
+    def _get(sym: str, col: str) -> Optional[float]:
         try:
             return safe_float(feat.loc[feat["symbol"] == sym, col].iloc[0])
         except Exception:
-            return float("nan")
+            return None
 
     vix = _get("VIX", "daily_close")
     vix15 = _get("VIX", "intraday_%chg_last15m")
     usdjpy = _get("USDJPY", "daily_close")
-    usdjpy_z = _get("USDJPY", "zscore_20d")
-    spx1d = _get("SPX", "daily_%chg_1d")
-    nikkei1d = _get("NIKKEI", "daily_%chg_1d")
+    usdjpy15 = _get("USDJPY", "intraday_%chg_last15m")
+    spx15 = _get("SPX", "intraday_%chg_last15m")
+    nikkei15 = _get("NIKKEI", "intraday_%chg_last15m")
+    z_usdjpy = _get("USDJPY", "zscore_20d")
+    z_vix = _get("VIX", "zscore_20d")
 
-    dynamic: List[Dict] = []
-    if not math.isnan(usdjpy_z) and abs(usdjpy_z) >= 1.8:
-        dynamic.append({"label": "FX intervention watch (EN)", "q": "yen strength intervention risk rate check MoF BoJ -scandal -affair -celebrity", "lang": "en"})
-    if not math.isnan(vix) and vix >= 18:
-        dynamic.append({"label": "Volatility spike drivers", "q": "VIX spike volatility jump risk-off catalysts -scandal -affair -celebrity", "lang": "en"})
-    if (not math.isnan(spx1d) and spx1d <= -1.0) or (not math.isnan(nikkei1d) and nikkei1d <= -1.0):
-        dynamic.append({"label": "Equity selloff catalyst", "q": "stock market selloff catalyst risk-off macro geopolitical -scandal -affair -celebrity", "lang": "en"})
+    dynamic_fetch: List[Dict] = []
 
-    base = fixed + dynamic
+    # If FX move is notable → add intervention/policy specific angle
+    if (usdjpy15 is not None and abs(usdjpy15) >= 0.25) or (z_usdjpy is not None and abs(z_usdjpy) >= 1.5):
+        dynamic_fetch += [
+            {"label": "為替急変の材料（6h）", "q": "ドル円 急変 材料 介入 リスク レートチェック", "lang": "ja"},
+            {"label": "FX volatility driver（6h）", "q": "USDJPY spike driver intervention warning official comments", "lang": "en"},
+        ]
 
-    # If AI disabled/unavailable, use base only
+    # If VIX jumps or high → add volatility/risk-off trigger angle
+    if (vix is not None and vix >= 18) or (vix15 is not None and vix15 >= 6) or (z_vix is not None and z_vix >= 1.2):
+        dynamic_fetch += [
+            {"label": "リスクオフ要因（6h）", "q": "リスクオフ 要因 VIX 上昇 株 下落 背景", "lang": "ja"},
+            {"label": "Volatility spike catalysts（6h）", "q": "volatility spike catalysts VIX surge risk-off drivers", "lang": "en"},
+        ]
+
+    # If equities swing → add “equity selloff driver” bucket
+    if (spx15 is not None and abs(spx15) >= 0.4) or (nikkei15 is not None and abs(nikkei15) >= 0.4):
+        dynamic_fetch += [
+            {"label": "株急変の材料（6h）", "q": "株価 急落 急騰 材料 先物 ヘッドライン", "lang": "ja"},
+            {"label": "Equity selloff driver（6h）", "q": "equity selloff driver headline risk futures", "lang": "en"},
+        ]
+
+    # -------------------------
+    # GPT: fill a few extra queries for today's context (non-overlapping)
+    # -------------------------
+    # Fallback for display (kept small)
+    fallback_display = [
+        {"label": "円相場 介入/レートチェック", "q": "ドル円 介入 リスク レートチェック 財務省 日銀", "lang": "ja"},
+        {"label": "米金利/Fedと株の反応", "q": "US Treasury yields spike Fed commentary risk-off markets", "lang": "en"},
+        {"label": "原油/中東/OPEC", "q": "原油 価格 中東 OPEC 供給 リスク 市場", "lang": "ja"},
+    ]
+
     if not ENABLE_AI:
-        picked = base[:MAX_RSS_QUERIES]
-        urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in picked]
-        return picked, urls
+        # Fetch broadly even without AI; display only MAX_RSS_QUERIES.
+        fetch_list = base_fetch + dynamic_fetch
+        # de-dup by q
+        seen = set()
+        fetch_list_uniq = []
+        for it in fetch_list:
+            q = (it.get("q") or "").strip()
+            if not q or q in seen:
+                continue
+            seen.add(q)
+            fetch_list_uniq.append(it)
+        display = fetch_list_uniq[:MAX_RSS_QUERIES] if fetch_list_uniq else fallback_display[:MAX_RSS_QUERIES]
+        urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in fetch_list_uniq[: max(10, MAX_RSS_QUERIES)]]
+        return display, urls
 
     client = openai_client()
     if client is None:
-        picked = base[:MAX_RSS_QUERIES]
-        urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in picked]
-        return picked, urls
+        fetch_list = base_fetch + dynamic_fetch
+        seen = set()
+        fetch_list_uniq = []
+        for it in fetch_list:
+            q = (it.get("q") or "").strip()
+            if not q or q in seen:
+                continue
+            seen.add(q)
+            fetch_list_uniq.append(it)
+        display = fetch_list_uniq[:MAX_RSS_QUERIES] if fetch_list_uniq else fallback_display[:MAX_RSS_QUERIES]
+        urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in fetch_list_uniq[: max(10, MAX_RSS_QUERIES)]]
+        return display, urls
 
-    # Reserve fixed buckets first (at least 4 if possible)
-    reserve = min(4, len(base), MAX_RSS_QUERIES)
-    n_ai = max(0, MAX_RSS_QUERIES - reserve)
-
-    if n_ai <= 0:
-        picked = base[:MAX_RSS_QUERIES]
-        urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in picked]
-        return picked, urls
-
-    # Compact context
-    ctx_cols = ["symbol", "daily_close", "daily_%chg_1d", "intraday_%chg_last15m", "zscore_20d"]
-    ctx = feat[ctx_cols].copy()
-    ctx = ctx.fillna("-")
-    ctx_str = ctx.to_string(index=False)
-
-    system = "You generate diverse Google News RSS search queries for MARKET-MOVING news. Follow output format strictly."
+    system = "You are a markets assistant. Propose market-moving news search queries, avoid gossip."
     user = f"""
-We already have these base queries (DO NOT repeat them):
-""" + "\n".join([f"- ({x['lang']}) {x['q']}" for x in base[:reserve]]) + f"""
+市場を動かしやすいニュース（地政学 + マクロ + 政策 + エネルギー + 為替）を幅広く拾いたいです。
+以下の市場状況に合わせて、被りの少ない追加のGoogle News検索クエリを提案してください（ノイズ/ゴシップは禁止）。
 
-Current market snapshot:
 Regime: {regime}
 Reason: {reason}
-VIX: {vix:.2f}  VIX15m%: {vix15:.2f}
-USDJPY: {usdjpy:.2f}  USDJPY_z20: {usdjpy_z:.2f}
-SPX_1d%: {spx1d:.2f}  NIKKEI_1d%: {nikkei1d:.2f}
+VIX={vix} VIX15m%={vix15}
+USDJPY={usdjpy} USDJPY15m%={usdjpy15}
+SPX15m%={spx15} NIKKEI15m%={nikkei15}
 
-Data table:
-{ctx_str}
+制約:
+- 最大4件
+- 各行: lang|label|query
+- lang は ja または en
+- 介入/金利/原油/制裁/軍事/関税/輸出規制/海運/サプライチェーン/政策発言 を優先
+- ゴシップ、芸能、スキャンダルは禁止
+""".strip()
 
-Task:
-- Propose EXACTLY {n_ai} additional RSS queries (mix ja/en).
-- Maximize coverage of market-moving topics: FX intervention, Fed/yields, inflation, tariffs/trade, sanctions, energy, shipping chokepoints, military escalation, political statements that impact markets.
-- Avoid celebrity / gossip. If in doubt, add EN negative terms: -scandal -affair -celebrity.
-- Keep queries short but specific (3-10 words).
+    text = call_openai_text(client, system, user)
 
-Output EXACTLY {n_ai} lines, one per query:
-lang|label|query
-Where:
-- lang is "ja" or "en"
-- label is a short human explanation (JP ok)
-- query is the search query (no quotes)
-"""
+    ai_extra: List[Dict] = []
+    if text:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or "|" not in line:
+                continue
+            parts = [p.strip() for p in line.split("|", 2)]
+            if len(parts) != 3:
+                continue
+            lang, label, q = parts
+            lang = lang.lower()
+            if lang not in ("ja", "en"):
+                continue
+            if not label or not q:
+                continue
+            ai_extra.append({"label": clamp_str(label, 70), "q": q, "lang": lang})
+            if len(ai_extra) >= 4:
+                break
 
-    raw = call_openai_text(client, system, user, max_tokens=350)
-    if DEBUG_AI:
-        print("[DEBUG] rss query raw:", clamp_str(raw, 1500))
+    # -------------------------
+    # Build final fetch list (broad) + display list (small)
+    # -------------------------
+    fetch_list = base_fetch + dynamic_fetch + ai_extra
 
-    rows: List[Dict] = []
-    for line in (raw or "").splitlines():
-        line = line.strip()
-        if not line or "|" not in line:
-            continue
-        parts = [p.strip() for p in line.split("|", 2)]
-        if len(parts) != 3:
-            continue
-        lang, label, q = parts
-        if lang not in ("ja", "en"):
-            continue
+    # De-dup by query text (q)
+    seen_q = set()
+    fetch_list_uniq: List[Dict] = []
+    for it in fetch_list:
+        q = (it.get("q") or "").strip()
         if not q:
             continue
-        rows.append({"label": label[:60] or q[:60], "q": q[:200], "lang": lang})
-
-    # Compose final query set: base (reserve) + AI rows + remaining base if still room
-    picked: List[Dict] = []
-    picked.extend(base[:reserve])
-
-    # Deduplicate by query string (case-insensitive)
-    seen = set([x["q"].strip().lower() for x in picked])
-    for r in rows:
-        k = r["q"].strip().lower()
-        if k in seen:
+        if q in seen_q:
             continue
-        seen.add(k)
-        picked.append(r)
-        if len(picked) >= MAX_RSS_QUERIES:
-            break
+        seen_q.add(q)
+        fetch_list_uniq.append(it)
 
-    if len(picked) < MAX_RSS_QUERIES:
-        for r in base[reserve:]:
-            k = r["q"].strip().lower()
-            if k in seen:
+    # Pick display queries: prioritize (1) FX/intervention if FX moving, (2) rates, (3) energy, else take top
+    def _pick_display(cands: List[Dict]) -> List[Dict]:
+        picked: List[Dict] = []
+
+        def take_if(pred):
+            nonlocal picked
+            for it in cands:
+                if it in picked:
+                    continue
+                if pred(it):
+                    picked.append(it)
+                    if len(picked) >= MAX_RSS_QUERIES:
+                        return
+
+        if (usdjpy15 is not None and abs(usdjpy15) >= 0.25) or (z_usdjpy is not None and abs(z_usdjpy) >= 1.5):
+            take_if(lambda it: "介入" in it.get("label","") or "intervention" in (it.get("q","").lower()))
+        take_if(lambda it: "金利" in it.get("label","") or "yields" in (it.get("q","").lower()) or "Fed" in it.get("q",""))
+        take_if(lambda it: "原油" in it.get("label","") or "oil" in (it.get("q","").lower()) or "OPEC" in it.get("q",""))
+
+        # Fill remaining
+        for it in cands:
+            if it in picked:
                 continue
-            picked.append(r)
-            seen.add(k)
+            picked.append(it)
             if len(picked) >= MAX_RSS_QUERIES:
                 break
 
-    # Final safety fallback
-    if not picked:
-        picked = fixed[:MAX_RSS_QUERIES]
+        return picked[:MAX_RSS_QUERIES] if picked else fallback_display[:MAX_RSS_QUERIES]
 
-    urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in picked]
-    return picked, urls
+    rss_display = _pick_display(fetch_list_uniq)
+
+    # Fetch URLs: use more than display to widen coverage (cap to 12 to keep time reasonable)
+    fetch_cap = max(12, MAX_RSS_QUERIES)
+    rss_urls = [build_google_news_rss_url(x["q"], x.get("lang", "en")) for x in fetch_list_uniq[:fetch_cap]]
+
+    return rss_display, rss_urls
 
 
 def ai_build_messages(
@@ -766,7 +798,7 @@ def notify(feat: pd.DataFrame) -> None:
     regime, reason = eval_regime(feat)
 
     rss_queries, rss_urls = ai_propose_rss_queries(feat, regime, reason)
-    candidates = collect_news_candidates(rss_queries)
+    candidates = collect_news_candidates(rss_urls)
     msgs = ai_build_messages(feat, regime, reason, rss_queries, candidates)
 
     if not msgs:
