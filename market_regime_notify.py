@@ -80,7 +80,7 @@ SYMBOLS = {
     "VIX": "^VIX",
     "USDJPY": "JPY=X",
     "NIKKEI": "^N225",
-    "NIKKEI_FUT": "NIY=F",
+    "NIKKEI_FUT": "NK=F",
     "SPX": "^GSPC",
 }
 
@@ -590,7 +590,7 @@ market: {json.dumps(market, ensure_ascii=False)}
 
 (2) 2通目：地政学ニュース（最大{NEWS_PICK_MAX}本）
 - 候補（最大{MAX_NEWS_CANDIDATES}件）から重要度が高いものだけ選ぶ
-- 各ニュース: 見出し（ソース）＋一言要約（日本語）＋「なぜ効く可能性があるか」＋URL
+- 各ニュース: 見出し（ソース）＋一言要約（日本語）＋「なぜ効く可能性があるか」＋影響を受けそうな業種（最大3つ、カンマ区切り）＋URL
 - 直近優先、重複回避
 - 最後にRSS候補（参照）も3本つける（label + URL）
 
