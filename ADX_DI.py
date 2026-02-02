@@ -163,6 +163,51 @@ def fetch_market_data(tickers, lookback_days=LOOKBACK_DAYS):
     return raw
 
 
+# ===== バリュエーション（PER / PBR）取得 =====
+def fetch_per_pbr_map(tickers):
+    """
+    yfinance(info) から PER/PBR を取得して dict で返す。
+    - 取得に失敗した銘柄は None
+    - yfinance/Yahoo 側の都合で欠損することがあるので、通知側では '-' 表示にする
+    """
+    per_map = {t: None for t in tickers}
+    pbr_map = {t: None for t in tickers}
+
+    # まとめてオブジェクトを作る（通信回数の削減を期待）
+    try:
+        tickers_obj = yf.Tickers(" ".join(tickers))
+    except Exception:
+        tickers_obj = None
+
+    for t in tickers:
+        try:
+            if tickers_obj is not None and hasattr(tickers_obj, "tickers") and t in tickers_obj.tickers:
+                info = tickers_obj.tickers[t].get_info()
+            else:
+                info = yf.Ticker(t).get_info()
+
+            # PER（trailing優先。無ければforward）
+            per = info.get("trailingPE", None)
+            if per is None:
+                per = info.get("forwardPE", None)
+
+            # PBR（priceToBook）
+            pbr = info.get("priceToBook", None)
+
+            # NaN正規化
+            if isinstance(per, float) and np.isnan(per):
+                per = None
+            if isinstance(pbr, float) and np.isnan(pbr):
+                pbr = None
+
+            per_map[t] = per
+            pbr_map[t] = pbr
+        except Exception:
+            # 取得失敗は None のまま
+            continue
+
+    return per_map, pbr_map
+
 # =====================================================================================
 # ここから下：抽出ロジック＆通知文言のみ変更（それ以外は触らない）
 # =====================================================================================
@@ -526,12 +571,14 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
         return
 
     lines = [f"{title} {now_jst():%m/%d %H:%M}"]
-    lines.append("Ticker   名称       現在価格   ATR%   ADX   DIΔ   底値上昇比率   BB(+/-)   BB_dn1σ   BB_up1σ   SMA_slope%")
+    lines.append("Ticker   名称       現在価格   PER    PBR    ATR%   ADX   DIΔ   底値上昇比率   BB(+/-)   BB_dn1σ   BB_up1σ   SMA_slope%")
 
     for _, r in df.iterrows():
         t = r["Ticker"]
         name = r.get("Name", "")
         close = fp(r["Close"], 0)
+        per = fp(r.get("PER", None), 2)
+        pbr = fp(r.get("PBR", None), 2)
         atr = fp(r["ATR20_pct"], 2)
         adx = fp(r["ADX14"], 1)
         did = fp(r["DI_diff"], 1)
@@ -542,7 +589,7 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
         bb_up = fp(r["BB_up_1"], 0)
         smas = fp(r["SMA25_slope20_pct"], 2)
         lines.append(
-            f"{t:<7} {name:<8} {close:>8} {atr:>6} {adx:>6} {did:>5} {br:>12}   "
+            f"{t:<7} {name:<8} {close:>8} {per:>6} {pbr:>6} {atr:>6} {adx:>6} {did:>5} {br:>12}   "
             f"{upc:>2}/{dnc:<2}   {bb_dn:>7}   {bb_up:>7}   {smas:>9}"
         )
 
@@ -558,7 +605,7 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
 
         # 現在価格 → BB(±1σ) → 底値上昇比率（BB比率） → 以降は今の順番
         desc = (
-            f"現在価格:{fp(r['Close'],0)}  "
+            f"現在価格:{fp(r['Close'],0)}  PER:{fp(r.get('PER',None),2)}  PBR:{fp(r.get('PBR',None),2)}  "
             f"BB(±1σ):{fp(r['BB_dn_1'],0)}–{fp(r['BB_up_1'],0)}  "
             f"底値上昇比率:{fp(r['Bottom_Rise_Ratio'],3)}  "
             f"ATR%:{fp(r['ATR20_pct'],2)}  "
@@ -587,8 +634,16 @@ def main():
         discord_send_text(f"【ATRレンジ候補】 {now_jst():%m/%d %H:%M}\nデータ取得失敗")
         return
 
+
+    # ===== PER / PBR（yfinance info）=====
+    per_map, pbr_map = fetch_per_pbr_map(tickers)
+
     # ===== 全銘柄 指標CSV出力（閾値調整用）=====
     all_df = compute_all_metrics(raw, tickers)
+    if all_df is not None and not all_df.empty:
+        all_df["PER"] = all_df["Ticker"].map(per_map)
+        all_df["PBR"] = all_df["Ticker"].map(pbr_map)
+
     if all_df is not None and not all_df.empty:
         os.makedirs(METRICS_OUT_DIR, exist_ok=True)
         ts = now_jst().strftime("%Y%m%d_%H%M")
@@ -600,6 +655,10 @@ def main():
 
     # ===== 抽出 → 通知 =====
     df = screen_candidates(raw, tickers)
+    if df is not None and not df.empty:
+        df["PER"] = df["Ticker"].map(per_map)
+        df["PBR"] = df["Ticker"].map(pbr_map)
+
     notify(df, raw)
 
 
