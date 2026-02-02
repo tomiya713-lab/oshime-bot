@@ -554,6 +554,8 @@ def extract_block(text: str, start: str, end: str) -> Optional[str]:
 # =========================
 def ai_propose_rss_queries_default(feat: pd.DataFrame, regime: str, reason: str) -> Tuple[List[Dict], List[str]]:
     fallback = [
+        {"label": "トランプ 株価 - 米大統領動向", "q": "トランプ 株価 ダウ", "lang": "ja"},
+        {"label": "高市 株価 - 首相動向", "q": "高市 株価", "lang": "ja"},
         {"label": "中東 原油 供給 リスク - risk-off時の定番", "q": "中東 原油 供給 リスク", "lang": "ja"},
         {"label": "Taiwan China military tension - 地政学リスク", "q": "Taiwan China military tension", "lang": "en"},
         {"label": "Russia Ukraine sanctions energy prices - 制裁/エネルギー", "q": "Russia Ukraine sanctions energy prices", "lang": "en"},
@@ -575,11 +577,18 @@ def ai_propose_rss_queries_default(feat: pd.DataFrame, regime: str, reason: str)
     system = "You are a markets+geopolitics assistant. Follow the output format strictly."
     user = f"""
 次の市場状況に合う「Google News RSS 検索クエリ」を最大{MAX_RSS_QUERIES}本提案して。
-日英ミックスOK。地政学とマクロ（米金利/原油/制裁/台湾/中東など）を広くカバーしつつ、今の数値に寄せて。
+日英ミックスOK。
+
+地政学とマクロ（米金利/原油/制裁/台湾/中東など）や日米首相の動向に加えて、
+**日本株（日経平均株価・TOPIX）や日本固有要因（金融政策・為替・企業要因）も考慮すること。**
+
+今の数値変化に最も関係が深そうなテーマを優先せよ。
 
 Regime: {regime}
 Reason: {reason}
-VIX: {vix}  VIX15m%: {vix15}  USDJPY: {usdjpy}
+VIX: {vix}  VIX15m%: {vix15}
+USDJPY: {usdjpy}
+NIKKEI_AVG: {nikkei_spot}  NIKKEI15m%: {nikkei15}
 
 出力は必ずこの形式（各行1件、合計{MAX_RSS_QUERIES}行）:
 lang|label|query
