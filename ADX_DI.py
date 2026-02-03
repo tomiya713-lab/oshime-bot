@@ -1,25 +1,101 @@
+# -*- coding: utf-8 -*-
+"""
+ADX + DI + ATR + BB(±1σ) screener for Nikkei225
++ Adds PER/PBR (yfinance info)
++ Adds J-Quants fundamentals (ROE proxy + simple earnings summary)
++ Adds AI comment (undervalued/fair/overvalued) using:
+    - sector median PER/PBR (TSE 33-sector via J-Quants listed info)
+    - stock PER/PBR
+    - ROE (NP/Eq from J-Quants fins/summary)
+    - latest earnings numbers (Sales/OP/NP and forecasts if available)
+
+Design goals (per user policy):
+- Objective numbers are computed in code.
+- Final valuation label + brief reasoning is done by AI.
+- AI is called ONLY when there are hits, and in ONE batch to reduce cost.
+- J-Quants Free plan endpoints only (fins/summary + listed/info).
+"""
+
 import os
 import sys
+import json
+import math
+import time
 from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List, Tuple
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import requests
 
-# ====== チャート用（元の運用に合わせて：入っていれば画像も送る） ======
+# ---------- chart libs ----------
+import matplotlib
+matplotlib.use("Agg")
+
+# Optional: mplfinance (chart)
 try:
-    import mplfinance as mpf
+    import mplfinance as mpf  # type: ignore
     MPF_AVAILABLE = True
 except Exception:
     MPF_AVAILABLE = False
 
+# Optional: OpenAI (for valuation comments)
+try:
+    from openai import OpenAI  # type: ignore
+    OPENAI_AVAILABLE = True
+except Exception:
+    OPENAI_AVAILABLE = False
 
-# ====== 基本設定（通知・環境変数などは変更しない想定） =====
+# =========================
+# Config (Env)
+# =========================
 TZ_OFFSET = 9  # JST
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "180"))
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 FORCE_RUN = os.getenv("FORCE_RUN", "0") == "1"
+
+# --- Screener params (kept close to your existing run) ---
+ADX_MAX = 25.0
+ATR_MIN_PCT = 1.8
+ATR_MAX_PCT = 6.0
+BB_TOUCH_MIN = 3
+SMA_SLOPE_MAX_PCT = 5.0
+
+DI_DIFF_MAX = float(os.getenv("DI_DIFF_MAX", "7.0"))
+DI_RATIO_MIN = float(os.getenv("DI_RATIO_MIN", "1.03"))
+
+# Output dirs
+METRICS_OUT_DIR = os.getenv("METRICS_OUT_DIR", "reports")
+METRICS_PREFIX = os.getenv("METRICS_PREFIX", "atr_swing_metrics")
+
+CHART_OUT_DIR = os.getenv("CHART_OUT_DIR", "charts")
+CHART_LOOKBACK_DAYS = int(os.getenv("CHART_LOOKBACK_DAYS", "90"))
+CHART_TOP_N = int(os.getenv("CHART_TOP_N", "8"))
+
+# --- J-Quants ---
+JQUANTS_API_KEY = os.getenv("JQUANTS_API_KEY", "").strip()
+JQUANTS_BASE = os.getenv("JQUANTS_BASE_URL", "https://api.jquants.com/v2").rstrip("/")
+
+# --- AI ---
+ENABLE_AI = os.getenv("ENABLE_AI", "1").strip() == "1"
+AI_ONLY_ON_ALERT = os.getenv("AI_ONLY_ON_ALERT", "1").strip() == "1"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "700"))
+OPENAI_TIMEOUT_SEC = int(os.getenv("OPENAI_TIMEOUT_SEC", "30"))
+OPENAI_RETRIES = int(os.getenv("OPENAI_RETRIES", "2"))
+DEBUG_AI = os.getenv("DEBUG_AI", "0").strip() == "1"
+
+# Rate limiting (safety)
+JQ_SLEEP_SEC = float(os.getenv("JQUANTS_SLEEP_SEC", "0.15"))
+JQ_TIMEOUT_SEC = int(os.getenv("JQUANTS_TIMEOUT_SEC", "20"))
+
+# =========================
+# Nikkei 225 tickers + Japanese names (existing mapping)
+# =========================
+# NOTE: Keep your current list; this file contains a placeholder minimal set.
+# Replace/merge with your full nikkei225 list and name map as in your current ADX_DI.py.
 
 # ===== 日経225ティッカー =====
 nikkei225_tickers = [ '4151.T','4502.T','4503.T','4506.T','4507.T','4519.T','4523.T','4568.T','4578.T','6479.T','6501.T','6503.T','6504.T','6506.T','6526.T','6594.T','6645.T','6674.T','6701.T','6702.T','6723.T','6724.T','6752.T','6753.T','6758.T','6762.T','6770.T','6841.T','6857.T','6861.T','6902.T','6920.T','6952.T','6954.T','6971.T','6976.T','6981.T','7735.T','7751.T','7752.T','8035.T','7201.T','7202.T','7203.T','7205.T','7211.T','7261.T','7267.T','7269.T','7270.T','7272.T','4543.T','4902.T','6146.T','7731.T','7733.T','7741.T','7762.T','9432.T','9433.T','9434.T','6963.T','9984.T','5831.T','7186.T','8304.T','8306.T','8308.T','8309.T','8316.T','8331.T','8354.T','8411.T','8253.T','8591.T','8697.T','8601.T','8604.T','8630.T','8725.T','8750.T','8766.T','8795.T','1332.T','2002.T','2269.T','2282.T','2501.T','2502.T','2503.T','2801.T','2802.T','2871.T','2914.T','3086.T','3092.T','3099.T','3382.T','7453.T','8233.T','8252.T','8267.T','9843.T','9983.T','2413.T','2432.T','3659.T','4307.T','4324.T','4385.T','4661.T','4689.T','4704.T','4751.T','4755.T','6098.T','6178.T','7974.T','9602.T','9735.T','9766.T','1605.T','3401.T','3402.T','3861.T','3405.T','3407.T','4004.T','4005.T','4021.T','4042.T','4043.T','4061.T','4063.T','4183.T','4188.T','4208.T','4452.T','4901.T','4911.T','6988.T','5019.T','5020.T','5101.T','5108.T','5201.T','5214.T','5233.T','5301.T','5332.T','5333.T','5401.T','5406.T','5411.T','3436.T','5706.T','5711.T','5713.T','5714.T','5801.T','5802.T','5803.T','2768.T','8001.T','8002.T','8015.T','8031.T','8053.T','8058.T','1721.T','1801.T','1802.T','1803.T','1808.T','1812.T','1925.T','1928.T','1963.T','5631.T','6103.T','6113.T','6273.T','6301.T','6302.T','6305.T','6326.T','6361.T','6367.T','6471.T','6472.T','6473.T','7004.T','7011.T','7013.T','7012.T','7832.T','7911.T','7912.T','7951.T','3289.T','8801.T','8802.T','8804.T','8830.T','9001.T','9005.T','9007.T','9008.T','9009.T','9020.T','9021.T','9022.T','9064.T','9147.T','9101.T','9104.T','9107.T','9201.T','9202.T','9301.T','9501.T','9502.T','9503.T','9531.T','9532.T' ]
@@ -81,16 +157,16 @@ ticker_name_map = {
     "9984.T": "ソフトバンクG",
 }
 
-# ===== ユーティリティ（既存運用のまま） =====
+# =========================
+# Utils
+# =========================
 def now_jst() -> datetime:
     return datetime.utcnow() + timedelta(hours=TZ_OFFSET)
-
 
 def is_weekend(dt: datetime) -> bool:
     return dt.weekday() >= 5
 
-
-def chunk_text(text: str, limit: int = 1900):
+def chunk_text(text: str, limit: int = 1900) -> List[str]:
     out, buf, size = [], [], 0
     for line in text.splitlines():
         add = len(line) + 1
@@ -103,8 +179,15 @@ def chunk_text(text: str, limit: int = 1900):
         out.append("\n".join(buf))
     return out
 
+def fp(x, nd=2) -> str:
+    try:
+        if x is None or (isinstance(x, float) and math.isnan(x)):
+            return "-"
+        return f"{float(x):.{nd}f}"
+    except Exception:
+        return "-"
 
-def discord_post(payload: dict, files=None):
+def discord_post(payload: dict, files=None) -> bool:
     if not DISCORD_WEBHOOK_URL:
         print("[WARN] DISCORD_WEBHOOK_URL is empty. skip notify.", file=sys.stderr)
         return False
@@ -121,12 +204,10 @@ def discord_post(payload: dict, files=None):
         print(f"[WARN] Discord post error: {e}", file=sys.stderr)
         return False
 
-
-def discord_send_text(content: str):
+def discord_send_text(content: str) -> bool:
     return discord_post({"content": content})
 
-
-def discord_send_image_file(file_path: str, title: str = "", description: str = ""):
+def discord_send_image_file(file_path: str, title: str = "", description: str = "") -> bool:
     if not os.path.exists(file_path):
         return False
     with open(file_path, "rb") as f:
@@ -134,21 +215,12 @@ def discord_send_image_file(file_path: str, title: str = "", description: str = 
         payload = {"content": f"**{title}**\n{description}".strip()}
         return discord_post(payload, files=files)
 
-
-def fp(x, nd=2):
-    try:
-        if x is None or (isinstance(x, float) and np.isnan(x)):
-            return "-"
-        return f"{float(x):.{nd}f}"
-    except Exception:
-        return "-"
-
-
-# ===== データ取得（既存運用のまま） =====
-def fetch_market_data(tickers, lookback_days=LOOKBACK_DAYS):
+# =========================
+# Data fetch: yfinance
+# =========================
+def fetch_market_data(tickers: List[str], lookback_days: int = LOOKBACK_DAYS) -> pd.DataFrame:
     end = now_jst().date()
     start = end - timedelta(days=lookback_days + 10)
-
     raw = yf.download(
         tickers=tickers,
         start=str(start),
@@ -162,616 +234,545 @@ def fetch_market_data(tickers, lookback_days=LOOKBACK_DAYS):
     )
     return raw
 
+# =========================
+# Technical indicators
+# =========================
+def _series_from_raw(raw_df: pd.DataFrame, field: str, ticker: str) -> pd.Series:
+    if isinstance(raw_df.columns, pd.MultiIndex):
+        return raw_df[(field, ticker)].dropna()
+    return raw_df[field].dropna()
 
-# ===== バリュエーション（PER / PBR）取得 =====
-def fetch_per_pbr_map(tickers):
-    """
-    yfinance(info) から PER/PBR を取得して dict で返す。
-    - 取得に失敗した銘柄は None
-    - yfinance/Yahoo 側の都合で欠損することがあるので、通知側では '-' 表示にする
-    """
-    per_map = {t: None for t in tickers}
-    pbr_map = {t: None for t in tickers}
+def calc_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 20) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.rolling(period, min_periods=period).mean()
 
-    # まとめてオブジェクトを作る（通信回数の削減を期待）
+def calc_adx_di(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+
+    atr = tr.rolling(period, min_periods=period).mean()
+    plus_di = 100.0 * pd.Series(plus_dm, index=high.index).rolling(period, min_periods=period).mean() / atr
+    minus_di = 100.0 * pd.Series(minus_dm, index=high.index).rolling(period, min_periods=period).mean() / atr
+
+    dx = (100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di)).replace([np.inf, -np.inf], np.nan)
+    adx = dx.rolling(period, min_periods=period).mean()
+    return adx, plus_di, minus_di
+
+def calc_bb(close: pd.Series, period: int = 20, sigma: float = 1.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    ma = close.rolling(period, min_periods=period).mean()
+    sd = close.rolling(period, min_periods=period).std()
+    upper = ma + sigma * sd
+    lower = ma - sigma * sd
+    return ma, upper, lower
+
+def sma_slope_pct(sma: pd.Series, window: int = 20) -> float:
+    if len(sma) < window + 1 or pd.isna(sma.iloc[-1]) or pd.isna(sma.iloc[-window-1]):
+        return float("nan")
+    base = float(sma.iloc[-window-1])
+    if base == 0:
+        return float("nan")
+    return (float(sma.iloc[-1]) / base - 1.0) * 100.0
+
+def bb_touch_count(close: pd.Series, upper: pd.Series, lower: pd.Series, window: int = 20) -> int:
+    c = close.tail(window)
+    u = upper.tail(window)
+    l = lower.tail(window)
+    hit = ((c >= u) | (c <= l)).sum()
+    return int(hit)
+
+def calc_latest_metrics(raw_df: pd.DataFrame, ticker: str) -> Optional[Dict[str, Any]]:
     try:
-        tickers_obj = yf.Tickers(" ".join(tickers))
-    except Exception:
-        tickers_obj = None
+        close = _series_from_raw(raw_df, "Close", ticker)
+        high = _series_from_raw(raw_df, "High", ticker)
+        low = _series_from_raw(raw_df, "Low", ticker)
 
-    for t in tickers:
-        try:
-            if tickers_obj is not None and hasattr(tickers_obj, "tickers") and t in tickers_obj.tickers:
-                info = tickers_obj.tickers[t].get_info()
-            else:
-                info = yf.Ticker(t).get_info()
-
-            # PER（trailing優先。無ければforward）
-            per = info.get("trailingPE", None)
-            if per is None:
-                per = info.get("forwardPE", None)
-
-            # PBR（priceToBook）
-            pbr = info.get("priceToBook", None)
-
-            # NaN正規化
-            if isinstance(per, float) and np.isnan(per):
-                per = None
-            if isinstance(pbr, float) and np.isnan(pbr):
-                pbr = None
-
-            per_map[t] = per
-            pbr_map[t] = pbr
-        except Exception:
-            # 取得失敗は None のまま
-            continue
-
-    return per_map, pbr_map
-
-# =====================================================================================
-# ここから下：抽出ロジック＆通知文言のみ変更（それ以外は触らない）
-# =====================================================================================
-
-# ★ 抽出ロジック用パラメータ
-ADX_MAX = 25.0
-ATR_MIN_PCT = 1.8
-ATR_MAX_PCT = 6.0
-BB_TOUCH_MIN = 2
-SMA_SLOPE_MAX_PCT = 5
-
-# ★ DI差分フィルタ（|+DI14 - -DI14| が小さいほど「方向感が薄い」）
-DI_DIFF_MAX = float(os.getenv("DI_DIFF_MAX", "7.0"))
-
-# ★ DI比率（+DI14 ÷ -DI14 が 3%以上 = 1.03以上）
-DI_RATIO_MIN = float(os.getenv("DI_RATIO_MIN", "1.03"))
-
-# ★ 指標CSV出力（GitHub ActionsでArtifacts化する前提でもOK）
-METRICS_OUT_DIR = os.getenv("METRICS_OUT_DIR", "reports")
-METRICS_PREFIX = os.getenv("METRICS_PREFIX", "atr_swing_metrics")
-
-# チャート設定（既存のまま使う想定。未設定ならデフォルトで安全に動作）
-CHART_OUT_DIR = os.getenv("CHART_OUT_DIR", "charts")
-CHART_LOOKBACK_DAYS = int(os.getenv("CHART_LOOKBACK_DAYS", "90"))
-CHART_TOP_N = int(os.getenv("CHART_TOP_N", "8"))
-
-
-def calc_latest_metrics_from_raw(raw_df: pd.DataFrame, ticker: str):
-    """
-    最新日で以下を算出し、条件を満たす場合に返す（満たさない場合はNone）
-      - ADX14 <= 25
-      - 1.8% <= ATR20% <= 4.0%
-      - 直近20日で BB(20,±1σ) +1σ/-1σ タッチ回数 >= 3
-      - |SMA25の20日傾き(%)| <= 0.5
-      - |+DI14 - -DI14| <= DI_DIFF_MAX
-      - (+DI14 / -DI14) >= DI_RATIO_MIN
-
-    通知追加用
-      - Close（最新終値）
-      - BB(20,±1σ)の価格（最新日の上下1σ）
-      - Bottom_Rise_Ratio = BB_up_1 / BB_dn_1（価格レンジ比率）
-    """
-    m = calc_latest_metrics_all_from_raw(raw_df, ticker)
-    if m is None:
-        return None
-
-    if not bool(m.get("Pass", False)):
-        return None
-
-    return {
-        "Ticker": m["Ticker"],
-        "Name": m["Name"],
-        "Close": m["Close"],
-        "ATR20_pct": m["ATR20_pct"],
-        "ADX14": m["ADX14"],
-        "BB_up_touch_cnt20": m["BB_up_touch_cnt20"],
-        "BB_dn_touch_cnt20": m["BB_dn_touch_cnt20"],
-        "BB_up_1": m["BB_up_1"],
-        "BB_dn_1": m["BB_dn_1"],
-        "SMA25_slope20_pct": m["SMA25_slope20_pct"],
-        "PLUS_DI14": m["PLUS_DI14"],
-        "MINUS_DI14": m["MINUS_DI14"],
-        "DI_diff": m["DI_diff"],
-        "DI_Ratio": m["DI_Ratio"],
-        "Bottom_Rise_Ratio": m["Bottom_Rise_Ratio"],  # BB_up_1 / BB_dn_1
-    }
-
-
-def calc_latest_metrics_all_from_raw(raw_df: pd.DataFrame, ticker: str):
-    """
-    ★全銘柄CSV用：指標を計算できたら必ず返す（抽出条件で落とさない）
-    - Pass/Fail と、各条件の判定列も返す（閾値調整用）
-    """
-    try:
-        if not isinstance(raw_df.columns, pd.MultiIndex):
+        need_len = 60
+        if len(close) < need_len:
             return None
 
-        close = raw_df[("Close", ticker)].dropna()
-        high = raw_df[("High", ticker)].reindex(close.index)
-        low = raw_df[("Low", ticker)].reindex(close.index)
+        adx, plus_di, minus_di = calc_adx_di(high, low, close, 14)
+        atr20 = calc_atr(high, low, close, 20)
 
-        if len(close) < 60:
-            return {
-                "Ticker": ticker,
-                "Name": ticker_name_map.get(ticker, ""),
-                "Close": np.nan,
-                "ATR20_pct": np.nan,
-                "ADX14": np.nan,
-                "BB_up_touch_cnt20": np.nan,
-                "BB_dn_touch_cnt20": np.nan,
-                "BB_up_1": np.nan,
-                "BB_dn_1": np.nan,
-                "SMA25_slope20_pct": np.nan,
-                "PLUS_DI14": np.nan,
-                "MINUS_DI14": np.nan,
-                "DI_diff": np.nan,
-                "DI_Ratio": np.nan,
-                "Bottom_Rise_Ratio": np.nan,
-                "Pass_ADX": False,
-                "Pass_ATR": False,
-                "Pass_BB": False,
-                "Pass_SMA_Slope": False,
-                "Pass_DI_Diff": False,
-                "Pass_DI_Ratio": False,
-                "Pass": False,
-                "Reason": "insufficient_data",
-            }
-
-        # --- ATR20% ---
-        prev_close = close.shift(1)
-        tr = pd.concat(
-            [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
-            axis=1
-        ).max(axis=1)
-        atr20 = tr.rolling(20, min_periods=20).mean()
-        atr20_pct = atr20 / close * 100.0
-
-        # --- ADX14（Rolling Sum DI / Rolling Mean DX） ---
-        prev_high = high.shift(1)
-        prev_low = low.shift(1)
-
-        up_move = high - prev_high
-        down_move = prev_low - low
-
-        plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=close.index)
-        minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=close.index)
-
-        tr14 = tr.rolling(14, min_periods=14).sum()
-        plus_dm14 = plus_dm.rolling(14, min_periods=14).sum()
-        minus_dm14 = minus_dm.rolling(14, min_periods=14).sum()
-
-        plus_di14 = 100.0 * (plus_dm14 / tr14)
-        minus_di14 = 100.0 * (minus_dm14 / tr14)
-
-        dx = 100.0 * (plus_di14 - minus_di14).abs() / (plus_di14 + minus_di14)
-        adx14 = dx.rolling(14, min_periods=14).mean()
-
-        # DI差分
-        di_diff = (plus_di14 - minus_di14).abs()
-
-        # DI比率（+DI14 ÷ -DI14）※ゼロ除算回避
-        di_ratio = plus_di14 / minus_di14.replace(0, np.nan)
-
-        # --- BB(20,±1σ) & タッチ回数（直近20日） ---
-        bb_mid = close.rolling(20, min_periods=20).mean()
-        bb_std = close.rolling(20, min_periods=20).std()
-        bb_up_1 = bb_mid + bb_std
-        bb_dn_1 = bb_mid - bb_std
-
-        touch_up_1 = (high >= bb_up_1).astype(int)
-        touch_dn_1 = (low <= bb_dn_1).astype(int)
-
-        touch_up_cnt20 = touch_up_1.rolling(20, min_periods=20).sum()
-        touch_dn_cnt20 = touch_dn_1.rolling(20, min_periods=20).sum()
-
-        # --- SMA25傾き（20日） ---
         sma25 = close.rolling(25, min_periods=25).mean()
-        sma25_20ago = sma25.shift(20)
-        sma25_slope20_pct = (sma25 - sma25_20ago) / sma25_20ago * 100.0
+        sma_slope = sma_slope_pct(sma25, window=20)
 
-        # --- 最新値 ---
-        close_v = close.iloc[-1]
-        atr_v = atr20_pct.iloc[-1]
-        adx_v = adx14.iloc[-1]
-        up_cnt = touch_up_cnt20.iloc[-1]
-        dn_cnt = touch_dn_cnt20.iloc[-1]
-        sma_slope_v = sma25_slope20_pct.iloc[-1]
-        bb_up_v = bb_up_1.iloc[-1]
-        bb_dn_v = bb_dn_1.iloc[-1]
+        bb_ma, bb_up, bb_dn = calc_bb(close, 20, sigma=1.0)
+        touches = bb_touch_count(close, bb_up, bb_dn, window=20)
 
-        plus_di_v = plus_di14.iloc[-1]
-        minus_di_v = minus_di14.iloc[-1]
-        di_diff_v = di_diff.iloc[-1]
-        di_ratio_v = di_ratio.iloc[-1]
+        last_close = float(close.iloc[-1])
+        atr_pct = float(atr20.iloc[-1] / last_close * 100.0) if not pd.isna(atr20.iloc[-1]) else float("nan")
 
-        # 底値上昇比率（BB_up_1 ÷ BB_dn_1）
-        bb_range_ratio_v = bb_up_v / bb_dn_v if float(bb_dn_v) != 0.0 else np.nan
+        adx_v = float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else float("nan")
+        pdi = float(plus_di.iloc[-1]) if not pd.isna(plus_di.iloc[-1]) else float("nan")
+        mdi = float(minus_di.iloc[-1]) if not pd.isna(minus_di.iloc[-1]) else float("nan")
 
-        if any(pd.isna(x) for x in [
-            close_v, atr_v, adx_v, up_cnt, dn_cnt, sma_slope_v, bb_up_v, bb_dn_v,
-            plus_di_v, minus_di_v, di_diff_v, di_ratio_v, bb_range_ratio_v
-        ]):
-            return {
-                "Ticker": ticker,
-                "Name": ticker_name_map.get(ticker, ""),
-                "Close": float(close_v) if not pd.isna(close_v) else np.nan,
-                "ATR20_pct": float(atr_v) if not pd.isna(atr_v) else np.nan,
-                "ADX14": float(adx_v) if not pd.isna(adx_v) else np.nan,
-                "BB_up_touch_cnt20": int(up_cnt) if not pd.isna(up_cnt) else np.nan,
-                "BB_dn_touch_cnt20": int(dn_cnt) if not pd.isna(dn_cnt) else np.nan,
-                "BB_up_1": float(bb_up_v) if not pd.isna(bb_up_v) else np.nan,
-                "BB_dn_1": float(bb_dn_v) if not pd.isna(bb_dn_v) else np.nan,
-                "SMA25_slope20_pct": float(sma_slope_v) if not pd.isna(sma_slope_v) else np.nan,
-                "PLUS_DI14": float(plus_di_v) if not pd.isna(plus_di_v) else np.nan,
-                "MINUS_DI14": float(minus_di_v) if not pd.isna(minus_di_v) else np.nan,
-                "DI_diff": float(di_diff_v) if not pd.isna(di_diff_v) else np.nan,
-                "DI_Ratio": float(di_ratio_v) if not pd.isna(di_ratio_v) else np.nan,
-                "Bottom_Rise_Ratio": float(bb_range_ratio_v) if not pd.isna(bb_range_ratio_v) else np.nan,
-                "Pass_ADX": False,
-                "Pass_ATR": False,
-                "Pass_BB": False,
-                "Pass_SMA_Slope": False,
-                "Pass_DI_Diff": False,
-                "Pass_DI_Ratio": False,
-                "Pass": False,
-                "Reason": "nan_metrics",
-            }
+        di_diff = abs(pdi - mdi) if (not math.isnan(pdi) and not math.isnan(mdi)) else float("nan")
+        di_ratio = (pdi / mdi) if (not math.isnan(pdi) and not math.isnan(mdi) and mdi != 0) else float("nan")
 
-        # --- 条件判定（抽出条件と同一） ---
-        pass_adx = float(adx_v) <= ADX_MAX
-        pass_atr = (ATR_MIN_PCT <= float(atr_v) <= ATR_MAX_PCT)
-        pass_bb = (int(up_cnt) >= BB_TOUCH_MIN) and (int(dn_cnt) >= BB_TOUCH_MIN)
-        pass_sma = abs(float(sma_slope_v)) <= SMA_SLOPE_MAX_PCT
-        pass_di_diff = float(di_diff_v) <= DI_DIFF_MAX
-        pass_di_ratio = float(di_ratio_v) >= DI_RATIO_MIN
+        bb_up_1 = float(bb_up.iloc[-1]) if not pd.isna(bb_up.iloc[-1]) else float("nan")
+        bb_dn_1 = float(bb_dn.iloc[-1]) if not pd.isna(bb_dn.iloc[-1]) else float("nan")
+        bottom_rise_ratio = (bb_up_1 / bb_dn_1) if (not math.isnan(bb_up_1) and not math.isnan(bb_dn_1) and bb_dn_1 != 0) else float("nan")
 
-        passed = all([pass_adx, pass_atr, pass_bb, pass_sma, pass_di_diff, pass_di_ratio])
-
-        return {
-            "Ticker": ticker,
-            "Name": ticker_name_map.get(ticker, ""),
-            "Close": float(close_v),
-            "ATR20_pct": float(atr_v),
-            "ADX14": float(adx_v),
-            "BB_up_touch_cnt20": int(up_cnt),
-            "BB_dn_touch_cnt20": int(dn_cnt),
-            "BB_up_1": float(bb_up_v),
-            "BB_dn_1": float(bb_dn_v),
-            "SMA25_slope20_pct": float(sma_slope_v),
-            "PLUS_DI14": float(plus_di_v),
-            "MINUS_DI14": float(minus_di_v),
-            "DI_diff": float(di_diff_v),
-            "DI_Ratio": float(di_ratio_v),                      # +DI14 / -DI14
-            "Bottom_Rise_Ratio": float(bb_range_ratio_v),        # BB_up_1 / BB_dn_1
-            "Pass_ADX": bool(pass_adx),
-            "Pass_ATR": bool(pass_atr),
-            "Pass_BB": bool(pass_bb),
-            "Pass_SMA_Slope": bool(pass_sma),
-            "Pass_DI_Diff": bool(pass_di_diff),
-            "Pass_DI_Ratio": bool(pass_di_ratio),
-            "Pass": bool(passed),
-            "Reason": "",
-        }
-
-    except Exception:
-        return {
-            "Ticker": ticker,
-            "Name": ticker_name_map.get(ticker, ""),
-            "Close": np.nan,
-            "ATR20_pct": np.nan,
-            "ADX14": np.nan,
-            "BB_up_touch_cnt20": np.nan,
-            "BB_dn_touch_cnt20": np.nan,
-            "BB_up_1": np.nan,
-            "BB_dn_1": np.nan,
-            "SMA25_slope20_pct": np.nan,
-            "PLUS_DI14": np.nan,
-            "MINUS_DI14": np.nan,
-            "DI_diff": np.nan,
-            "DI_Ratio": np.nan,
-            "Bottom_Rise_Ratio": np.nan,
-            "Pass_ADX": False,
-            "Pass_ATR": False,
-            "Pass_BB": False,
-            "Pass_SMA_Slope": False,
-            "Pass_DI_Diff": False,
-            "Pass_DI_Ratio": False,
-            "Pass": False,
-            "Reason": "exception",
-        }
-
-
-def screen_candidates(raw_df: pd.DataFrame, tickers):
-    rows = []
-    for t in tickers:
-        m = calc_latest_metrics_from_raw(raw_df, t)
-        if m is not None:
-            rows.append(m)
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    df = df.sort_values(["ADX14", "ATR20_pct"], ascending=[True, False]).reset_index(drop=True)
-    return df
-
-
-def compute_all_metrics(raw_df: pd.DataFrame, tickers):
-    """
-    全銘柄分：計算できた指標を全部出す（抽出条件で落とさない）。
-    Pass/Failと、各条件の判定列も含める（閾値調整用）。
-    """
-    rows = []
-    for t in tickers:
-        m = calc_latest_metrics_all_from_raw(raw_df, t)
-        if m is None:
-            continue
-        rows.append(m)
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    df = df.sort_values(["Pass", "Ticker"], ascending=[False, True]).reset_index(drop=True)
-    return df
-
-
-
-def _setup_matplotlib_japanese_font():
-    """
-    日本語を画像内に描画するためのフォントをセットアップする。
-
-    返り値:
-      - (jp_fp, font_path)
-        jp_fp: matplotlib.font_manager.FontProperties または None
-        font_path: 実際に使うフォントファイルパス（見つからなければ None）
-
-    探索順:
-      1) 環境変数 JAPANESE_FONT_PATH
-      2) スクリプト同階層の ipaexg.ttf
-      3) よくあるLinux配置（IPAex / Noto CJK / Takao など）
-    """
-    try:
-        import matplotlib
-        from matplotlib import font_manager as fm
-    except Exception:
-        return None, None
-
-    candidates = []
-
-    env_path = os.getenv("JAPANESE_FONT_PATH", "").strip()
-    if env_path:
-        candidates.append(env_path)
-
-    # リポジトリに同梱する想定（推奨）
-    try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        candidates.extend([
-            os.path.join(here, "ipaexg.ttf"),
-            os.path.join(here, "IPAexGothic.ttf"),
-            os.path.join(here, "NotoSansCJKjp-Regular.otf"),
-            os.path.join(here, "NotoSansCJK-Regular.ttc"),
-        ])
-    except Exception:
-        pass
-
-    # 代表的な配置場所（GitHub Actions ubuntu含む）
-    candidates.extend([
-        # IPAex
-        "/usr/share/fonts/truetype/ipaexg.ttf",
-        "/usr/share/fonts/truetype/ipaexg/ipaexg.ttf",
-        "/usr/share/fonts/opentype/ipaexg.ttf",
-        "/usr/share/fonts/opentype/ipaexg/ipaexg.ttf",
-        "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
-        # Noto CJK (Ubuntu系で入っていることが多い)
-        "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.ttf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansJP-Regular.otf",
-        "/usr/share/fonts/truetype/noto/NotoSansJP-Regular.ttf",
-        # Takao (古めの環境)
-        "/usr/share/fonts/truetype/takao-gothic/TakaoPGothic.ttf",
-        "/usr/share/fonts/truetype/takao/TakaoPGothic.ttf",
-    ])
-
-    font_path = None
-    for p in candidates:
-        if p and os.path.exists(p):
-            font_path = p
-            break
-
-    if not font_path:
-        # --- 最終手段：フォントを自動ダウンロード（yml不要で文字化け対策） ---
-        # 日本語フォントが入っていない環境（例: GitHub Actionsの最小Ubuntu）でも、画像内に日本語を描画するため。
-        # 失敗しても処理は継続（その場合は日本語が□になる可能性あり）。
-        try:
-            import requests as _rq
-            cache_dir = os.getenv("JP_FONT_CACHE_DIR", "/tmp/jp_fonts")
-            os.makedirs(cache_dir, exist_ok=True)
-            dl_path = os.path.join(cache_dir, "NotoSansCJKjp-Regular.otf")
-            if (not os.path.exists(dl_path)) or os.path.getsize(dl_path) < 1_000_000:
-                url = os.getenv(
-                    "JP_FONT_URL",
-                    "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf",
-                )
-                resp = _rq.get(url, timeout=45)
-                if resp.status_code == 200 and len(resp.content) > 1_000_000:
-                    with open(dl_path, "wb") as f:
-                        f.write(resp.content)
-            if os.path.exists(dl_path) and os.path.getsize(dl_path) > 1_000_000:
-                font_path = dl_path
-                print(f"[INFO] Japanese font ready: {font_path}", file=sys.stderr)
-        except Exception as _e:
-            print(f"[WARN] Japanese font download failed: {_e}", file=sys.stderr)
-
-    if not font_path:
-        # フォントが見つからない場合は None を返す（＝日本語は文字化けする可能性）
-        return None, None
-
-    try:
-        # フォント登録（これをやらないと get_name() が安定しない環境がある）
-        fm.fontManager.addfont(font_path)
-        jp_fp = fm.FontProperties(fname=font_path)
-
-        # mplfinance の title など「fontpropertiesを渡せない文字」も日本語で出すため
-        # グローバルのデフォルトフォントを日本語フォントに寄せる
-        try:
-            matplotlib.rcParams["font.family"] = jp_fp.get_name()
-            matplotlib.rcParams["axes.unicode_minus"] = False
-        except Exception:
-            pass
-
-        return jp_fp, font_path
-    except Exception:
-        return None, None
-    candidates = []
-    env_path = os.getenv("JAPANESE_FONT_PATH", "").strip()
-    if env_path:
-        candidates.append(env_path)
-
-    try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        candidates.append(os.path.join(here, "ipaexg.ttf"))
-    except Exception:
-        pass
-
-    candidates.extend([
-        "/usr/share/fonts/truetype/ipaexg.ttf",
-        "/usr/share/fonts/truetype/ipaexg/ipaexg.ttf",
-        "/usr/share/fonts/opentype/ipaexg.ttf",
-    ])
-
-    for p in candidates:
-        if p and os.path.exists(p):
-            try:
-                return fm.FontProperties(fname=p)
-            except Exception:
-                continue
-    return None
-
-
-def save_chart_image_with_bb1sigma(
-    raw_df: pd.DataFrame,
-    ticker: str,
-    out_dir: str = CHART_OUT_DIR,
-    name: str = "",
-    metrics=None,
-):
-    """
-    mplfinance が使えるときだけ画像作成。
-    - BB(20,±1σ) を重ねる
-    - 画像の中に「銘柄名（和名）＋各種指標」をテキストで埋め込む（Discord 2通目を画像完結にする）
-    """
-    if not MPF_AVAILABLE:
-        return None
-
-    try:
-        ohlcv = raw_df.loc[:, [(c, ticker) for c in ["Open", "High", "Low", "Close", "Volume"]]].copy()
-        ohlcv.columns = ["Open", "High", "Low", "Close", "Volume"]
-        ohlcv = ohlcv.dropna()
-        if ohlcv.empty:
-            return None
-        ohlcv = ohlcv.tail(CHART_LOOKBACK_DAYS)
-
-        close = ohlcv["Close"]
-        bb_mid = close.rolling(20, min_periods=20).mean()
-        bb_std = close.rolling(20, min_periods=20).std()
-        bb_up_1 = bb_mid + bb_std
-        bb_dn_1 = bb_mid - bb_std
-
-        add_plots = [
-            mpf.make_addplot(bb_up_1, panel=0),
-            mpf.make_addplot(bb_dn_1, panel=0),
-        ]
-
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"{ticker}.png")
-
-        # returnfig=True で fig を受け取り、画像内にテキストを描画する
-        fig, axlist = mpf.plot(
-            ohlcv,
-            type="candle",
-            mav=(5, 25, 75),
-            volume=True,
-            style="yahoo",
-            title=f"{ticker} {name}".strip(),
-            addplot=add_plots,
-            returnfig=True,
+        passed = (
+            (not math.isnan(adx_v) and adx_v <= ADX_MAX) and
+            (not math.isnan(atr_pct) and (ATR_MIN_PCT <= atr_pct <= ATR_MAX_PCT)) and
+            (touches >= BB_TOUCH_MIN) and
+            (not math.isnan(sma_slope) and abs(sma_slope) <= SMA_SLOPE_MAX_PCT) and
+            (not math.isnan(di_diff) and di_diff <= DI_DIFF_MAX) and
+            (not math.isnan(di_ratio) and di_ratio >= DI_RATIO_MIN)
         )
 
-        # 画像内テキスト（指標）
-        jp_fp = _setup_matplotlib_japanese_font()[0]
-
-        if metrics:
-            # テキストは「画像の中」で完結するよう、重要指標をまとめる
-            text_lines = [
-                f"{ticker} {name}".strip(),
-                f"現在価格:{fp(metrics.get('Close'),0)}  PER:{fp(metrics.get('PER'),2)}  PBR:{fp(metrics.get('PBR'),2)}",
-                f"BB(±1σ):{fp(metrics.get('BB_dn_1'),0)}–{fp(metrics.get('BB_up_1'),0)}  底値上昇比率:{fp(metrics.get('Bottom_Rise_Ratio'),3)}",
-                f"ATR%:{fp(metrics.get('ATR20_pct'),2)}  ADX:{fp(metrics.get('ADX14'),1)}  DI_diff:{fp(metrics.get('DI_diff'),1)}",
-                f"BB(+/-):{int(metrics.get('BB_up_touch_cnt20',0))}/{int(metrics.get('BB_dn_touch_cnt20',0))}  SMA_slope%:{fp(metrics.get('SMA25_slope20_pct'),2)}",
-            ]
-            text = "\n".join(text_lines)
-
-            # fig内左上に表示（背景付きで可読性UP）
-            fig.text(
-                0.01,
-                0.99,
-                text,
-                ha="left",
-                va="top",
-                fontsize=10,
-                fontproperties=jp_fp,
-                bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.85, edgecolor="none"),
-            )
-
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
-        try:
-            import matplotlib.pyplot as plt
-            plt.close(fig)
-        except Exception:
-            pass
-
-        return out_path
+        return {
+            "Ticker": ticker,
+            "Name": ticker_name_map.get(ticker, ""),
+            "Close": last_close,
+            "ATR_pct": atr_pct,
+            "ADX": adx_v,
+            "DI_diff": di_diff,
+            "DI_ratio": di_ratio,
+            "BB_touches": touches,
+            "BB_dn1": bb_dn_1,
+            "BB_up1": bb_up_1,
+            "Bottom_Rise_Ratio": bottom_rise_ratio,
+            "SMA_slope_pct": sma_slope,
+            "Pass": bool(passed),
+        }
     except Exception:
         return None
 
+def compute_all_metrics(raw_df: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
+    rows = []
+    for t in tickers:
+        m = calc_latest_metrics(raw_df, t)
+        if m:
+            rows.append(m)
+    return pd.DataFrame(rows)
 
-def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
-    title = (
-        f"【ATRレンジ候補（ADX≤25 × ATR(1.8-4)% × BB±1σ>=3 × SMA傾き小 × "
-        f"DI_diff≤{DI_DIFF_MAX:g} × DI比率≥{DI_RATIO_MIN:g}）】"
-    )
+def screen_candidates(raw_df: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
+    df = compute_all_metrics(raw_df, tickers)
+    if df.empty:
+        return df
+    return df[df["Pass"] == True].sort_values(["ADX", "ATR_pct"], ascending=[True, True]).reset_index(drop=True)
 
+# =========================
+# PER / PBR from yfinance
+# =========================
+def fetch_per_pbr_from_info(ticker: str) -> Tuple[Optional[float], Optional[float]]:
+    try:
+        info = yf.Ticker(ticker).info or {}
+        per = info.get("trailingPE", None)
+        pbr = info.get("priceToBook", None)
+        per = float(per) if per is not None else None
+        pbr = float(pbr) if pbr is not None else None
+        return per, pbr
+    except Exception:
+        return None, None
+
+# =========================
+# J-Quants helpers (Free endpoints)
+# =========================
+def _jq_headers() -> Dict[str, str]:
+    if not JQUANTS_API_KEY:
+        return {}
+    return {"x-api-key": JQUANTS_API_KEY}
+
+def jq_get(path: str, params: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
+    if not JQUANTS_API_KEY:
+        return None
+    url = f"{JQUANTS_BASE}{path}"
+    try:
+        r = requests.get(url, headers=_jq_headers(), params=params or {}, timeout=JQ_TIMEOUT_SEC)
+        if r.status_code >= 300:
+            if DEBUG_AI:
+                print(f"[DEBUG] JQ GET failed: {r.status_code} {r.text[:200]}", file=sys.stderr)
+            return None
+        return r.json()
+    except Exception as e:
+        if DEBUG_AI:
+            print(f"[DEBUG] JQ GET exception: {e}", file=sys.stderr)
+        return None
+
+def to_jq_code(ticker: str) -> str:
+    """'6841.T' -> '6841' (API accepts 4-digit; response may include 5-digit with trailing 0)"""
+    return ticker.split(".")[0]
+
+def normalize_code(code: str) -> str:
+    """'68410' -> '6841' (common J-Quants equity code formatting)"""
+    s = str(code or "").strip()
+    if len(s) == 5 and s.endswith("0"):
+        return s[:-1]
+    return s
+
+def jq_fetch_fins_summary(code4: str) -> Optional[Dict[str, Any]]:
+    """Return most recent record for given code (4-digit string)."""
+    js = jq_get("/fins/summary", params={"code": code4})
+    if not js or "data" not in js or not js["data"]:
+        return None
+    # data is list; choose newest by DiscDate/DiscTime
+    data = js["data"]
+    def key(x):
+        return (x.get("DiscDate") or "", x.get("DiscTime") or "")
+    data_sorted = sorted(data, key=key, reverse=True)
+    return data_sorted[0]
+
+def jq_fetch_listed_info_all() -> Optional[pd.DataFrame]:
+    """
+    Get listed issue master.
+    V2 docs: /listed/info (GitBook) - returns many rows.
+    We'll fetch once per run and filter to Nikkei225 codes.
+    """
+    js = jq_get("/listed/info", params={})
+    if not js:
+        return None
+    # Some responses use 'info', others 'data'. Be robust.
+    rows = js.get("info") or js.get("data") or []
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    return df
+
+def build_sector_map_and_medians(tickers: List[str], per_pbr: Dict[str, Tuple[Optional[float], Optional[float]]]) -> Tuple[Dict[str, str], Dict[str, Dict[str, float]]]:
+    """
+    Returns:
+      sector_map: ticker -> sector33code (string)
+      medians: sector33code -> {'per_median': x, 'pbr_median': y}
+    """
+    sector_map: Dict[str, str] = {}
+    medians: Dict[str, Dict[str, float]] = {}
+
+    df = jq_fetch_listed_info_all()
     if df is None or df.empty:
-        discord_send_text(f"{title} {now_jst():%m/%d %H:%M}\n対象なし")
+        return sector_map, medians
+
+    # Normalize code columns
+    # Expect 'Code' and 'Sector33Code' (per docs)
+    if "Code" not in df.columns or "Sector33Code" not in df.columns:
+        return sector_map, medians
+
+    df["Code4"] = df["Code"].astype(str).map(normalize_code)
+    needed_codes = set([to_jq_code(t) for t in tickers])
+    df_use = df[df["Code4"].isin(needed_codes)].copy()
+    if df_use.empty:
+        return sector_map, medians
+
+    # Map
+    for _, r in df_use.iterrows():
+        code4 = str(r.get("Code4", "")).strip()
+        s33 = str(r.get("Sector33Code", "")).strip()
+        if not code4 or not s33:
+            continue
+        # find tickers matching this code
+        for t in tickers:
+            if to_jq_code(t) == code4:
+                sector_map[t] = s33
+
+    # Build per-sector median
+    rows = []
+    for t in tickers:
+        s33 = sector_map.get(t, "")
+        per, pbr = per_pbr.get(t, (None, None))
+        if not s33:
+            continue
+        if per is None and pbr is None:
+            continue
+        rows.append({"Sector33Code": s33, "Ticker": t, "PER": per, "PBR": pbr})
+    if not rows:
+        return sector_map, medians
+
+    d = pd.DataFrame(rows)
+    for s33, g in d.groupby("Sector33Code"):
+        per_med = g["PER"].dropna().median() if g["PER"].notna().any() else float("nan")
+        pbr_med = g["PBR"].dropna().median() if g["PBR"].notna().any() else float("nan")
+        medians[str(s33)] = {
+            "per_median": float(per_med) if not pd.isna(per_med) else float("nan"),
+            "pbr_median": float(pbr_med) if not pd.isna(pbr_med) else float("nan"),
+        }
+    return sector_map, medians
+
+# =========================
+# AI valuation comment (batch)
+# =========================
+def openai_client() -> Optional["OpenAI"]:
+    if not (OPENAI_AVAILABLE and OPENAI_API_KEY):
+        return None
+    return OpenAI(api_key=OPENAI_API_KEY)
+
+def call_openai_text(client: "OpenAI", system: str, user: str) -> Optional[str]:
+    for attempt in range(1 + max(0, OPENAI_RETRIES)):
+        try:
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                temperature=0.2,
+                max_tokens=OPENAI_MAX_TOKENS,
+                timeout=OPENAI_TIMEOUT_SEC,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            if DEBUG_AI:
+                print("[DEBUG] AI raw head:", text[:1000])
+            if text:
+                return text
+        except Exception as e:
+            print(f"[WARN] OpenAI failed (attempt {attempt+1}): {e}", file=sys.stderr)
+            time.sleep(0.6)
+    return None
+
+def ai_build_valuation_comments(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
+    """
+    Input rows: list of candidate dicts with per/pbr + sector medians + roe + earnings summary.
+    Output: {ticker: {"label": "...", "reason": "..."}}
+    """
+    if not ENABLE_AI:
+        return {}
+    if AI_ONLY_ON_ALERT and not rows:
+        return {}
+    client = openai_client()
+    if client is None:
+        return {}
+
+    system = (
+        "You are an equity valuation assistant for Japanese stocks.\n"
+        "Given sector median PER/PBR (TSE 33-sector), stock PER/PBR, ROE, and latest earnings summary, "
+        "output for each stock a label in Japanese: '割安', '妥当', or '割高', "
+        "and a very brief reason (1-2 lines) in Japanese.\n"
+        "Do NOT mention thresholds. Base your judgement on relative comparison + profitability + earnings tone.\n"
+        "Return STRICT JSON only in the following format:\n"
+        "{ \"TICKER\": {\"label\":\"割安|妥当|割高\", \"reason\":\"...\"}, ... }\n"
+    )
+    payload = {
+        "date_jst": now_jst().strftime("%Y-%m-%d %H:%M"),
+        "stocks": rows,
+        "notes": "sector medians are computed as medians over Nikkei225 members within each Sector33Code.",
+    }
+    user = json.dumps(payload, ensure_ascii=False)
+    text = call_openai_text(client, system, user)
+    if not text:
+        return {}
+    # Try to parse JSON safely
+    try:
+        # Remove code fences if any
+        text2 = text.strip()
+        if text2.startswith("```"):
+            text2 = re.sub(r"^```[a-zA-Z0-9]*\n", "", text2)
+            text2 = re.sub(r"\n```$", "", text2)
+        obj = json.loads(text2)
+        out = {}
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, dict):
+                    out[str(k)] = {
+                        "label": str(v.get("label", "")).strip(),
+                        "reason": str(v.get("reason", "")).strip(),
+                    }
+        return out
+    except Exception:
+        return {}
+
+# =========================
+# Earnings summary builder (from J-Quants fins/summary)
+# =========================
+def build_earnings_summary(jq_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not jq_row:
+        return {}
+    def s2f(x) -> Optional[float]:
+        try:
+            if x is None or x == "":
+                return None
+            return float(x)
+        except Exception:
+            return None
+
+    sales = s2f(jq_row.get("Sales"))
+    op = s2f(jq_row.get("OP"))
+    np_ = s2f(jq_row.get("NP"))
+    eq = s2f(jq_row.get("Eq"))
+    roe = (np_ / eq) if (np_ is not None and eq not in (None, 0.0)) else None
+
+    fsales = s2f(jq_row.get("FSales"))
+    fop = s2f(jq_row.get("FOP"))
+    fnp = s2f(jq_row.get("FNP"))
+
+    return {
+        "DiscDate": jq_row.get("DiscDate", ""),
+        "CurPerType": jq_row.get("CurPerType", ""),
+        "CurPerSt": jq_row.get("CurPerSt", ""),
+        "CurPerEn": jq_row.get("CurPerEn", ""),
+        "Sales": sales,
+        "OP": op,
+        "NP": np_,
+        "Eq": eq,
+        "ROE_proxy": roe,
+        "Forecast": {"Sales": fsales, "OP": fop, "NP": fnp},
+    }
+
+# =========================
+# Chart (simple)
+# =========================
+def save_chart_image_with_bb1sigma(raw_df: pd.DataFrame, ticker: str, out_dir: str) -> Optional[str]:
+    if not MPF_AVAILABLE:
+        return None
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        close = _series_from_raw(raw_df, "Close", ticker)
+        high = _series_from_raw(raw_df, "High", ticker)
+        low = _series_from_raw(raw_df, "Low", ticker)
+        open_ = _series_from_raw(raw_df, "Open", ticker)
+        vol = _series_from_raw(raw_df, "Volume", ticker)
+
+        df = pd.DataFrame({"Open": open_, "High": high, "Low": low, "Close": close, "Volume": vol}).dropna()
+        df = df.tail(CHART_LOOKBACK_DAYS)
+
+        # BB ±1σ
+        ma, up, dn = calc_bb(df["Close"], 20, sigma=1.0)
+        apds = [
+            mpf.make_addplot(ma, panel=0),
+            mpf.make_addplot(up, panel=0),
+            mpf.make_addplot(dn, panel=0),
+        ]
+
+        path = os.path.join(out_dir, f"{ticker.replace('.','_')}_bb1s.png")
+        mpf.plot(
+            df,
+            type="candle",
+            volume=True,
+            addplot=apds,
+            style="yahoo",
+            figsize=(10, 6),
+            title=f"{ticker}",
+            savefig=dict(fname=path, dpi=140, bbox_inches="tight"),
+        )
+        return path
+    except Exception as e:
+        print(f"[WARN] chart failed {ticker}: {e}", file=sys.stderr)
+        return None
+
+# =========================
+# Notify
+# =========================
+def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
+    ts = now_jst().strftime("%m/%d %H:%M")
+    title = "【ATRレンジ候補（ADX≤25 × ATR% × BB±1σ × SMA × DI）】"
+    if df is None or df.empty:
+        discord_send_text(f"{title} {ts}\n該当なし")
         return
 
-    lines = [f"{title} {now_jst():%m/%d %H:%M}"]
+    # --- Enrich PER/PBR for all tickers in Nikkei225 (for sector medians) ---
+    per_pbr_all: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+    for t in nikkei225_tickers:
+        per_pbr_all[t] = fetch_per_pbr_from_info(t)
 
-    # 1通目は「表」は出さず、対象銘柄だけを簡潔に列挙（詳細は画像内に統合）
-    lines.append("対象銘柄:")
+    sector_map, sector_medians = build_sector_map_and_medians(nikkei225_tickers, per_pbr_all)
+
+    # --- Candidate enrich: PER/PBR + JQ + sector medians ---
+    candidates: List[Dict[str, Any]] = []
     for _, r in df.iterrows():
         t = r["Ticker"]
-        name = r.get("Name", "")
-        lines.append(f"- {t} {name}".strip())
+        per, pbr = per_pbr_all.get(t, (None, None))
+        code4 = to_jq_code(t)
+        jq_row = jq_fetch_fins_summary(code4)
+        earn = build_earnings_summary(jq_row)
 
-    for part in chunk_text("\n".join(lines)):
-        discord_send_text(part)
+        s33 = sector_map.get(t, "")
+        med = sector_medians.get(s33, {})
+        per_med = med.get("per_median", float("nan"))
+        pbr_med = med.get("pbr_median", float("nan"))
 
-    # 画像（BB±1σ線入り）
-    if not MPF_AVAILABLE:
-        return
-    for _, r in df.head(CHART_TOP_N).iterrows():
-        t = r["Ticker"]
-        name = r.get("Name", "")
+        cand = {
+            "ticker": t,
+            "name": ticker_name_map.get(t, ""),
+            "price": float(r.get("Close", float("nan"))),
+            "per": per,
+            "pbr": pbr,
+            "sector33": s33,
+            "sector_per_median": None if math.isnan(per_med) else per_med,
+            "sector_pbr_median": None if math.isnan(pbr_med) else pbr_med,
+            "roe": earn.get("ROE_proxy"),
+            "earnings": {
+                "disc_date": earn.get("DiscDate"),
+                "period": earn.get("CurPerType"),
+                "sales": earn.get("Sales"),
+                "op": earn.get("OP"),
+                "np": earn.get("NP"),
+                "forecast": earn.get("Forecast", {}),
+            },
+            "tech": {
+                "atr_pct": float(r.get("ATR_pct", float("nan"))),
+                "adx": float(r.get("ADX", float("nan"))),
+                "di_diff": float(r.get("DI_diff", float("nan"))),
+                "bb_touches": int(r.get("BB_touches", 0)),
+                "sma_slope_pct": float(r.get("SMA_slope_pct", float("nan"))),
+            },
+        }
+        candidates.append(cand)
+        time.sleep(JQ_SLEEP_SEC)
 
-        # 2通目（画像）に銘柄名（和名）と各種指標をすべて埋め込むため、
-        # Discord本文の description は空にする（画像内テキストで完結）
-        img = save_chart_image_with_bb1sigma(raw_df, t, out_dir=CHART_OUT_DIR, name=name, metrics=r.to_dict())
+    # --- AI comment batch (only for hits) ---
+    ai_map: Dict[str, Dict[str, str]] = {}
+    if candidates and ENABLE_AI and (not AI_ONLY_ON_ALERT or True):
+        ai_map = ai_build_valuation_comments(candidates)
+
+    # --- Text summary message (compact; no duplicated table section) ---
+    lines = [f"{title} {ts}", f"件数: {len(df)}"]
+    for i, r in enumerate(df.head(20).itertuples(index=False), start=1):
+        t = getattr(r, "Ticker")
+        name = ticker_name_map.get(t, "")
+        per, pbr = per_pbr_all.get(t, (None, None))
+        ai = ai_map.get(t, {})
+        label = ai.get("label", "")
+        lines.append(
+            f"{i}. {t} {name}  価格:{fp(getattr(r,'Close',None),0)}  PER:{fp(per,2)} PBR:{fp(pbr,2)}"
+            f"  {label}"
+        )
+    for msg in chunk_text("\n".join(lines)):
+        discord_send_text(msg)
+
+    # --- Send charts with rich description (includes AI reason + fundamentals) ---
+    top = df.head(CHART_TOP_N)
+    for _, rr in top.iterrows():
+        t = rr["Ticker"]
+        name = ticker_name_map.get(t, "")
+        per, pbr = per_pbr_all.get(t, (None, None))
+
+        # build desc
+        ai = ai_map.get(t, {})
+        label = ai.get("label", "")
+        reason = ai.get("reason", "")
+
+        # find candidate enriched
+        c = next((x for x in candidates if x["ticker"] == t), None) or {}
+        sector_per = c.get("sector_per_median")
+        sector_pbr = c.get("sector_pbr_median")
+        roe = c.get("roe")
+        ed = (c.get("earnings") or {})
+        disc = ed.get("disc_date") or "-"
+        period = ed.get("period") or "-"
+        sales = ed.get("sales")
+        op = ed.get("op")
+        np_ = ed.get("np")
+
+        desc_lines = []
+        if label:
+            desc_lines.append(f"【評価】{label}  {reason}".strip())
+        desc_lines.append(
+            f"PER:{fp(per,2)} (業種中央値 {fp(sector_per,2)}) / PBR:{fp(pbr,2)} (業種中央値 {fp(sector_pbr,2)}) / ROE(簡易):{fp(roe*100 if roe is not None else None,1)}%"
+        )
+        desc_lines.append(
+            f"決算:{disc} {period}  売上:{fp(sales/1e8 if sales else None,1)}億  営業益:{fp(op/1e8 if op else None,1)}億  純益:{fp(np_/1e8 if np_ else None,1)}億"
+        )
+        desc_lines.append(
+            f"ATR%:{fp(rr.get('ATR_pct'),2)} ADX:{fp(rr.get('ADX'),1)} DIΔ:{fp(rr.get('DI_diff'),1)} SMA傾き%:{fp(rr.get('SMA_slope_pct'),2)}"
+        )
+        desc = "\n".join([s for s in desc_lines if s.strip()])
+
+        img = save_chart_image_with_bb1sigma(raw_df, t, out_dir=CHART_OUT_DIR)
         if img:
-            discord_send_image_file(img, title="", description="")
-
+            discord_send_image_file(img, title=f"{t} {name}".strip(), description=desc)
 
 def main():
     now = now_jst()
@@ -782,38 +783,21 @@ def main():
     tickers = nikkei225_tickers
     raw = fetch_market_data(tickers, lookback_days=LOOKBACK_DAYS)
 
-    # yfinanceが存在しない銘柄で落ちないように（運用安定）
     if raw is None or raw.empty:
-        discord_send_text(f"【ATRレンジ候補】 {now_jst():%m/%d %H:%M}\nデータ取得失敗")
+        discord_send_text(f"【ATRレンジ候補】 {now:%m/%d %H:%M}\nデータ取得失敗")
         return
 
-
-    # ===== PER / PBR（yfinance info）=====
-    per_map, pbr_map = fetch_per_pbr_map(tickers)
-
-    # ===== 全銘柄 指標CSV出力（閾値調整用）=====
+    # Save metrics (all tickers)
     all_df = compute_all_metrics(raw, tickers)
     if all_df is not None and not all_df.empty:
-        all_df["PER"] = all_df["Ticker"].map(per_map)
-        all_df["PBR"] = all_df["Ticker"].map(pbr_map)
-
-    if all_df is not None and not all_df.empty:
         os.makedirs(METRICS_OUT_DIR, exist_ok=True)
-        ts = now_jst().strftime("%Y%m%d_%H%M")
+        ts = now.strftime("%Y%m%d_%H%M")
         out_path = os.path.join(METRICS_OUT_DIR, f"{METRICS_PREFIX}_{ts}.csv")
         all_df.to_csv(out_path, index=False, encoding="utf-8-sig")
         print(f"[INFO] metrics csv saved: {out_path}")
-    else:
-        print("[WARN] metrics csv not created (no rows).", file=sys.stderr)
 
-    # ===== 抽出 → 通知 =====
     df = screen_candidates(raw, tickers)
-    if df is not None and not df.empty:
-        df["PER"] = df["Ticker"].map(per_map)
-        df["PBR"] = df["Ticker"].map(pbr_map)
-
     notify(df, raw)
-
 
 if __name__ == "__main__":
     main()
