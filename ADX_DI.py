@@ -515,18 +515,91 @@ def compute_all_metrics(raw_df: pd.DataFrame, tickers):
     return df
 
 
-def _get_japanese_font_properties():
+
+def _setup_matplotlib_japanese_font():
     """
-    可能ならIPAexゴシック(ipaexg.ttf)を使って日本語を崩さず描画する。
-    - 環境変数 JAPANESE_FONT_PATH があれば最優先
-    - スクリプト同階層の ipaexg.ttf を次点
-    - 見つからなければ None（matplotlib既定フォント）で描画
+    日本語を画像内に描画するためのフォントをセットアップする。
+
+    返り値:
+      - (jp_fp, font_path)
+        jp_fp: matplotlib.font_manager.FontProperties または None
+        font_path: 実際に使うフォントファイルパス（見つからなければ None）
+
+    探索順:
+      1) 環境変数 JAPANESE_FONT_PATH
+      2) スクリプト同階層の ipaexg.ttf
+      3) よくあるLinux配置（IPAex / Noto CJK / Takao など）
     """
     try:
+        import matplotlib
         from matplotlib import font_manager as fm
     except Exception:
-        return None
+        return None, None
 
+    candidates = []
+
+    env_path = os.getenv("JAPANESE_FONT_PATH", "").strip()
+    if env_path:
+        candidates.append(env_path)
+
+    # リポジトリに同梱する想定（推奨）
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates.extend([
+            os.path.join(here, "ipaexg.ttf"),
+            os.path.join(here, "IPAexGothic.ttf"),
+            os.path.join(here, "NotoSansCJKjp-Regular.otf"),
+            os.path.join(here, "NotoSansCJK-Regular.ttc"),
+        ])
+    except Exception:
+        pass
+
+    # 代表的な配置場所（GitHub Actions ubuntu含む）
+    candidates.extend([
+        # IPAex
+        "/usr/share/fonts/truetype/ipaexg.ttf",
+        "/usr/share/fonts/truetype/ipaexg/ipaexg.ttf",
+        "/usr/share/fonts/opentype/ipaexg.ttf",
+        "/usr/share/fonts/opentype/ipaexg/ipaexg.ttf",
+        "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+        # Noto CJK (Ubuntu系で入っていることが多い)
+        "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansJP-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansJP-Regular.ttf",
+        # Takao (古めの環境)
+        "/usr/share/fonts/truetype/takao-gothic/TakaoPGothic.ttf",
+        "/usr/share/fonts/truetype/takao/TakaoPGothic.ttf",
+    ])
+
+    font_path = None
+    for p in candidates:
+        if p and os.path.exists(p):
+            font_path = p
+            break
+
+    if not font_path:
+        # フォントが見つからない場合は None を返す（＝日本語は文字化けする可能性）
+        return None, None
+
+    try:
+        # フォント登録（これをやらないと get_name() が安定しない環境がある）
+        fm.fontManager.addfont(font_path)
+        jp_fp = fm.FontProperties(fname=font_path)
+
+        # mplfinance の title など「fontpropertiesを渡せない文字」も日本語で出すため
+        # グローバルのデフォルトフォントを日本語フォントに寄せる
+        try:
+            matplotlib.rcParams["font.family"] = jp_fp.get_name()
+            matplotlib.rcParams["axes.unicode_minus"] = False
+        except Exception:
+            pass
+
+        return jp_fp, font_path
+    except Exception:
+        return None, None
     candidates = []
     env_path = os.getenv("JAPANESE_FONT_PATH", "").strip()
     if env_path:
@@ -603,7 +676,7 @@ def save_chart_image_with_bb1sigma(
         )
 
         # 画像内テキスト（指標）
-        jp_fp = _get_japanese_font_properties()
+        jp_fp = _setup_matplotlib_japanese_font()[0]
 
         if metrics:
             # テキストは「画像の中」で完結するよう、重要指標をまとめる
