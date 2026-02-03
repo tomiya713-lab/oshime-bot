@@ -890,17 +890,17 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
         earn = build_earnings_summary(jq_row, jq_prev)
 
         
-s33 = sector_map.get(t, "")
-med = sector_medians.get(s33, {})
-per_med = med.get("per_median", float("nan"))
-pbr_med = med.get("pbr_median", float("nan"))
+        s33 = sector_map.get(t, "")
+        med = sector_medians.get(s33, {})
+        per_med = med.get("per_median", float("nan"))
+        pbr_med = med.get("pbr_median", float("nan"))
 
-median_source = "sector"
-if (not np.isfinite(per_med)) or (not np.isfinite(pbr_med)):
-    # fallback to overall median if sector median is unavailable
-    per_med = overall_medians.get("per_median", float("nan"))
-    pbr_med = overall_medians.get("pbr_median", float("nan"))
-    median_source = "overall"
+        median_source = "sector"
+        if (not np.isfinite(per_med)) or (not np.isfinite(pbr_med)):
+            # fallback to overall median if sector median is unavailable
+            per_med = overall_medians.get("per_median", float("nan"))
+            pbr_med = overall_medians.get("pbr_median", float("nan"))
+            median_source = "overall"
 
         cand = {
             "ticker": t,
