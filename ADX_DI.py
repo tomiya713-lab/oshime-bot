@@ -515,10 +515,55 @@ def compute_all_metrics(raw_df: pd.DataFrame, tickers):
     return df
 
 
-def save_chart_image_with_bb1sigma(raw_df: pd.DataFrame, ticker: str, out_dir: str = CHART_OUT_DIR):
+def _get_japanese_font_properties():
     """
-    既存運用を壊さないように：mplfinanceが使えるときだけ画像作成。
-    チャートに BB(20,±1σ) を重ねる。
+    可能ならIPAexゴシック(ipaexg.ttf)を使って日本語を崩さず描画する。
+    - 環境変数 JAPANESE_FONT_PATH があれば最優先
+    - スクリプト同階層の ipaexg.ttf を次点
+    - 見つからなければ None（matplotlib既定フォント）で描画
+    """
+    try:
+        from matplotlib import font_manager as fm
+    except Exception:
+        return None
+
+    candidates = []
+    env_path = os.getenv("JAPANESE_FONT_PATH", "").strip()
+    if env_path:
+        candidates.append(env_path)
+
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates.append(os.path.join(here, "ipaexg.ttf"))
+    except Exception:
+        pass
+
+    candidates.extend([
+        "/usr/share/fonts/truetype/ipaexg.ttf",
+        "/usr/share/fonts/truetype/ipaexg/ipaexg.ttf",
+        "/usr/share/fonts/opentype/ipaexg.ttf",
+    ])
+
+    for p in candidates:
+        if p and os.path.exists(p):
+            try:
+                return fm.FontProperties(fname=p)
+            except Exception:
+                continue
+    return None
+
+
+def save_chart_image_with_bb1sigma(
+    raw_df: pd.DataFrame,
+    ticker: str,
+    out_dir: str = CHART_OUT_DIR,
+    name: str = "",
+    metrics=None,
+):
+    """
+    mplfinance が使えるときだけ画像作成。
+    - BB(20,±1σ) を重ねる
+    - 画像の中に「銘柄名（和名）＋各種指標」をテキストで埋め込む（Discord 2通目を画像完結にする）
     """
     if not MPF_AVAILABLE:
         return None
@@ -545,16 +590,51 @@ def save_chart_image_with_bb1sigma(raw_df: pd.DataFrame, ticker: str, out_dir: s
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, f"{ticker}.png")
 
-        mpf.plot(
+        # returnfig=True で fig を受け取り、画像内にテキストを描画する
+        fig, axlist = mpf.plot(
             ohlcv,
             type="candle",
             mav=(5, 25, 75),
             volume=True,
             style="yahoo",
-            title=ticker,
+            title=f"{ticker} {name}".strip(),
             addplot=add_plots,
-            savefig=dict(fname=out_path, dpi=150, bbox_inches="tight"),
+            returnfig=True,
         )
+
+        # 画像内テキスト（指標）
+        jp_fp = _get_japanese_font_properties()
+
+        if metrics:
+            # テキストは「画像の中」で完結するよう、重要指標をまとめる
+            text_lines = [
+                f"{ticker} {name}".strip(),
+                f"現在価格:{fp(metrics.get('Close'),0)}  PER:{fp(metrics.get('PER'),2)}  PBR:{fp(metrics.get('PBR'),2)}",
+                f"BB(±1σ):{fp(metrics.get('BB_dn_1'),0)}–{fp(metrics.get('BB_up_1'),0)}  底値上昇比率:{fp(metrics.get('Bottom_Rise_Ratio'),3)}",
+                f"ATR%:{fp(metrics.get('ATR20_pct'),2)}  ADX:{fp(metrics.get('ADX14'),1)}  DI_diff:{fp(metrics.get('DI_diff'),1)}",
+                f"BB(+/-):{int(metrics.get('BB_up_touch_cnt20',0))}/{int(metrics.get('BB_dn_touch_cnt20',0))}  SMA_slope%:{fp(metrics.get('SMA25_slope20_pct'),2)}",
+            ]
+            text = "\n".join(text_lines)
+
+            # fig内左上に表示（背景付きで可読性UP）
+            fig.text(
+                0.01,
+                0.99,
+                text,
+                ha="left",
+                va="top",
+                fontsize=10,
+                fontproperties=jp_fp,
+                bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.85, edgecolor="none"),
+            )
+
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        try:
+            import matplotlib.pyplot as plt
+            plt.close(fig)
+        except Exception:
+            pass
+
         return out_path
     except Exception:
         return None
@@ -571,27 +651,13 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
         return
 
     lines = [f"{title} {now_jst():%m/%d %H:%M}"]
-    lines.append("Ticker   名称       現在価格   PER    PBR    ATR%   ADX   DIΔ   底値上昇比率   BB(+/-)   BB_dn1σ   BB_up1σ   SMA_slope%")
 
+    # 1通目は「表」は出さず、対象銘柄だけを簡潔に列挙（詳細は画像内に統合）
+    lines.append("対象銘柄:")
     for _, r in df.iterrows():
         t = r["Ticker"]
         name = r.get("Name", "")
-        close = fp(r["Close"], 0)
-        per = fp(r.get("PER", None), 2)
-        pbr = fp(r.get("PBR", None), 2)
-        atr = fp(r["ATR20_pct"], 2)
-        adx = fp(r["ADX14"], 1)
-        did = fp(r["DI_diff"], 1)
-        br = fp(r["Bottom_Rise_Ratio"], 3)  # BB比率なので小数は残す方が便利
-        upc = str(int(r["BB_up_touch_cnt20"]))
-        dnc = str(int(r["BB_dn_touch_cnt20"]))
-        bb_dn = fp(r["BB_dn_1"], 0)
-        bb_up = fp(r["BB_up_1"], 0)
-        smas = fp(r["SMA25_slope20_pct"], 2)
-        lines.append(
-            f"{t:<7} {name:<8} {close:>8} {per:>6} {pbr:>6} {atr:>6} {adx:>6} {did:>5} {br:>12}   "
-            f"{upc:>2}/{dnc:<2}   {bb_dn:>7}   {bb_up:>7}   {smas:>9}"
-        )
+        lines.append(f"- {t} {name}".strip())
 
     for part in chunk_text("\n".join(lines)):
         discord_send_text(part)
@@ -603,21 +669,11 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
         t = r["Ticker"]
         name = r.get("Name", "")
 
-        # 現在価格 → BB(±1σ) → 底値上昇比率（BB比率） → 以降は今の順番
-        desc = (
-            f"現在価格:{fp(r['Close'],0)}  PER:{fp(r.get('PER',None),2)}  PBR:{fp(r.get('PBR',None),2)}  "
-            f"BB(±1σ):{fp(r['BB_dn_1'],0)}–{fp(r['BB_up_1'],0)}  "
-            f"底値上昇比率:{fp(r['Bottom_Rise_Ratio'],3)}  "
-            f"ATR%:{fp(r['ATR20_pct'],2)}  "
-            f"ADX:{fp(r['ADX14'],1)}  "
-            f"DI_diff:{fp(r['DI_diff'],1)}  "
-            f"BB(+/-):{int(r['BB_up_touch_cnt20'])}/{int(r['BB_dn_touch_cnt20'])}  "
-            f"SMA_slope%:{fp(r['SMA25_slope20_pct'],2)}"
-        )
-
-        img = save_chart_image_with_bb1sigma(raw_df, t, out_dir=CHART_OUT_DIR)
+        # 2通目（画像）に銘柄名（和名）と各種指標をすべて埋め込むため、
+        # Discord本文の description は空にする（画像内テキストで完結）
+        img = save_chart_image_with_bb1sigma(raw_df, t, out_dir=CHART_OUT_DIR, name=name, metrics=r.to_dict())
         if img:
-            discord_send_image_file(img, title=f"{t} {name}".strip(), description=desc)
+            discord_send_image_file(img, title="", description="")
 
 
 def main():
