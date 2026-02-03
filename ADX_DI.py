@@ -187,6 +187,44 @@ def fp(x, nd=2) -> str:
     except Exception:
         return "-"
 
+
+def diff_pct(val: Optional[float], base: Optional[float]) -> Optional[float]:
+    """Return (val/base - 1) * 100, or None."""
+    try:
+        if val is None or base is None:
+            return None
+        if isinstance(val, float) and math.isnan(val):
+            return None
+        if isinstance(base, float) and math.isnan(base):
+            return None
+        if base == 0:
+            return None
+        return (float(val) / float(base) - 1.0) * 100.0
+    except Exception:
+        return None
+
+def fmt_vs_median(label: str, val: Optional[float], med: Optional[float], nd_val=2, nd_med=2) -> str:
+    d = diff_pct(val, med)
+    d_str = "-" if d is None else f"{d:+.0f}%"
+    return f"{label}:{fp(val, nd_val)} vs 業種中央値 {fp(med, nd_med)}（{d_str}）"
+
+def fair_price(val_mul: Optional[float], target: Optional[float]) -> Optional[float]:
+    try:
+        if val_mul is None or target is None:
+            return None
+        if isinstance(val_mul, float) and math.isnan(val_mul):
+            return None
+        if isinstance(target, float) and math.isnan(target):
+            return None
+        return float(val_mul) * float(target)
+    except Exception:
+        return None
+
+def fmt_fair(title: str, price: Optional[float], fair: Optional[float]) -> str:
+    d = diff_pct(price, fair)
+    d_str = "-" if d is None else f"{d:+.0f}%"
+    return f"{title}:{fp(fair,0)}円（{d_str}）"
+
 def discord_post(payload: dict, files=None) -> bool:
     if not DISCORD_WEBHOOK_URL:
         print("[WARN] DISCORD_WEBHOOK_URL is empty. skip notify.", file=sys.stderr)
@@ -591,7 +629,10 @@ def build_earnings_summary(jq_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     sales = s2f(jq_row.get("Sales"))
     op = s2f(jq_row.get("OP"))
     np_ = s2f(jq_row.get("NP"))
+    eps = s2f(jq_row.get("EPS"))
     eq = s2f(jq_row.get("Eq"))
+    sh_out = s2f(jq_row.get("ShOutFY"))  # shares outstanding (FY)
+    bps = (eq / sh_out) if (eq is not None and sh_out not in (None, 0.0)) else None
     roe = (np_ / eq) if (np_ is not None and eq not in (None, 0.0)) else None
 
     fsales = s2f(jq_row.get("FSales"))
@@ -606,7 +647,10 @@ def build_earnings_summary(jq_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "Sales": sales,
         "OP": op,
         "NP": np_,
+        "EPS": eps,
         "Eq": eq,
+        "ShOutFY": sh_out,
+        "BPS_approx": bps,
         "ROE_proxy": roe,
         "Forecast": {"Sales": fsales, "OP": fop, "NP": fnp},
     }
@@ -699,6 +743,8 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
                 "sales": earn.get("Sales"),
                 "op": earn.get("OP"),
                 "np": earn.get("NP"),
+                "eps": earn.get("EPS"),
+                "bps": earn.get("BPS_approx"),
                 "forecast": earn.get("Forecast", {}),
             },
             "tech": {
@@ -755,12 +801,21 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
         sales = ed.get("sales")
         op = ed.get("op")
         np_ = ed.get("np")
+        price = float(rr.get("Close", float("nan")))
 
         desc_lines = []
         if label:
             desc_lines.append(f"【評価】{label}  {reason}".strip())
+        # --- fair value (sector median based) ---
+        eps = (ed.get("eps") if isinstance(ed, dict) else None)
+        bps = (ed.get("bps") if isinstance(ed, dict) else None)
+        fair_pbr = fair_price(bps, sector_pbr)
+        fair_per = fair_price(eps, sector_per)
+
+        desc_lines.append(fmt_fair("理論株価(PBR基準)", price, fair_pbr))
+        desc_lines.append(fmt_fair("理論株価(PER基準)", price, fair_per))
         desc_lines.append(
-            f"PER:{fp(per,2)} (業種中央値 {fp(sector_per,2)}) / PBR:{fp(pbr,2)} (業種中央値 {fp(sector_pbr,2)}) / ROE(簡易):{fp(roe*100 if roe is not None else None,1)}%"
+            f"{fmt_vs_median('PBR', pbr, sector_pbr, 2, 2)} / {fmt_vs_median('PER', per, sector_per, 2, 2)} / ROE(簡易):{fp(roe*100 if roe is not None else None,1)}%"
         )
         desc_lines.append(
             f"決算:{disc} {period}  売上:{fp(sales/1e8 if sales else None,1)}億  営業益:{fp(op/1e8 if op else None,1)}億  純益:{fp(np_/1e8 if np_ else None,1)}億"
