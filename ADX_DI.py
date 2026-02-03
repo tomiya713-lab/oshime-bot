@@ -188,6 +188,14 @@ def fp(x, nd=2) -> str:
         return "-"
 
 
+def fmt_yoy(x: Optional[float]) -> str:
+    """Format YoY ratio (e.g. 0.053 -> '+5%')."""
+    try:
+        if x is None or (isinstance(x, float) and math.isnan(x)):
+            return "-"
+        return f"{x*100:+.0f}%"
+    except Exception:
+        return "-"
 def diff_pct(val: Optional[float], base: Optional[float]) -> Optional[float]:
     """Return (val/base - 1) * 100, or None."""
     try:
@@ -420,22 +428,24 @@ def _jq_headers() -> Dict[str, str]:
         return {}
     return {"x-api-key": JQUANTS_API_KEY}
 
-def jq_get(path: str, params: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
+def jq_get(path: str, params: Optional[Dict[str, str]] = None, base_url: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Generic GET for J-Quants. Use V2 by default; optionally override base_url (e.g. V1 endpoints)."""
     if not JQUANTS_API_KEY:
         return None
-    url = f"{JQUANTS_BASE}{path}"
+    base = (base_url or JQUANTS_BASE).rstrip("/")
+    url = f"{base}{path}"
     try:
         r = requests.get(url, headers=_jq_headers(), params=params or {}, timeout=JQ_TIMEOUT_SEC)
         if r.status_code >= 300:
-            if DEBUG_AI:
-                print(f"[DEBUG] JQ GET failed: {r.status_code} {r.text[:200]}", file=sys.stderr)
+            # Print minimal debug when sector medians cannot be built (helps troubleshoot without leaking secrets)
+            if os.getenv("DEBUG_JQUANTS", "0").strip() == "1":
+                print(f"[WARN] JQ GET failed: {r.status_code} {url} {r.text[:200]}", file=sys.stderr)
             return None
         return r.json()
     except Exception as e:
-        if DEBUG_AI:
-            print(f"[DEBUG] JQ GET exception: {e}", file=sys.stderr)
+        if os.getenv("DEBUG_JQUANTS", "0").strip() == "1":
+            print(f"[WARN] JQ GET exception: {url} {e}", file=sys.stderr)
         return None
-
 def to_jq_code(ticker: str) -> str:
     """'6841.T' -> '6841' (API accepts 4-digit; response may include 5-digit with trailing 0)"""
     return ticker.split(".")[0]
@@ -447,34 +457,73 @@ def normalize_code(code: str) -> str:
         return s[:-1]
     return s
 
-def jq_fetch_fins_summary(code4: str) -> Optional[Dict[str, Any]]:
-    """Return most recent record for given code (4-digit string)."""
+def jq_fetch_fins_summary_records(code4: str) -> List[Dict[str, Any]]:
+    """Fetch fins/summary records (newest first)."""
     js = jq_get("/fins/summary", params={"code": code4})
     if not js or "data" not in js or not js["data"]:
-        return None
-    # data is list; choose newest by DiscDate/DiscTime
+        return []
     data = js["data"]
     def key(x):
         return (x.get("DiscDate") or "", x.get("DiscTime") or "")
-    data_sorted = sorted(data, key=key, reverse=True)
-    return data_sorted[0]
+    return sorted(data, key=key, reverse=True)
 
+def jq_pick_latest_and_prev(records: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Pick latest record and a previous-year comparable record (same CurPerType) if possible."""
+    if not records:
+        return None, None
+    latest = records[0]
+
+    # Try to find same CurPerType and CurPerEn about 1 year earlier
+    cur_type = (latest.get("CurPerType") or "").strip()
+    cur_end = (latest.get("CurPerEn") or "").strip()  # YYYY-MM-DD
+    prev = None
+    try:
+        if cur_end:
+            y, m, d = [int(x) for x in cur_end.split("-")]
+            target = f"{y-1:04d}-{m:02d}-{d:02d}"
+        else:
+            target = ""
+    except Exception:
+        target = ""
+
+    if cur_type and target:
+        for r in records[1:]:
+            if (r.get("CurPerType") or "").strip() == cur_type and (r.get("CurPerEn") or "").strip() == target:
+                prev = r
+                break
+
+    # Fallback: same CurPerType, closest earlier CurPerEn
+    if prev is None and cur_type:
+        def end_key(x):
+            return (x.get("CurPerEn") or "")
+        candidates = [r for r in records[1:] if (r.get("CurPerType") or "").strip() == cur_type and (r.get("CurPerEn") or "") < (cur_end or "9999-99-99")]
+        if candidates:
+            prev = sorted(candidates, key=end_key, reverse=True)[0]
+
+    return latest, prev
+
+def jq_fetch_fins_summary(code4: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Return (latest, prev_year_like) records for given code."""
+    recs = jq_fetch_fins_summary_records(code4)
+    return jq_pick_latest_and_prev(recs)
 def jq_fetch_listed_info_all() -> Optional[pd.DataFrame]:
+    """Fetch listed issue info with Sector33Code.
+
+    Note: As of recent specs, /listed/info is documented under V1 while other endpoints (e.g. fins/summary) exist in V2.
+    We try V2 first, then fall back to V1 to stay compatible across plans/versions.
     """
-    Get listed issue master.
-    V2 docs: /listed/info (GitBook) - returns many rows.
-    We'll fetch once per run and filter to Nikkei225 codes.
-    """
+    # try v2
     js = jq_get("/listed/info", params={})
     if not js:
+        # fallback v1
+        js = jq_get("/listed/info", params={}, base_url="https://api.jquants.com/v1")
+    if not js:
         return None
-    # Some responses use 'info', others 'data'. Be robust.
     rows = js.get("info") or js.get("data") or []
     if not rows:
         return None
     df = pd.DataFrame(rows)
     return df
-
 def build_sector_map_and_medians(tickers: List[str], per_pbr: Dict[str, Tuple[Optional[float], Optional[float]]]) -> Tuple[Dict[str, str], Dict[str, Dict[str, float]]]:
     """
     Returns:
@@ -615,9 +664,10 @@ def ai_build_valuation_comments(rows: List[Dict[str, Any]]) -> Dict[str, Dict[st
 # =========================
 # Earnings summary builder (from J-Quants fins/summary)
 # =========================
-def build_earnings_summary(jq_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def build_earnings_summary(jq_row: Optional[Dict[str, Any]], prev_row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not jq_row:
         return {}
+
     def s2f(x) -> Optional[float]:
         try:
             if x is None or x == "":
@@ -626,15 +676,28 @@ def build_earnings_summary(jq_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         except Exception:
             return None
 
+    def yoy(cur: Optional[float], prev: Optional[float]) -> Optional[float]:
+        if cur is None or prev is None or prev == 0:
+            return None
+        return (cur / prev) - 1.0
+
+    # current
     sales = s2f(jq_row.get("Sales"))
     op = s2f(jq_row.get("OP"))
     np_ = s2f(jq_row.get("NP"))
     eps = s2f(jq_row.get("EPS"))
+
     eq = s2f(jq_row.get("Eq"))
     sh_out = s2f(jq_row.get("ShOutFY"))  # shares outstanding (FY)
     bps = (eq / sh_out) if (eq is not None and sh_out not in (None, 0.0)) else None
     roe = (np_ / eq) if (np_ is not None and eq not in (None, 0.0)) else None
 
+    # previous comparable
+    psales = s2f(prev_row.get("Sales")) if prev_row else None
+    pop = s2f(prev_row.get("OP")) if prev_row else None
+    pnp = s2f(prev_row.get("NP")) if prev_row else None
+
+    # forecasts
     fsales = s2f(jq_row.get("FSales"))
     fop = s2f(jq_row.get("FOP"))
     fnp = s2f(jq_row.get("FNP"))
@@ -652,12 +715,14 @@ def build_earnings_summary(jq_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "ShOutFY": sh_out,
         "BPS_approx": bps,
         "ROE_proxy": roe,
+        "YoY": {
+            "Sales": yoy(sales, psales),
+            "OP": yoy(op, pop),
+            "NP": yoy(np_, pnp),
+        },
+        "Prev": {"Sales": psales, "OP": pop, "NP": pnp},
         "Forecast": {"Sales": fsales, "OP": fop, "NP": fnp},
     }
-
-# =========================
-# Chart (simple)
-# =========================
 def save_chart_image_with_bb1sigma(raw_df: pd.DataFrame, ticker: str, out_dir: str) -> Optional[str]:
     if not MPF_AVAILABLE:
         return None
@@ -719,8 +784,8 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
         t = r["Ticker"]
         per, pbr = per_pbr_all.get(t, (None, None))
         code4 = to_jq_code(t)
-        jq_row = jq_fetch_fins_summary(code4)
-        earn = build_earnings_summary(jq_row)
+        jq_row, jq_prev = jq_fetch_fins_summary(code4)
+        earn = build_earnings_summary(jq_row, jq_prev)
 
         s33 = sector_map.get(t, "")
         med = sector_medians.get(s33, {})
@@ -745,6 +810,9 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
                 "np": earn.get("NP"),
                 "eps": earn.get("EPS"),
                 "bps": earn.get("BPS_approx"),
+                "yoy_sales": (earn.get("YoY", {}) or {}).get("Sales"),
+                "yoy_op": (earn.get("YoY", {}) or {}).get("OP"),
+                "yoy_np": (earn.get("YoY", {}) or {}).get("NP"),
                 "forecast": earn.get("Forecast", {}),
             },
             "tech": {
@@ -801,6 +869,9 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
         sales = ed.get("sales")
         op = ed.get("op")
         np_ = ed.get("np")
+        yoy_sales = ed.get("yoy_sales")
+        yoy_op = ed.get("yoy_op")
+        yoy_np = ed.get("yoy_np")
         price = float(rr.get("Close", float("nan")))
 
         desc_lines = []
@@ -818,7 +889,7 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
             f"{fmt_vs_median('PBR', pbr, sector_pbr, 2, 2)} / {fmt_vs_median('PER', per, sector_per, 2, 2)} / ROE(簡易):{fp(roe*100 if roe is not None else None,1)}%"
         )
         desc_lines.append(
-            f"決算:{disc} {period}  売上:{fp(sales/1e8 if sales else None,1)}億  営業益:{fp(op/1e8 if op else None,1)}億  純益:{fp(np_/1e8 if np_ else None,1)}億"
+            f"決算:{disc} {period}  売上:{fp(sales/1e8 if sales else None,1)}億({fmt_yoy(yoy_sales)})  営業益:{fp(op/1e8 if op else None,1)}億({fmt_yoy(yoy_op)})  純益:{fp(np_/1e8 if np_ else None,1)}億({fmt_yoy(yoy_np)})"
         )
         desc_lines.append(
             f"ATR%:{fp(rr.get('ATR_pct'),2)} ADX:{fp(rr.get('ADX'),1)} DIΔ:{fp(rr.get('DI_diff'),1)} SMA傾き%:{fp(rr.get('SMA_slope_pct'),2)}"
