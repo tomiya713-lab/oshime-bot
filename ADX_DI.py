@@ -211,10 +211,10 @@ def diff_pct(val: Optional[float], base: Optional[float]) -> Optional[float]:
     except Exception:
         return None
 
-def fmt_vs_median(label: str, val: Optional[float], med: Optional[float], nd_val=2, nd_med=2) -> str:
+def fmt_vs_median(label: str, val: Optional[float], med: Optional[float], nd_val=2, nd_med=2, median_label: str = "業種中央値") -> str:
     d = diff_pct(val, med)
     d_str = "-" if d is None else f"{d:+.0f}%"
-    return f"{label}:{fp(val, nd_val)} vs 業種中央値 {fp(med, nd_med)}（{d_str}）"
+    return f"{label}:{fp(val, nd_val)} vs {median_label} {fp(med, nd_med)}（{d_str}）"
 
 def fair_price(val_mul: Optional[float], target: Optional[float]) -> Optional[float]:
     try:
@@ -506,36 +506,138 @@ def jq_fetch_fins_summary(code4: str) -> Tuple[Optional[Dict[str, Any]], Optiona
     """Return (latest, prev_year_like) records for given code."""
     recs = jq_fetch_fins_summary_records(code4)
     return jq_pick_latest_and_prev(recs)
-def jq_fetch_listed_info_all() -> Optional[pd.DataFrame]:
-    """Fetch listed issue info with Sector33Code.
+def jq_fetch_listed_info_for_codes(codes4: List[str]) -> Optional[pd.DataFrame]:
+    """Fetch listed issue info (Sector33Code etc.) for given 4-digit codes.
 
-    Note: As of recent specs, /listed/info is documented under V1 while other endpoints (e.g. fins/summary) exist in V2.
-    We try V2 first, then fall back to V1 to stay compatible across plans/versions.
+    Why per-code:
+      - Pulling ALL listed issues can be large and may time out / be rate limited.
+      - We only need the universe we screen (e.g., Nikkei225).
+    Endpoint notes:
+      - /listed/info is documented as V1 in GitBook, but may be available on multiple hosts.
+      - We try a small set of base URLs in order.
     """
-    # try v2
-    js = jq_get("/listed/info", params={})
-    if not js:
-        # fallback v1
-        js = jq_get("/listed/info", params={}, base_url="https://api.jquants.com/v1")
-    if not js:
+    if not codes4:
         return None
-    rows = js.get("info") or js.get("data") or []
-    if not rows:
+
+    base_urls = [
+        "https://api.jquants.com/v2",
+        "https://api.jquants.com/v1",
+        "https://api.jpx-jquants.com/v1",
+    ]
+
+    rows_all = []
+    seen = set()
+
+    for code4 in codes4:
+        code4 = str(code4).strip()
+        if not code4:
+            continue
+        candidates = [code4, code4 + "0"]
+        got = False
+
+        for base in base_urls:
+            if got:
+                break
+            for c in candidates:
+                js = jq_get("/listed/info", params={"code": c}, base_url=base)
+                if not js:
+                    continue
+                rows = js.get("info") or js.get("data") or []
+                if not rows:
+                    continue
+                for r in rows:
+                    key = (str(r.get("Code","")), str(r.get("Date","")))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows_all.append(r)
+                got = True
+                break
+
+        time.sleep(JQ_SLEEP_SEC)
+
+    if not rows_all:
         return None
-    df = pd.DataFrame(rows)
-    return df
-def build_sector_map_and_medians(tickers: List[str], per_pbr: Dict[str, Tuple[Optional[float], Optional[float]]]) -> Tuple[Dict[str, str], Dict[str, Dict[str, float]]]:
+
+    return pd.DataFrame(rows_all)
+def build_sector_map_and_medians(
+    tickers: List[str],
+    per_pbr: Dict[str, Tuple[Optional[float], Optional[float]]]
+) -> Tuple[Dict[str, str], Dict[str, Dict[str, float]], Dict[str, float]]:
     """
     Returns:
       sector_map: ticker -> sector33code (string)
       medians: sector33code -> {'per_median': x, 'pbr_median': y}
+      overall: {'per_median': x, 'pbr_median': y} for fallback
     """
     sector_map: Dict[str, str] = {}
     medians: Dict[str, Dict[str, float]] = {}
 
-    df = jq_fetch_listed_info_all()
+    per_vals = [v[0] for v in per_pbr.values() if v and v[0] is not None and np.isfinite(v[0])]
+    pbr_vals = [v[1] for v in per_pbr.values() if v and v[1] is not None and np.isfinite(v[1])]
+    overall = {
+        "per_median": float(np.median(per_vals)) if per_vals else float("nan"),
+        "pbr_median": float(np.median(pbr_vals)) if pbr_vals else float("nan"),
+    }
+
+    codes4 = sorted(set([to_jq_code(t) for t in tickers if to_jq_code(t)]))
+    df = jq_fetch_listed_info_for_codes(codes4)
     if df is None or df.empty:
-        return sector_map, medians
+        return sector_map, medians, overall
+
+    if "Code" not in df.columns:
+        return sector_map, medians, overall
+
+    sector_col = None
+    for c in ["Sector33Code", "Sector33", "Sector33CodeName"]:
+        if c in df.columns:
+            sector_col = c
+            break
+    if sector_col is None:
+        return sector_map, medians, overall
+
+    df["Code4"] = df["Code"].astype(str).map(normalize_code)
+
+    # pick latest per Code4 if available
+    if "Date" in df.columns:
+        df["Date"] = df["Date"].astype(str)
+        df = df.sort_values(["Code4", "Date"]).drop_duplicates(["Code4"], keep="last")
+    else:
+        df = df.drop_duplicates(["Code4"], keep="last")
+
+    code_to_sector = {}
+    for _, r in df.iterrows():
+        c4 = str(r.get("Code4", "")).strip()
+        s = str(r.get(sector_col, "")).strip()
+        if c4 and s:
+            code_to_sector[c4] = s
+
+    for t in tickers:
+        c4 = to_jq_code(t)
+        if c4 and c4 in code_to_sector:
+            sector_map[t] = code_to_sector[c4]
+
+    # build sector medians
+    rows = []
+    for t in tickers:
+        s = sector_map.get(t)
+        if not s:
+            continue
+        per, pbr = per_pbr.get(t, (None, None))
+        rows.append({"sector": s, "per": per, "pbr": pbr})
+
+    if not rows:
+        return sector_map, medians, overall
+
+    dfv = pd.DataFrame(rows)
+    for s, g in dfv.groupby("sector"):
+        per_s = g["per"].dropna().astype(float).to_numpy()
+        pbr_s = g["pbr"].dropna().astype(float).to_numpy()
+        if per_s.size == 0 or pbr_s.size == 0:
+            continue
+        medians[str(s)] = {"per_median": float(np.median(per_s)), "pbr_median": float(np.median(pbr_s))}
+
+    return sector_map, medians, overall
 
     # Normalize code columns
     # Expect 'Code' and 'Sector33Code' (per docs)
@@ -776,7 +878,7 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
     for t in nikkei225_tickers:
         per_pbr_all[t] = fetch_per_pbr_from_info(t)
 
-    sector_map, sector_medians = build_sector_map_and_medians(nikkei225_tickers, per_pbr_all)
+    sector_map, sector_medians, overall_medians = build_sector_map_and_medians(nikkei225_tickers, per_pbr_all)
 
     # --- Candidate enrich: PER/PBR + JQ + sector medians ---
     candidates: List[Dict[str, Any]] = []
@@ -787,10 +889,18 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
         jq_row, jq_prev = jq_fetch_fins_summary(code4)
         earn = build_earnings_summary(jq_row, jq_prev)
 
-        s33 = sector_map.get(t, "")
-        med = sector_medians.get(s33, {})
-        per_med = med.get("per_median", float("nan"))
-        pbr_med = med.get("pbr_median", float("nan"))
+        
+s33 = sector_map.get(t, "")
+med = sector_medians.get(s33, {})
+per_med = med.get("per_median", float("nan"))
+pbr_med = med.get("pbr_median", float("nan"))
+
+median_source = "sector"
+if (not np.isfinite(per_med)) or (not np.isfinite(pbr_med)):
+    # fallback to overall median if sector median is unavailable
+    per_med = overall_medians.get("per_median", float("nan"))
+    pbr_med = overall_medians.get("pbr_median", float("nan"))
+    median_source = "overall"
 
         cand = {
             "ticker": t,
@@ -801,6 +911,7 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
             "sector33": s33,
             "sector_per_median": None if math.isnan(per_med) else per_med,
             "sector_pbr_median": None if math.isnan(pbr_med) else pbr_med,
+            "median_source": median_source,
             "roe": earn.get("ROE_proxy"),
             "earnings": {
                 "disc_date": earn.get("DiscDate"),
@@ -862,6 +973,7 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
         c = next((x for x in candidates if x["ticker"] == t), None) or {}
         sector_per = c.get("sector_per_median")
         sector_pbr = c.get("sector_pbr_median")
+        median_label = "業種中央値" if c.get("median_source") != "overall" else "全体中央値"
         roe = c.get("roe")
         ed = (c.get("earnings") or {})
         disc = ed.get("disc_date") or "-"
@@ -886,7 +998,7 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
         desc_lines.append(fmt_fair("理論株価(PBR基準)", price, fair_pbr))
         desc_lines.append(fmt_fair("理論株価(PER基準)", price, fair_per))
         desc_lines.append(
-            f"{fmt_vs_median('PBR', pbr, sector_pbr, 2, 2)} / {fmt_vs_median('PER', per, sector_per, 2, 2)} / ROE(簡易):{fp(roe*100 if roe is not None else None,1)}%"
+            f"{fmt_vs_median('PBR', pbr, sector_pbr, 2, 2, median_label=median_label)} / {fmt_vs_median('PER', per, sector_per, 2, 2, median_label=median_label)} / ROE(簡易):{fp(roe*100 if roe is not None else None,1)}%"
         )
         desc_lines.append(
             f"決算:{disc} {period}  売上:{fp(sales/1e8 if sales else None,1)}億({fmt_yoy(yoy_sales)})  営業益:{fp(op/1e8 if op else None,1)}億({fmt_yoy(yoy_op)})  純益:{fp(np_/1e8 if np_ else None,1)}億({fmt_yoy(yoy_np)})"
