@@ -581,6 +581,30 @@ def _setup_matplotlib_japanese_font():
             break
 
     if not font_path:
+        # --- 最終手段：フォントを自動ダウンロード（yml不要で文字化け対策） ---
+        # 日本語フォントが入っていない環境（例: GitHub Actionsの最小Ubuntu）でも、画像内に日本語を描画するため。
+        # 失敗しても処理は継続（その場合は日本語が□になる可能性あり）。
+        try:
+            import requests as _rq
+            cache_dir = os.getenv("JP_FONT_CACHE_DIR", "/tmp/jp_fonts")
+            os.makedirs(cache_dir, exist_ok=True)
+            dl_path = os.path.join(cache_dir, "NotoSansCJKjp-Regular.otf")
+            if (not os.path.exists(dl_path)) or os.path.getsize(dl_path) < 1_000_000:
+                url = os.getenv(
+                    "JP_FONT_URL",
+                    "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf",
+                )
+                resp = _rq.get(url, timeout=45)
+                if resp.status_code == 200 and len(resp.content) > 1_000_000:
+                    with open(dl_path, "wb") as f:
+                        f.write(resp.content)
+            if os.path.exists(dl_path) and os.path.getsize(dl_path) > 1_000_000:
+                font_path = dl_path
+                print(f"[INFO] Japanese font ready: {font_path}", file=sys.stderr)
+        except Exception as _e:
+            print(f"[WARN] Japanese font download failed: {_e}", file=sys.stderr)
+
+    if not font_path:
         # フォントが見つからない場合は None を返す（＝日本語は文字化けする可能性）
         return None, None
 
