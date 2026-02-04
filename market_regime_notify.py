@@ -317,7 +317,8 @@ def compute_shock_changes(feat: pd.DataFrame) -> Dict[str, Dict[str, Optional[fl
             "delta": safe_float(r.get("intraday_delta_lookback")),
             "ticker_used": r.get("ticker_used"),
         }
-        return {
+
+    return {
         "USDJPY": row("USDJPY"),
         "VIX": row("VIX"),
         "SPX": row("SPX"),
