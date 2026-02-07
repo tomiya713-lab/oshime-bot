@@ -23,7 +23,7 @@ Env (existing):
 - OPENAI_MODEL (default: gpt-4.1-mini)
 - ENABLE_AI (default: 1)
 - AI_ONLY_ON_ALERT (default: 1)
-- MAX_RSS_QUERIES (default: 5)
+- MAX_RSS_QUERIES (default: 3)
 - RSS_ITEMS_PER_QUERY (default: 10)
 - MAX_NEWS_CANDIDATES (default: 30)
 - NEWS_PICK_MAX (default: 5)
@@ -317,12 +317,10 @@ def compute_shock_changes(feat: pd.DataFrame) -> Dict[str, Dict[str, Optional[fl
             "delta": safe_float(r.get("intraday_delta_lookback")),
             "ticker_used": r.get("ticker_used"),
         }
-
     return {
         "USDJPY": row("USDJPY"),
         "VIX": row("VIX"),
         "SPX": row("SPX"),
-        "NIKKEI": row("NIKKEI"),
         "NIKKEI_FUT": row("NIKKEI_FUT"),
     }
 
@@ -432,6 +430,95 @@ def build_google_news_rss_url(query: str, lang: str) -> str:
         hl, gl, ceid = "en-US", "US", "US:en"
     q = requests.utils.quote(query)
     return f"https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}"
+
+
+# =========================
+# RSS query retry helpers
+# =========================
+
+_JA_SYNONYMS = [
+    ("米金利", "米 長期金利"),
+    ("長期金利", "米 長期金利"),
+    ("利回り", "米国債 利回り"),
+    ("上昇", "利回り"),
+    ("下落", "急落"),
+    ("円安", "ドル円"),
+    ("円高", "ドル円"),
+    ("為替介入", "口先介入"),
+    ("当局発言", "政府 発言"),
+    ("株価", "株式市場"),
+    ("日経平均", "日本株"),
+]
+
+_EN_SYNONYMS = [
+    ("yields", "treasury yields"),
+    ("rate cut", "fed rate cut"),
+    ("rate hike", "fed rate hike"),
+    ("risk-off", "market selloff"),
+    ("volatility spike", "vix spike"),
+]
+
+def _shrink_query_tokens(q: str, max_tokens: int = 3) -> str:
+    """Drop extra tokens to reduce AND strictness."""
+    toks = [t for t in (q or "").split() if t.strip()]
+    return " ".join(toks[:max_tokens])
+
+def _apply_synonyms(q: str, lang: str) -> str:
+    """Replace a few terms with more common variants."""
+    s = q or ""
+    syns = _JA_SYNONYMS if lang == "ja" else _EN_SYNONYMS
+    for a, b in syns:
+        if a in s:
+            s = s.replace(a, b)
+    return s
+
+def build_retry_queries(rss_queries: List[Dict], attempt: int) -> List[Dict]:
+    """
+    attempt=1: keep as-is
+    attempt=2: shrink to 3 tokens
+    attempt=3: shrink + synonyms
+    """
+    out: List[Dict] = []
+    for q in rss_queries:
+        lang = (q.get("lang") or "ja").lower()
+        base = (q.get("q") or "").strip()
+        if not base:
+            continue
+
+        if attempt == 1:
+            newq = base
+        elif attempt == 2:
+            newq = _shrink_query_tokens(base, max_tokens=3)
+        else:
+            newq = _apply_synonyms(_shrink_query_tokens(base, max_tokens=3), lang=lang)
+
+        out.append({"label": q.get("label", ""), "q": newq, "lang": lang})
+    return out
+
+def collect_news_candidates_with_retry(rss_queries: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Retry RSS search by relaxing queries when too strict.
+    - Weekdays: 2 retries (attempt 1..3)
+    - Weekends: 1 retry (attempt 1..2)
+
+    Returns: (candidates, queries_used)
+    """
+    wd = jst_now().weekday()  # 0=Mon .. 6=Sun
+    attempts = (1, 2) if wd >= 5 else (1, 2, 3)
+
+    best_items: List[Dict] = []
+    best_qs: List[Dict] = rss_queries
+
+    for attempt in attempts:
+        qs = build_retry_queries(rss_queries, attempt=attempt)
+        urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in qs[:MAX_RSS_QUERIES]]
+        items = collect_news_candidates(urls)
+        if len(items) > len(best_items):
+            best_items, best_qs = items, qs
+        if len(items) >= 5:
+            return items, qs
+
+    return best_items, best_qs
 
 def fetch_rss_items(url: str, per_query: int) -> List[Dict]:
     try:
@@ -552,79 +639,10 @@ def extract_block(text: str, start: str, end: str) -> Optional[str]:
 
 
 # =========================
-# AI strict pick helpers (anti-hallucination)
-# =========================
-def format_candidates_numbered(news_candidates: List[Dict], max_n: int) -> str:
-    """Return numbered candidate list for prompting (NO URL included)."""
-    lines = []
-    for i, it in enumerate(news_candidates[:max_n], start=1):
-        title = _sanitize_for_prompt(it.get("title", ""), 160)
-        source = _sanitize_for_prompt(it.get("source", ""), 60)
-        snippet = _sanitize_for_prompt(it.get("snippet", ""), 220)
-        published = (it.get("published_utc", "") or "")
-        if not title:
-            continue
-        lines.append(f"{i}|{title}|{source}|{published}|{snippet}")
-    return "\n".join(lines)
-
-def parse_picks_block(picks_text: str, max_n: int) -> List[Dict]:
-    """Parse lines: idx|summary|why  (idx is 1-based)."""
-    out = []
-    for line in (picks_text or "").splitlines():
-        line = line.strip()
-        if not line or "|" not in line:
-            continue
-        parts = [p.strip() for p in line.split("|", 2)]
-        if len(parts) != 3:
-            continue
-        try:
-            idx = int(parts[0])
-        except Exception:
-            continue
-        if idx < 1 or idx > max_n:
-            continue
-        summary, why = parts[1], parts[2]
-        if not summary:
-            continue
-        out.append({"idx": idx, "summary": clamp_str(summary, 180), "why": clamp_str(why, 220)})
-    # de-dup by idx keeping first
-    seen = set()
-    uniq = []
-    for x in out:
-        if x["idx"] in seen:
-            continue
-        seen.add(x["idx"])
-        uniq.append(x)
-        if len(uniq) >= NEWS_PICK_MAX:
-            break
-    return uniq
-
-def build_news_message_from_picks(picks: List[Dict], news_candidates: List[Dict], rss_queries: List[Dict]) -> str:
-    lines = [f"【原因ニュース】（候補から選別）"]
-    for p in picks[:NEWS_PICK_MAX]:
-        it = news_candidates[p["idx"] - 1]
-        title = (it.get("title", "") or "").strip()
-        source = (it.get("source", "") or "").strip()
-        url = (it.get("url", "") or "").strip()
-        head = f"{title}（{source}）" if source else title
-        if not head:
-            head = "(no title)"
-        lines.append(f"\n- {head}\n  要約: {p['summary']}\n  関連: {p.get('why','')}\n  URL: {url}")
-
-    lines.append("\n【参照RSS候補】")
-    for q in rss_queries[:MAX_RSS_QUERIES]:
-        label = q.get("label", "")
-        url = build_google_news_rss_url(q.get("q", ""), q.get("lang", "ja"))
-        lines.append(f"- {label}: {url}")
-    return "\n".join(lines)
-
-# =========================
 # AI query builders
 # =========================
 def ai_propose_rss_queries_default(feat: pd.DataFrame, regime: str, reason: str) -> Tuple[List[Dict], List[str]]:
     fallback = [
-        {"label": "トランプ 株価 - 米大統領動向", "q": "トランプ 株価 ダウ", "lang": "ja"},
-        {"label": "高市 株価 - 首相動向", "q": "高市 株価", "lang": "ja"},
         {"label": "中東 原油 供給 リスク - risk-off時の定番", "q": "中東 原油 供給 リスク", "lang": "ja"},
         {"label": "Taiwan China military tension - 地政学リスク", "q": "Taiwan China military tension", "lang": "en"},
         {"label": "Russia Ukraine sanctions energy prices - 制裁/エネルギー", "q": "Russia Ukraine sanctions energy prices", "lang": "en"},
@@ -642,26 +660,15 @@ def ai_propose_rss_queries_default(feat: pd.DataFrame, regime: str, reason: str)
     vix = safe_float(feat.loc[feat["symbol"] == "VIX", "daily_close"].iloc[0])
     vix15 = safe_float(feat.loc[feat["symbol"] == "VIX", "intraday_%chg_last15m"].iloc[0])
     usdjpy = safe_float(feat.loc[feat["symbol"] == "USDJPY", "daily_close"].iloc[0])
-    nikkei_spot = safe_float(feat.loc[feat["symbol"] == "NIKKEI", "daily_close"].iloc[0])
-    nikkei15 = safe_float(feat.loc[feat["symbol"] == "NIKKEI", "intraday_%chg_last15m"].iloc[0])
 
     system = "You are a markets+geopolitics assistant. Follow the output format strictly."
     user = f"""
 次の市場状況に合う「Google News RSS 検索クエリ」を最大{MAX_RSS_QUERIES}本提案して。
-日英ミックスOK。日本株価に影響しそうな地政学とマクロ（米金利/原油/制裁/台湾/中東など）を広くカバーしつつ、今の数値に寄せて。
-
-【重要な検索クエリ作成ルール】
-- query は原則「2〜3語」、最大でも3語までにすること。
-- 多くの単語を1クエリに詰め込まない。
-- 同じテーマは短いクエリを分けて提案すること。
-- USDJPY / VIX などの指標名は原則含めない。
-- 日本語クエリは名詞中心で簡潔に。
+日英ミックスOK。地政学とマクロ（米金利/原油/制裁/台湾/中東など）を広くカバーしつつ、今の数値に寄せて。
 
 Regime: {regime}
 Reason: {reason}
-VIX: {vix}  VIX15m%: {vix15}
-USDJPY: {usdjpy}
-NIKKEI_AVG: {nikkei_spot}  NIKKEI15m%: {nikkei15}
+VIX: {vix}  VIX15m%: {vix15}  USDJPY: {usdjpy}
 
 出力は必ずこの形式（各行1件、合計{MAX_RSS_QUERIES}行）:
 lang|label|query
@@ -740,11 +747,18 @@ def ai_build_messages_default(
             "deltaLB": safe_float(row.get("intraday_delta_lookback")),
         }
 
-    market = {"VIX": pick("VIX"), "USDJPY": pick("USDJPY"), "NIKKEI": pick("NIKKEI"), "NIKKEI_FUT": pick("NIKKEI_FUT"), "SPX": pick("SPX")}
-    if not news_candidates:
-        return None
+    market = {"VIX": pick("VIX"), "USDJPY": pick("USDJPY"), "NIKKEI_FUT": pick("NIKKEI_FUT"), "SPX": pick("SPX")}
 
-    cand_blob = format_candidates_numbered(news_candidates, min(MAX_NEWS_CANDIDATES, len(news_candidates)))
+    cand_lines = []
+    for it in news_candidates[:MAX_NEWS_CANDIDATES]:
+        title = _sanitize_for_prompt(it.get("title", ""), 160)
+        source = _sanitize_for_prompt(it.get("source", ""), 60)
+        url = (it.get("url", "") or "").strip()
+        snippet = _sanitize_for_prompt(it.get("snippet", ""), 200)
+        published = (it.get("published_utc", "") or "")
+        if title and url:
+            cand_lines.append(f"- {title} | {source} | {published} | {snippet} | {url}")
+    cand_blob = "\n".join(cand_lines)
 
     system = "You are an editor who writes concise, actionable Discord messages in Japanese."
     user = f"""
@@ -761,32 +775,26 @@ market: {json.dumps(market, ensure_ascii=False)}
 【要件】
 (1) 1通目：結論＋解釈（短い）
 - Regime（NORMAL/ALERT/CRISIS）
-- なぜそう見えるか（VIX/円/日経先物/日経平均/米株の変化を日本語で1〜3行）
+- なぜそう見えるか（VIX/円/日経先物/米株の変化を日本語で1〜3行）
 - 監視ポイント（次の1〜2時間で見るべき指標）
 
-(2) 2通目：原因ニュースの“選別結果”（最大{NEWS_PICK_MAX}本）
-- 下の「ニュース候補一覧」から重要度が高いものだけ選び、番号で指定する（直近優先）
-- **URLや媒体名の捏造は禁止**。候補一覧に存在しないニュースやURLは絶対に書かない
-- 各ニュースは次の形式で出力する（各行1件）:
-  idx|summary|why
-  - idx: ニュース候補の番号（1〜）
-  - summary: 1〜2行要約（日本語）
-  - why: なぜ今回の市場変化と関係する可能性があるか
-- 候補が不足する場合は無理に埋めず、出せる分だけでよい（0件も可）
+(2) 2通目：ニュース（最大{NEWS_PICK_MAX}本）
+- 候補から重要度が高いものだけ選ぶ（直近優先）
+- 各ニュース: 見出し（ソース）＋一言要約（日本語）＋「なぜ効く可能性があるか」＋URL
+- 最後にRSS候補（参照）も3本つける（label + URL）
 
 【出力フォーマット厳守】
 <<<MSG1>>>
 ...ここに1通目...
 <<<ENDMSG1>>>
-<<<PICKS>>>
-idx|summary|why
-...
-<<<ENDPICKS>>>
+<<<MSG2>>>
+...ここに2通目...
+<<<ENDMSG2>>>
 
 【RSS候補】
 {json.dumps(rss_queries, ensure_ascii=False)}
 
-【ニュース候補一覧】（URLは出力しない）
+【ニュース候補一覧】
 {cand_blob}
 
 【重要】原則として直近6時間以内のニュースを最優先で選ぶこと。6時間以内が少ない場合のみ、12時間以内まで許容。
@@ -796,13 +804,9 @@ idx|summary|why
     if not text:
         return None
     msg1 = extract_block(text, "<<<MSG1>>>", "<<<ENDMSG1>>>")
-    picks_text = extract_block(text, "<<<PICKS>>>", "<<<ENDPICKS>>>")
-    if not msg1 or picks_text is None:
+    msg2 = extract_block(text, "<<<MSG2>>>", "<<<ENDMSG2>>>")
+    if not msg1 or not msg2:
         return None
-    picks = parse_picks_block(picks_text, min(MAX_NEWS_CANDIDATES, len(news_candidates)))
-    if not picks:
-        return None
-    msg2 = build_news_message_from_picks(picks, news_candidates, rss_queries)
     return msg1, msg2
 
 def ai_build_messages_shock(
@@ -820,10 +824,17 @@ def ai_build_messages_shock(
         return None
 
     chg = compute_shock_changes(feat)
-    if not news_candidates:
-        return None
 
-    cand_blob = format_candidates_numbered(news_candidates, min(MAX_NEWS_CANDIDATES, len(news_candidates)))
+    cand_lines = []
+    for it in news_candidates[:MAX_NEWS_CANDIDATES]:
+        title = _sanitize_for_prompt(it.get("title", ""), 160)
+        source = _sanitize_for_prompt(it.get("source", ""), 60)
+        url = (it.get("url", "") or "").strip()
+        snippet = _sanitize_for_prompt(it.get("snippet", ""), 200)
+        published = (it.get("published_utc", "") or "")
+        if title and url:
+            cand_lines.append(f"- {title} | {source} | {published} | {snippet} | {url}")
+    cand_blob = "\n".join(cand_lines)
 
     system = "You are a macro+markets analyst writing concise Discord messages in Japanese."
     user = f"""
@@ -844,30 +855,27 @@ def ai_build_messages_shock(
 
 【出力要件（2メッセージ、区切り厳守）】
 (1) 1通目：原因と状況（短く）
-- 何が起きたか（USDJPY/VIX/SPX/日経先物/日経平均の変化）
-- 可能性が高い原因（ニュース要約を混ぜて良いが、候補以外の具体ニュースは書かない）
+- 何が起きたか（USDJPY/VIX/SPX/日経先物の変化）
+- 可能性が高い原因（ニュース要約を混ぜて）
 - 次に見るポイント（具体的に）
 
-(2) 2通目：原因ニュースの“選別結果”（最大{NEWS_PICK_MAX}本）
-- 下の「ニュース候補一覧」から「原因になった可能性が高い順」に番号で最大{NEWS_PICK_MAX}本選ぶ
-- **URLや媒体名の捏造は禁止**。候補一覧に存在しないニュースやURLは絶対に書かない
-- 各ニュースは次の形式で出力（各行1件）:
-  idx|summary|why
-- 候補が不足する場合は無理に埋めず、出せる分だけでよい（0件も可）
+(2) 2通目：原因ニュース（最大{NEWS_PICK_MAX}本）
+- 候補から「原因になった可能性が高い順」に最大{NEWS_PICK_MAX}本
+- 各ニュース: 1–2行要約（日本語）＋理由（なぜこの市場変化と繋がる？）＋URL
+- 最後にRSS候補（参照）を3本（label + URL）
 
 【出力フォーマット厳守】
 <<<MSG1>>>
 ...ここに1通目...
 <<<ENDMSG1>>>
-<<<PICKS>>>
-idx|summary|why
-...
-<<<ENDPICKS>>>
+<<<MSG2>>>
+...ここに2通目...
+<<<ENDMSG2>>>
 
 【RSS候補】
 {json.dumps(rss_queries, ensure_ascii=False)}
 
-【ニュース候補一覧】（URLは出力しない）
+【ニュース候補一覧】
 {cand_blob}
 
 【重要】原則として直近6時間以内のニュースを最優先で原因候補にする。6時間以内が少ない場合のみ、12時間以内まで許容。
@@ -877,13 +885,9 @@ idx|summary|why
     if not text:
         return None
     msg1 = extract_block(text, "<<<MSG1>>>", "<<<ENDMSG1>>>")
-    picks_text = extract_block(text, "<<<PICKS>>>", "<<<ENDPICKS>>>")
-    if not msg1 or picks_text is None:
+    msg2 = extract_block(text, "<<<MSG2>>>", "<<<ENDMSG2>>>")
+    if not msg1 or not msg2:
         return None
-    picks = parse_picks_block(picks_text, min(MAX_NEWS_CANDIDATES, len(news_candidates)))
-    if not picks:
-        return None
-    msg2 = build_news_message_from_picks(picks, news_candidates, rss_queries)
     return msg1, msg2
 
 
@@ -905,7 +909,6 @@ def build_fallback_messages(regime: str, reason: str, rss_queries: List[Dict]) -
 # =========================
 # Main notify
 # =========================
-
 def notify(feat: pd.DataFrame) -> None:
     ts = fmt_ts_jst()
     regime, reason = eval_regime(feat)
@@ -913,31 +916,37 @@ def notify(feat: pd.DataFrame) -> None:
     chg = compute_shock_changes(feat)
     shock_flag, shock_reasons = is_shock(chg)
 
-    if shock_flag:
-        rss_queries, rss_urls = build_shock_rss_queries()
-        candidates = collect_news_candidates(rss_urls)
+    # "Cause search" should run not only in SHOCK but also in ALERT (and CRISIS).
+    shock_like = shock_flag or (regime in ("ALERT", "CRISIS"))
+
+    if shock_like:
+        # Use shock-style fixed queries (high-recall) when market is stressed.
+        rss_queries, _ = build_shock_rss_queries()
+        candidates, rss_queries_used = collect_news_candidates_with_retry(rss_queries)
 
         if not candidates:
-            msg1, msg2 = build_fallback_messages(regime, reason + " | SHOCK(no news)", rss_queries)
+            tag = "SHOCK(no news)" if shock_flag else "ALERT(no news)"
+            msg1, msg2 = build_fallback_messages(regime, reason + f" | {tag}", rss_queries_used)
         else:
-            msgs = ai_build_messages_shock(feat, regime, reason, shock_reasons, rss_queries, candidates)
+            sr = shock_reasons if shock_flag else ["Regime=ALERT (no threshold breach)"]
+            msgs = ai_build_messages_shock(feat, regime, reason, sr, rss_queries_used, candidates)
             if not msgs:
-                msg1, msg2 = build_fallback_messages(regime, reason + " | SHOCK(no AI)", rss_queries)
+                tag = "SHOCK(no AI)" if shock_flag else "ALERT(no AI)"
+                msg1, msg2 = build_fallback_messages(regime, reason + f" | {tag}", rss_queries_used)
             else:
                 msg1, msg2 = msgs
     else:
-        rss_queries, rss_urls = ai_propose_rss_queries_default(feat, regime, reason)
-        candidates = collect_news_candidates(rss_urls)
+        rss_queries, _ = ai_propose_rss_queries_default(feat, regime, reason)
+        candidates, rss_queries_used = collect_news_candidates_with_retry(rss_queries)
 
         if not candidates:
-            msg1, msg2 = build_fallback_messages(regime, reason + " | no news", rss_queries)
+            msg1, msg2 = build_fallback_messages(regime, reason + " | no news", rss_queries_used)
         else:
-            msgs = ai_build_messages_default(feat, regime, reason, rss_queries, candidates)
+            msgs = ai_build_messages_default(feat, regime, reason, rss_queries_used, candidates)
             if not msgs:
-                msg1, msg2 = build_fallback_messages(regime, reason, rss_queries)
+                msg1, msg2 = build_fallback_messages(regime, reason, rss_queries_used)
             else:
                 msg1, msg2 = msgs
-
     discord_send_text(DISCORD_WEBHOOK_URL, msg1)
     discord_send_text(DISCORD_WEBHOOK_URL, msg2)
 
@@ -946,7 +955,6 @@ def notify(feat: pd.DataFrame) -> None:
         png_path = os.path.join(d, "regime_table.png")
         render_table_png(feat, title=title, out_path=png_path)
         discord_send_file(DISCORD_WEBHOOK_URL, title, png_path)
-
 
 def main():
     if not DISCORD_WEBHOOK_URL:
