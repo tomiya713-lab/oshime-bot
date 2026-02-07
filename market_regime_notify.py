@@ -23,7 +23,7 @@ Env (existing):
 - OPENAI_MODEL (default: gpt-4.1-mini)
 - ENABLE_AI (default: 1)
 - AI_ONLY_ON_ALERT (default: 1)
-- MAX_RSS_QUERIES (default: 3)
+- MAX_RSS_QUERIES (default: 5)
 - RSS_ITEMS_PER_QUERY (default: 10)
 - MAX_NEWS_CANDIDATES (default: 30)
 - NEWS_PICK_MAX (default: 5)
@@ -648,12 +648,14 @@ def ai_propose_rss_queries_default(feat: pd.DataFrame, regime: str, reason: str)
     system = "You are a markets+geopolitics assistant. Follow the output format strictly."
     user = f"""
 次の市場状況に合う「Google News RSS 検索クエリ」を最大{MAX_RSS_QUERIES}本提案して。
-日英ミックスOK。
+日英ミックスOK。地政学とマクロ（米金利/原油/制裁/台湾/中東など）を広くカバーしつつ、今の数値に寄せて。
 
-地政学とマクロ（米金利/原油/制裁/台湾/中東など）や日米首相の動向に加えて、
-**日本株（日経平均株価・TOPIX）や日本固有要因（金融政策・為替・企業要因）も考慮すること。**
-
-今の数値変化に最も関係が深そうなテーマを優先せよ。
+【重要な検索クエリ作成ルール】
+- query は原則「2〜3語」、最大でも4語までにすること。
+- 多くの単語を1クエリに詰め込まない。
+- 同じテーマは短いクエリを分けて提案すること。
+- USDJPY / VIX などの指標名は原則含めない。
+- 日本語クエリは名詞中心で簡潔に。
 
 Regime: {regime}
 Reason: {reason}
