@@ -27,21 +27,25 @@ DISCORD_ENABLED = bool(DISCORD_WEBHOOK_URL)
 FORCE_RUN = os.getenv("FORCE_RUN", "0") == "1"
 
 # ===== 抽出ロジックパラメータ =====
+# 1) 短期（SMA5×SMA25）…「直前狙い（PreGC）」と「クロス当日（GC）」を両方拾う
 SMA_SHORT = 5
 SMA_LONG = 25
 
-# 新GC_shortの閾値：SMA5/SMA25 がこの比率以上
+# “直前狙い”用：SMA5/SMA25 がこの比率以上（例: 0.90）
 SMA_RATIO_MIN = float(os.getenv("SMA_RATIO_MIN", "0.90"))
 
 # 「SMAが上向き」の定義：SMA25が上向き（おすすめ）
 REQUIRE_SMA25_UP = os.getenv("REQUIRE_SMA25_UP", "1") == "1"
+
+# 2) 王道GC（SMA25×SMA75）…クロス当日を拾う
+SMA_TREND = 75  # 固定
 
 # MACD (12,26,9) 固定
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 
-# 週足BB：20週 + 2σ 固定
+# 週足BB：20週 + 2σ（“条件”には使わないが、metricsには残す）
 WBB_PERIOD_WEEKS = 20
 WBB_SIGMA = 2.0
 
@@ -197,120 +201,180 @@ ticker_name_map = {
     "9984.T": "ソフトバンクG",
 }
 
+
 def load_tickers() -> List[str]:
-    # CSV入力は使わない運用（常に日経225を対象）
-    return nikkei225_tickers
+    return list(dict.fromkeys([t.strip() for t in nikkei225_tickers if str(t).strip()]))
 
 
-# ===== yfinance データ取得 =====
-def fetch_market_data(tickers: List[str], lookback_days: int = LOOKBACK_DAYS) -> pd.DataFrame:
-    end_dt = (now_jst().date() + timedelta(days=1)).isoformat()
-    start_dt = (now_jst().date() - timedelta(days=lookback_days)).isoformat()
+def fetch_market_data(tickers: List[str], lookback_days: int = LOOKBACK_DAYS) -> Optional[pd.DataFrame]:
+    """yfinanceでOHLCVを一括取得（Adj Close不使用）"""
+    try:
+        period = f"{int(lookback_days)}d"
+        df = yf.download(
+            tickers=tickers,
+            period=period,
+            interval="1d",
+            auto_adjust=False,
+            group_by="column",
+            threads=True,
+            progress=False,
+        )
+        if df is None or df.empty:
+            return None
+        return df
+    except Exception as e:
+        print(f"[ERROR] fetch_market_data failed: {e}", file=sys.stderr)
+        return None
 
-    raw = yf.download(
-        tickers,
-        start=start_dt,
-        end=end_dt,
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        group_by="column",  # (field, ticker) の MultiIndex
-        threads=True,
-    )
-    return raw
 
-
-# ===== 指標計算 =====
-def latest_gc_macd_bb_from_raw(raw_df: pd.DataFrame, ticker: str) -> Optional[Dict[str, Any]]:
-    """
-    抽出条件：
-      GC_short（新定義） AND MACD強気 AND 週足BB上限ブレイク週
-
-    新GC_short（あなた指定）：
-      ・今日：SMA5 < SMA25
-      ・SMAが上向き（デフォルトはSMA25上向き）
-      ・SMA5/SMA25 >= 0.90（envで変更可）
-      ・前日より ratio が改善（ratio_today > ratio_yesterday）
-    """
+def _extract_series(raw_df: pd.DataFrame, ticker: str, col: str) -> Optional[pd.Series]:
     try:
         if isinstance(raw_df.columns, pd.MultiIndex):
-            close = raw_df[("Close", ticker)].dropna()
+            s = raw_df[(col, ticker)].dropna().copy()
         else:
-            close = raw_df["Close"].dropna()
-
-        need_len = max(SMA_LONG, MACD_SLOW) + 5
-        if len(close) < need_len:
+            s = raw_df[col].dropna().copy()
+        if s is None or len(s) == 0:
             return None
-
-        # --- 日足SMA ---
-        sma5 = close.rolling(window=SMA_SHORT, min_periods=SMA_SHORT).mean()
-        sma25 = close.rolling(window=SMA_LONG, min_periods=SMA_LONG).mean()
-
-        if pd.isna(sma5.iloc[-1]) or pd.isna(sma25.iloc[-1]) or pd.isna(sma5.iloc[-2]) or pd.isna(sma25.iloc[-2]):
-            return None
-
-        ratio_t = float(sma5.iloc[-1] / sma25.iloc[-1]) if float(sma25.iloc[-1]) != 0.0 else np.nan
-        ratio_y = float(sma5.iloc[-2] / sma25.iloc[-2]) if float(sma25.iloc[-2]) != 0.0 else np.nan
-
-        sma25_up = bool(sma25.iloc[-1] > sma25.iloc[-2])
-
-        # 新GC_short
-        gc_short_new = (
-            (float(sma5.iloc[-1]) < float(sma25.iloc[-1])) and
-            (not pd.isna(ratio_t) and ratio_t >= SMA_RATIO_MIN) and
-            (not pd.isna(ratio_y) and ratio_t > ratio_y) and
-            (sma25_up if REQUIRE_SMA25_UP else True)
-        )
-
-        # --- MACD (12,26,9) ---
-        ema_fast = close.ewm(span=MACD_FAST, adjust=False).mean()
-        ema_slow = close.ewm(span=MACD_SLOW, adjust=False).mean()
-        macd_line = ema_fast - ema_slow
-        macd_signal = macd_line.ewm(span=MACD_SIGNAL, adjust=False).mean()
-
-        if pd.isna(macd_line.iloc[-1]) or pd.isna(macd_signal.iloc[-1]):
-            return None
-
-        macd_bullish = (float(macd_line.iloc[-1]) > 0.0) and (float(macd_line.iloc[-1]) > float(macd_signal.iloc[-1]))
-
-        # --- 週足BB上限 (W-FRIで週足化) ---
-        weekly_close = close.to_frame("Close").resample("W-FRI").last()["Close"].dropna()
-        if len(weekly_close) < WBB_PERIOD_WEEKS + 2:
-            return None
-
-        w_ma20 = weekly_close.rolling(window=WBB_PERIOD_WEEKS, min_periods=WBB_PERIOD_WEEKS).mean()
-        w_std20 = weekly_close.rolling(window=WBB_PERIOD_WEEKS, min_periods=WBB_PERIOD_WEEKS).std()
-        w_upper = w_ma20 + WBB_SIGMA * w_std20
-
-        if pd.isna(w_upper.iloc[-1]) or pd.isna(weekly_close.iloc[-1]):
-            return None
-
-        wbb_upper_break = bool(float(weekly_close.iloc[-1]) >= float(w_upper.iloc[-1]))
-
-        ok = bool(gc_short_new and macd_bullish and wbb_upper_break)
-
-        return {
-            # 判定フラグ
-            "ok": ok,
-            "gc_short_new": bool(gc_short_new),
-            "macd_bullish": bool(macd_bullish),
-            "wbb_upper_break": bool(wbb_upper_break),
-
-            # 指標値（最新）
-            "SMA5": float(sma5.iloc[-1]),
-            "SMA25": float(sma25.iloc[-1]),
-            "SMA_ratio": float(ratio_t),
-            "SMA_ratio_prev": float(ratio_y),
-            "SMA25_up": bool(sma25_up),
-
-            "MACD": float(macd_line.iloc[-1]),
-            "MACD_signal": float(macd_signal.iloc[-1]),
-
-            "WClose": float(weekly_close.iloc[-1]),
-            "WBB_upper": float(w_upper.iloc[-1]),
-        }
+        return s
     except Exception:
         return None
+
+
+def latest_gc_signals_from_raw(raw_df: pd.DataFrame, ticker: str) -> Dict[str, Any]:
+    """
+    直近日のシグナルを計算して返す。
+
+    ✅要望反映
+    - “直前狙い”も残す（PreGC 5x25）
+    - クロス当日も拾う（GC 5x25 / GC 25x75）
+    - MACDは「MACD > Signal」のみ（0以上条件は撤廃）
+    - 週足BBブレイク条件は削除（ただしmetrics用に週足BB距離は計算）
+    - metrics csvに以下を追加：
+        SMA5_prev, SMA25_prev, SMA75_prev,
+        MACD_hist,
+        WBB_dist_pct,
+        Volume, VolAvg5
+    """
+    out: Dict[str, Any] = {"Ticker": ticker}
+
+    close = _extract_series(raw_df, ticker, "Close")
+    vol = _extract_series(raw_df, ticker, "Volume")
+
+    if close is None or len(close) < max(SMA_TREND, SMA_LONG) + 3:
+        out.update({
+            "ok": False,
+            "gc_pre_5_25": False,
+            "gc_cross_5_25": False,
+            "gc_cross_25_75": False,
+            "macd_bullish": False,
+            "Signals": "",
+            "Signal_Count": 0,
+            "Reason": "insufficient_close",
+        })
+        return out
+
+    # --- SMA ---
+    sma5 = close.rolling(window=SMA_SHORT, min_periods=SMA_SHORT).mean()
+    sma25 = close.rolling(window=SMA_LONG, min_periods=SMA_LONG).mean()
+    sma75 = close.rolling(window=SMA_TREND, min_periods=SMA_TREND).mean()
+
+    sma5_t, sma25_t, sma75_t = float(sma5.iloc[-1]), float(sma25.iloc[-1]), float(sma75.iloc[-1])
+    sma5_p, sma25_p, sma75_p = float(sma5.iloc[-2]), float(sma25.iloc[-2]), float(sma75.iloc[-2])
+
+    out["SMA5"] = sma5_t
+    out["SMA25"] = sma25_t
+    out["SMA75"] = sma75_t
+    out["SMA5_prev"] = sma5_p
+    out["SMA25_prev"] = sma25_p
+    out["SMA75_prev"] = sma75_p
+
+    ratio_t = (sma5_t / sma25_t) if sma25_t != 0.0 else np.nan
+    ratio_p = (sma5_p / sma25_p) if sma25_p != 0.0 else np.nan
+    out["SMA_ratio"] = float(ratio_t) if not np.isnan(ratio_t) else np.nan
+    out["SMA_ratio_prev"] = float(ratio_p) if not np.isnan(ratio_p) else np.nan
+
+    sma25_up = bool(sma25_t > sma25_p)
+    out["SMA25_up"] = bool(sma25_up)
+
+    # --- “直前狙い”（SMA5×SMA25） ---
+    gc_pre_5_25 = (
+        (sma5_t < sma25_t) and
+        (not np.isnan(ratio_t) and ratio_t >= SMA_RATIO_MIN) and
+        (not np.isnan(ratio_p) and ratio_t > ratio_p) and
+        (sma25_up if REQUIRE_SMA25_UP else True)
+    )
+
+    # --- “クロス当日”（SMA5×SMA25） ---
+    gc_cross_5_25 = (sma5_p <= sma25_p) and (sma5_t > sma25_t)
+
+    # --- “クロス当日”（SMA25×SMA75：王道GC） ---
+    gc_cross_25_75 = (sma25_p <= sma75_p) and (sma25_t > sma75_t)
+
+    out["gc_pre_5_25"] = bool(gc_pre_5_25)
+    out["gc_cross_5_25"] = bool(gc_cross_5_25)
+    out["gc_cross_25_75"] = bool(gc_cross_25_75)
+
+    # --- MACD (12,26,9) ---
+    ema_fast = close.ewm(span=MACD_FAST, adjust=False).mean()
+    ema_slow = close.ewm(span=MACD_SLOW, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    macd_signal = macd_line.ewm(span=MACD_SIGNAL, adjust=False).mean()
+    macd_hist = macd_line - macd_signal
+
+    out["MACD"] = float(macd_line.iloc[-1])
+    out["MACD_signal"] = float(macd_signal.iloc[-1])
+    out["MACD_hist"] = float(macd_hist.iloc[-1])  # 追加
+
+    macd_bullish = float(macd_line.iloc[-1]) > float(macd_signal.iloc[-1])  # 0以上条件なし
+    out["macd_bullish"] = bool(macd_bullish)
+
+    # --- 出来高 / 5日平均 ---
+    if vol is not None and len(vol) >= 6:
+        out["Volume"] = float(vol.iloc[-1])
+        out["VolAvg5"] = float(vol.tail(5).mean())
+    else:
+        out["Volume"] = np.nan
+        out["VolAvg5"] = np.nan
+
+    # --- 週足BB（条件には使わない。metrics用） ---
+    try:
+        weekly_close = close.to_frame("Close").resample("W-FRI").last()["Close"].dropna()
+        if len(weekly_close) >= WBB_PERIOD_WEEKS + 2:
+            w_ma20 = weekly_close.rolling(window=WBB_PERIOD_WEEKS, min_periods=WBB_PERIOD_WEEKS).mean()
+            w_std20 = weekly_close.rolling(window=WBB_PERIOD_WEEKS, min_periods=WBB_PERIOD_WEEKS).std()
+            w_upper = w_ma20 + WBB_SIGMA * w_std20
+
+            wclose = float(weekly_close.iloc[-1])
+            wbb_upper = float(w_upper.iloc[-1])
+            out["WClose"] = wclose
+            out["WBB_upper"] = wbb_upper
+            out["WBB_dist_pct"] = (wclose / wbb_upper - 1.0) if (wbb_upper and not np.isnan(wbb_upper)) else np.nan  # 追加
+        else:
+            out["WClose"] = np.nan
+            out["WBB_upper"] = np.nan
+            out["WBB_dist_pct"] = np.nan
+    except Exception:
+        out["WClose"] = np.nan
+        out["WBB_upper"] = np.nan
+        out["WBB_dist_pct"] = np.nan
+
+    # --- シグナルまとめ（Discord表示用） ---
+    signals: List[str] = []
+    if gc_pre_5_25:
+        signals.append("PreGC 5x25")
+    if gc_cross_5_25:
+        signals.append("GC 5x25")
+    if gc_cross_25_75:
+        signals.append("GC 25x75")
+
+    out["Signals"] = " / ".join(signals)
+    out["Signal_Count"] = int(len(signals))
+
+    # 最終OK：GC系（どれか） AND MACD強気
+    ok = bool(macd_bullish and len(signals) > 0)
+    out["ok"] = ok
+    out["Reason"] = "" if ok else "conditions_not_met"
+    return out
 
 
 # ===== チャート生成 =====
@@ -328,8 +392,7 @@ def save_chart_image_from_raw(raw_df: pd.DataFrame, ticker: str, out_dir: str = 
         else:
             use = raw_df[["Open", "High", "Low", "Close", "Volume"]].copy()
 
-        use = use.dropna()
-        use = use.tail(CHART_LOOKBACK_DAYS)
+        use = use.dropna().tail(CHART_LOOKBACK_DAYS)
 
         mpf.plot(
             use,
@@ -356,114 +419,72 @@ def fp(x: Any, nd: int = 2) -> str:
 
 # ===== 全銘柄CSV（閾値調整用） =====
 def compute_all_metrics(raw_df: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
-    """全銘柄分の指標を計算してCSV出力用のDataFrameを返す（抽出条件で落とさない）。"""
     rows: List[Dict[str, Any]] = []
     for t in tickers:
-        res = latest_gc_macd_bb_from_raw(raw_df, t)
-        if res is None:
-            rows.append({
-                "Ticker": t,
-                "Name": ticker_name_map.get(t, ""),
-                "ok": False,
-                "gc_short_new": False,
-                "macd_bullish": False,
-                "wbb_upper_break": False,
-                "SMA5": np.nan,
-                "SMA25": np.nan,
-                "SMA_ratio": np.nan,
-                "SMA_ratio_prev": np.nan,
-                "SMA25_up": False,
-                "MACD": np.nan,
-                "MACD_signal": np.nan,
-                "WClose": np.nan,
-                "WBB_upper": np.nan,
-                "Reason": "insufficient_or_error",
-            })
-            continue
-
-        rows.append({
-            "Ticker": t,
-            "Name": ticker_name_map.get(t, ""),
-            "ok": bool(res.get("ok", False)),
-            "gc_short_new": bool(res.get("gc_short_new", False)),
-            "macd_bullish": bool(res.get("macd_bullish", False)),
-            "wbb_upper_break": bool(res.get("wbb_upper_break", False)),
-            "SMA5": res.get("SMA5", np.nan),
-            "SMA25": res.get("SMA25", np.nan),
-            "SMA_ratio": res.get("SMA_ratio", np.nan),
-            "SMA_ratio_prev": res.get("SMA_ratio_prev", np.nan),
-            "SMA25_up": bool(res.get("SMA25_up", False)),
-            "MACD": res.get("MACD", np.nan),
-            "MACD_signal": res.get("MACD_signal", np.nan),
-            "WClose": res.get("WClose", np.nan),
-            "WBB_upper": res.get("WBB_upper", np.nan),
-            "Reason": "",
-        })
+        res = latest_gc_signals_from_raw(raw_df, t)
+        res["Name"] = ticker_name_map.get(t, "")
+        if not res.get("Signals"):
+            res["Signals"] = ""
+        rows.append(res)
 
     df = pd.DataFrame(rows) if rows else pd.DataFrame()
     if df.empty:
         return df
 
-    # ok優先 → MACD強い順 → SMA_ratio大きい順
-    df = df.sort_values(["ok", "MACD", "SMA_ratio"], ascending=[False, False, False]).reset_index(drop=True)
+    # 並び：ok優先 → Signal数 → MACD_hist → SMA_ratio
+    df = df.sort_values(
+        ["ok", "Signal_Count", "MACD_hist", "SMA_ratio"],
+        ascending=[False, False, False, False],
+    ).reset_index(drop=True)
     return df
 
 
-# ===== シグナル判定 & 通知 =====
-def screen_gc_macd_bb(raw_df: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
-    """
-    最終版（新GC_short + MACD強気 + 週足BB上限ブレイク週）を満たすティッカーを抽出。
-    """
+# ===== シグナル抽出 =====
+def screen_gc_signals(raw_df: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     for t in tickers:
-        res = latest_gc_macd_bb_from_raw(raw_df, t)
-        if res is None:
-            continue
+        res = latest_gc_signals_from_raw(raw_df, t)
         if not res.get("ok", False):
             continue
-        rows.append({
-            "Ticker": t,
-            "SMA5": res["SMA5"],
-            "SMA25": res["SMA25"],
-            "SMA_ratio": res["SMA_ratio"],
-            "SMA_ratio_prev": res["SMA_ratio_prev"],
-            "SMA25_up": res["SMA25_up"],
-            "MACD": res["MACD"],
-            "MACD_signal": res["MACD_signal"],
-            "WClose": res["WClose"],
-            "WBB_upper": res["WBB_upper"],
-        })
+        rows.append(res)
 
     df = pd.DataFrame(rows) if rows else pd.DataFrame()
     if df.empty:
         return df
 
-    # MACDが強い順 → ratioが大きい順
-    df = df.sort_values(["MACD", "SMA_ratio"], ascending=[False, False]).reset_index(drop=True)
+    df = df.sort_values(
+        ["Signal_Count", "MACD_hist", "SMA_ratio"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
     return df
 
 
 def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
     title = (
-        f"【GC_short(新) + MACD強気 + 週足BB上限ブレイク週】 {now_jst():%m/%d %H:%M}\n"
-        f"GC_short(新)条件: SMA5<SMA25, SMA25上向き={1 if REQUIRE_SMA25_UP else 0}, "
-        f"SMA5/SMA25≥{SMA_RATIO_MIN:.2f}, ratio改善"
+        f"【GCシグナル + MACD強気】 {now_jst():%m/%d %H:%M}\n"
+        f"- PreGC 5x25: SMA5<SMA25, SMA25上向き={1 if REQUIRE_SMA25_UP else 0}, "
+        f"SMA5/SMA25≥{SMA_RATIO_MIN:.2f}, ratio改善\n"
+        f"- GC 5x25: 前日までSMA5<=SMA25 → 当日SMA5>SMA25\n"
+        f"- GC 25x75: 前日までSMA25<=SMA75 → 当日SMA25>SMA75\n"
+        f"- MACD: MACD > Signal（0以上条件なし）"
     )
 
     if df is None or df.empty:
-        discord_send_content(f"{title}\n対象なし")
+        discord_send_content(f"{title}\n\n対象なし")
         return
 
-    lines = [title, f"候補：{len(df)}件", ""]
+    lines = [title, f"\n候補：{len(df)}件", ""]
     for _, r in df.iterrows():
-        t = r["Ticker"]
-        name = ticker_name_map.get(t, "")
+        t = r.get("Ticker", "")
+        name = ticker_name_map.get(str(t), "")
+        signals = r.get("Signals", "")
         lines.append(
-            f"{t} {name} | "
-            f"ratio={fp(r['SMA_ratio'],3)} (prev {fp(r['SMA_ratio_prev'],3)}) "
-            f"SMA5={fp(r['SMA5'],2)} SMA25={fp(r['SMA25'],2)} "
-            f"MACD={fp(r['MACD'],3)} Sig={fp(r['MACD_signal'],3)} "
-            f"WClose={fp(r['WClose'],0)} WBB_up={fp(r['WBB_upper'],0)}"
+            f"{t} {name} | {signals} | "
+            f"ratio={fp(r.get('SMA_ratio'),3)} (prev {fp(r.get('SMA_ratio_prev'),3)}) "
+            f"SMA5={fp(r.get('SMA5'),2)} SMA25={fp(r.get('SMA25'),2)} SMA75={fp(r.get('SMA75'),2)} "
+            f"MACD={fp(r.get('MACD'),3)} Sig={fp(r.get('MACD_signal'),3)} Hist={fp(r.get('MACD_hist'),3)} "
+            f"Vol={fp(r.get('Volume'),0)} VolAvg5={fp(r.get('VolAvg5'),0)} "
+            f"WBBdist={fp(r.get('WBB_dist_pct'),3)}"
         )
 
     send_long_text("\n".join(lines))
@@ -475,14 +496,16 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
 
     top = df.head(CHART_TOP_N)
     for _, r in top.iterrows():
-        t = r["Ticker"]
+        t = str(r.get("Ticker", ""))
         name = ticker_name_map.get(t, "")
         ttl = f"{t} {name}".strip()
         desc = (
-            f"ratio:{fp(r['SMA_ratio'],3)} (prev {fp(r['SMA_ratio_prev'],3)})  "
-            f"SMA5:{fp(r['SMA5'],2)} SMA25:{fp(r['SMA25'],2)}  "
-            f"MACD:{fp(r['MACD'],3)} Sig:{fp(r['MACD_signal'],3)}  "
-            f"WClose:{fp(r['WClose'],0)} WBB_up:{fp(r['WBB_upper'],0)}"
+            f"{r.get('Signals','')} | "
+            f"ratio:{fp(r.get('SMA_ratio'),3)} (prev {fp(r.get('SMA_ratio_prev'),3)})  "
+            f"SMA5:{fp(r.get('SMA5'),2)} SMA25:{fp(r.get('SMA25'),2)} SMA75:{fp(r.get('SMA75'),2)}  "
+            f"MACD:{fp(r.get('MACD'),3)} Sig:{fp(r.get('MACD_signal'),3)} Hist:{fp(r.get('MACD_hist'),3)}  "
+            f"Vol:{fp(r.get('Volume'),0)} VolAvg5:{fp(r.get('VolAvg5'),0)}  "
+            f"WBBdist:{fp(r.get('WBB_dist_pct'),3)}"
         )
 
         img_path = save_chart_image_from_raw(raw_df, t, out_dir=CHART_OUT_DIR)
@@ -503,7 +526,7 @@ def main() -> None:
 
     raw = fetch_market_data(tickers, lookback_days=LOOKBACK_DAYS)
     if raw is None or raw.empty:
-        discord_send_content(f"【GC_short(新) + MACD強気 + 週足BB上限ブレイク週】 {now_jst():%m/%d %H:%M}\nデータ取得失敗")
+        discord_send_content(f"【GCシグナル + MACD強気】 {now_jst():%m/%d %H:%M}\nデータ取得失敗")
         return
 
     # ===== 全銘柄 指標CSV出力（閾値調整用） =====
@@ -518,7 +541,7 @@ def main() -> None:
         print("[WARN] metrics csv not created (no rows).", file=sys.stderr)
 
     # ===== 抽出 → 通知 =====
-    df = screen_gc_macd_bb(raw, tickers)
+    df = screen_gc_signals(raw, tickers)
     notify(df, raw)
 
 
