@@ -76,7 +76,7 @@ OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_OUTPUT_TOKENS", "900"))
 OPENAI_TIMEOUT_SEC = int(os.environ.get("OPENAI_TIMEOUT_SEC", "30"))
 OPENAI_RETRIES = int(os.environ.get("OPENAI_RETRIES", "2"))
 
-MAX_RSS_QUERIES = int(os.environ.get("MAX_RSS_QUERIES", "3"))
+MAX_RSS_QUERIES = int(os.environ.get("MAX_RSS_QUERIES", "5"))
 RSS_ITEMS_PER_QUERY = int(os.environ.get("RSS_ITEMS_PER_QUERY", "10"))
 MAX_NEWS_CANDIDATES = int(os.environ.get("MAX_NEWS_CANDIDATES", "30"))
 NEWS_PICK_MAX = int(os.environ.get("NEWS_PICK_MAX", "5"))
@@ -488,7 +488,9 @@ def build_retry_queries(rss_queries: List[Dict], attempt: int) -> List[Dict]:
         if attempt == 1:
             newq = base
         elif attempt == 2:
-            newq = _shrink_query_tokens(base, max_tokens=3)
+            wd = jst_now().weekday()
+            max_t = 2 if wd >= 5 else 3
+            newq = _shrink_query_tokens(base, max_tokens=max_t)
         else:
             newq = _apply_synonyms(_shrink_query_tokens(base, max_tokens=3), lang=lang)
 
@@ -583,18 +585,26 @@ def collect_news_candidates(rss_urls: List[str]) -> List[Dict]:
     items = list(uniq.values())
     items.sort(key=lambda x: x.get("published_utc") or "", reverse=True)
 
-    fresh = _filter_by_age(items, NEWS_MAX_AGE_HOURS, keep_undated=False)
+    # Weekend tends to have fewer fresh items; widen recency window to improve recall.
+    wd = jst_now().weekday()  # 0=Mon .. 6=Sun
+    max_age = NEWS_MAX_AGE_HOURS
+    fallback_age = NEWS_FALLBACK_MAX_AGE_HOURS
+    if wd >= 5:
+        max_age = max(max_age, 24.0)
+        fallback_age = max(fallback_age, 48.0)
+
+    fresh = _filter_by_age(items, max_age, keep_undated=False)
     if len(fresh) >= min(5, MAX_NEWS_CANDIDATES):
         items_use = fresh
-        age_used = NEWS_MAX_AGE_HOURS
+        age_used = max_age
     else:
-        items_use = _filter_by_age(items, NEWS_FALLBACK_MAX_AGE_HOURS, keep_undated=True)
-        age_used = NEWS_FALLBACK_MAX_AGE_HOURS
+        items_use = _filter_by_age(items, fallback_age, keep_undated=True)
+        age_used = fallback_age
 
     items_use = items_use[:MAX_NEWS_CANDIDATES]
 
     if DEBUG_AI:
-        print(f"[DEBUG] news candidates: total={len(items)} within{NEWS_MAX_AGE_HOURS}h={len(fresh)} using<= {age_used}h -> {len(items_use)}")
+        print(f"[DEBUG] news candidates: total={len(items)} within{max_age}h={len(fresh)} using<= {age_used}h -> {len(items_use)}")
         if items_use:
             print("[DEBUG] newest candidate published_utc:", items_use[0].get("published_utc"))
 
@@ -643,9 +653,11 @@ def extract_block(text: str, start: str, end: str) -> Optional[str]:
 # =========================
 def ai_propose_rss_queries_default(feat: pd.DataFrame, regime: str, reason: str) -> Tuple[List[Dict], List[str]]:
     fallback = [
-        {"label": "中東 原油 供給 リスク - risk-off時の定番", "q": "中東 原油 供給 リスク", "lang": "ja"},
-        {"label": "Taiwan China military tension - 地政学リスク", "q": "Taiwan China military tension", "lang": "en"},
-        {"label": "Russia Ukraine sanctions energy prices - 制裁/エネルギー", "q": "Russia Ukraine sanctions energy prices", "lang": "en"},
+        {"label": "為替/当局発言（ドル円）", "q": "ドル円 当局 発言", "lang": "ja"},
+        {"label": "米金利/米国債利回り", "q": "米 長期金利 利回り", "lang": "ja"},
+        {"label": "株式市場 全体（米株）", "q": "米株 市場", "lang": "ja"},
+        {"label": "stock market (broad)", "q": "stock market", "lang": "en"},
+        {"label": "Japan stocks (broad)", "q": "Nikkei market", "lang": "en"},
     ]
 
     if not ENABLE_AI:
@@ -665,6 +677,13 @@ def ai_propose_rss_queries_default(feat: pd.DataFrame, regime: str, reason: str)
     user = f"""
 次の市場状況に合う「Google News RSS 検索クエリ」を最大{MAX_RSS_QUERIES}本提案して。
 日英ミックスOK。地政学とマクロ（米金利/原油/制裁/台湾/中東など）を広くカバーしつつ、今の数値に寄せて。
+
+【重要な検索クエリ作成ルール】
+- query は原則「2〜3語」、最大でも4語まで。
+- 単語を1クエリに詰め込みすぎない（ANDを強くしすぎない）。
+- 同じテーマは短いクエリを分割して提案する。
+- USDJPY/VIX/SPXなどの指標名は原則queryに入れない。
+
 
 Regime: {regime}
 Reason: {reason}
@@ -710,9 +729,11 @@ query は Google News 検索文字列
 
 def build_shock_rss_queries() -> Tuple[List[Dict], List[str]]:
     queries = [
-        {"label": "為替介入・当局発言（円/ドル）", "q": "為替介入 当局 発言 ドル円", "lang": "ja"},
-        {"label": "FRB/米金利/金融政策", "q": "FRB chair nomination yields rate cut hike", "lang": "en"},
-        {"label": "株急落/ボラ急騰/リスクオフ", "q": "stocks plunge risk-off volatility spike", "lang": "en"},
+        {"label": "為替/介入・当局（ドル円）", "q": "ドル円 当局 発言 介入", "lang": "ja"},
+        {"label": "米金利/米国債利回り", "q": "米 長期金利 利回り", "lang": "ja"},
+        {"label": "Risk-off / volatility", "q": "risk-off volatility markets", "lang": "en"},
+        {"label": "US stock market (broad)", "q": "stock market moves", "lang": "en"},
+        {"label": "日本株 市場（broad）", "q": "日経平均 市場", "lang": "ja"},
     ]
     urls = [build_google_news_rss_url(x["q"], x["lang"]) for x in queries[:MAX_RSS_QUERIES]]
     return queries[:MAX_RSS_QUERIES], urls
