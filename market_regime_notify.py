@@ -647,6 +647,17 @@ def extract_block(text: str, start: str, end: str) -> Optional[str]:
         return None
     return m.group(1).strip()
 
+def extract_block_allow_no_end(text: str, start: str, end: str) -> Optional[str]:
+    """Extract block; if end marker missing, return everything after start (best-effort)."""
+    m = re.search(re.escape(start) + r"(.*?)" + re.escape(end), text, flags=re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    m2 = re.search(re.escape(start) + r"(.*)$", text, flags=re.DOTALL)
+    if not m2:
+        return None
+    return m2.group(1).strip()
+
+
 
 # =========================
 # AI query builders
@@ -826,7 +837,7 @@ market: {json.dumps(market, ensure_ascii=False)}
     if not text:
         return None
     msg1 = extract_block(text, "<<<MSG1>>>", "<<<ENDMSG1>>>")
-    msg2 = extract_block(text, "<<<MSG2>>>", "<<<ENDMSG2>>>")
+    msg2 = extract_block_allow_no_end(text, "<<<MSG2>>>", "<<<ENDMSG2>>>")
     if not msg1 or not msg2:
         return None
     return msg1, msg2
@@ -908,7 +919,7 @@ def ai_build_messages_shock(
     if not text:
         return None
     msg1 = extract_block(text, "<<<MSG1>>>", "<<<ENDMSG1>>>")
-    msg2 = extract_block(text, "<<<MSG2>>>", "<<<ENDMSG2>>>")
+    msg2 = extract_block_allow_no_end(text, "<<<MSG2>>>", "<<<ENDMSG2>>>")
     if not msg1 or not msg2:
         return None
     return msg1, msg2
