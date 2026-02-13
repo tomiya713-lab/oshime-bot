@@ -76,7 +76,7 @@ OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_OUTPUT_TOKENS", "900"))
 OPENAI_TIMEOUT_SEC = int(os.environ.get("OPENAI_TIMEOUT_SEC", "30"))
 OPENAI_RETRIES = int(os.environ.get("OPENAI_RETRIES", "2"))
 
-MAX_RSS_QUERIES = int(os.environ.get("MAX_RSS_QUERIES", "5"))
+MAX_RSS_QUERIES = int(os.environ.get("MAX_RSS_QUERIES", "6"))
 RSS_ITEMS_PER_QUERY = int(os.environ.get("RSS_ITEMS_PER_QUERY", "10"))
 MAX_NEWS_CANDIDATES = int(os.environ.get("MAX_NEWS_CANDIDATES", "30"))
 NEWS_PICK_MAX = int(os.environ.get("NEWS_PICK_MAX", "5"))
@@ -664,9 +664,10 @@ def extract_block_allow_no_end(text: str, start: str, end: str) -> Optional[str]
 # =========================
 def ai_propose_rss_queries_default(feat: pd.DataFrame, regime: str, reason: str) -> Tuple[List[Dict], List[str]]:
     fallback = [
-        {"label": "為替/当局発言（ドル円）", "q": "ドル円 当局 発言", "lang": "ja"},
-        {"label": "米金利/米国債利回り", "q": "米 長期金利 利回り", "lang": "ja"},
-        {"label": "株式市場 全体（米株）", "q": "米株 市場", "lang": "ja"},
+        {"label": "為替（ドル円）", "q": "ドル円 急", "lang": "ja"},
+        {"label": "米金利", "q": "米 金利 ", "lang": "ja"},
+        {"label": "株式市場 全体（米株）", "q": "ダウ 急", "lang": "ja"},
+        {"label": "株式市場 全体（米株）", "q": "日経 急", "lang": "ja"},
         {"label": "stock market (broad)", "q": "stock market", "lang": "en"},
         {"label": "Japan stocks (broad)", "q": "Nikkei market", "lang": "en"},
     ]
