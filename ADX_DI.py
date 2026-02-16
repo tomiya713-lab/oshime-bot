@@ -62,8 +62,9 @@ ATR_MAX_PCT = 6.0
 BB_TOUCH_MIN = 3
 SMA_SLOPE_MAX_PCT = 5.0
 
+SMA_SLOPE_MIN_PCT = -1.0
 DI_DIFF_MAX = float(os.getenv("DI_DIFF_MAX", "7.0"))
-DI_RATIO_MIN = float(os.getenv("DI_RATIO_MIN", "1.03"))
+DI_RATIO_MIN = float(os.getenv("DI_RATIO_MIN", "0.95"))
 RANGE_LOWER_TOLERANCE_PCT = float(os.getenv("RANGE_LOWER_TOLERANCE_PCT", "2.0"))  # within +2% of lower range
 
 # Output dirs
@@ -437,8 +438,7 @@ def calc_latest_metrics(raw_df: pd.DataFrame, ticker: str) -> Optional[Dict[str,
             (not math.isnan(adx_v) and adx_v <= ADX_MAX) and
             (not math.isnan(atr_pct) and (ATR_MIN_PCT <= atr_pct <= ATR_MAX_PCT)) and
             (touches >= BB_TOUCH_MIN) and
-            (not math.isnan(sma_slope) and abs(sma_slope) <= SMA_SLOPE_MAX_PCT) and
-            (not math.isnan(di_diff) and di_diff <= DI_DIFF_MAX) and
+            (not math.isnan(sma_slope) and (SMA_SLOPE_MIN_PCT <= sma_slope <= SMA_SLOPE_MAX_PCT)) and
             (not math.isnan(di_ratio) and di_ratio >= DI_RATIO_MIN) and
             (not math.isnan(lower_dist_pct) and lower_dist_pct <= RANGE_LOWER_TOLERANCE_PCT)
         )
