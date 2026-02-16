@@ -64,6 +64,7 @@ SMA_SLOPE_MAX_PCT = 5.0
 
 DI_DIFF_MAX = float(os.getenv("DI_DIFF_MAX", "7.0"))
 DI_RATIO_MIN = float(os.getenv("DI_RATIO_MIN", "1.03"))
+RANGE_LOWER_TOLERANCE_PCT = float(os.getenv("RANGE_LOWER_TOLERANCE_PCT", "2.0"))  # within +2% of lower range
 
 # Output dirs
 METRICS_OUT_DIR = os.getenv("METRICS_OUT_DIR", "reports")
@@ -429,6 +430,7 @@ def calc_latest_metrics(raw_df: pd.DataFrame, ticker: str) -> Optional[Dict[str,
 
         bb_up_1 = float(bb_up.iloc[-1]) if not pd.isna(bb_up.iloc[-1]) else float("nan")
         bb_dn_1 = float(bb_dn.iloc[-1]) if not pd.isna(bb_dn.iloc[-1]) else float("nan")
+        lower_dist_pct = ((last_close / bb_dn_1) - 1.0) * 100.0 if (not math.isnan(bb_dn_1) and bb_dn_1 != 0) else float("nan")
         bottom_rise_ratio = (bb_up_1 / bb_dn_1) if (not math.isnan(bb_up_1) and not math.isnan(bb_dn_1) and bb_dn_1 != 0) else float("nan")
 
         passed = (
@@ -437,7 +439,8 @@ def calc_latest_metrics(raw_df: pd.DataFrame, ticker: str) -> Optional[Dict[str,
             (touches >= BB_TOUCH_MIN) and
             (not math.isnan(sma_slope) and abs(sma_slope) <= SMA_SLOPE_MAX_PCT) and
             (not math.isnan(di_diff) and di_diff <= DI_DIFF_MAX) and
-            (not math.isnan(di_ratio) and di_ratio >= DI_RATIO_MIN)
+            (not math.isnan(di_ratio) and di_ratio >= DI_RATIO_MIN) and
+            (not math.isnan(lower_dist_pct) and lower_dist_pct <= RANGE_LOWER_TOLERANCE_PCT)
         )
 
         return {
@@ -448,6 +451,7 @@ def calc_latest_metrics(raw_df: pd.DataFrame, ticker: str) -> Optional[Dict[str,
             "ADX": adx_v,
             "DI_diff": di_diff,
             "DI_ratio": di_ratio,
+            "Lower_dist_pct": lower_dist_pct,
             "BB_touches": touches,
             "BB_dn1": bb_dn_1,
             "BB_up1": bb_up_1,
