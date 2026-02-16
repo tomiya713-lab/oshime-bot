@@ -60,7 +60,7 @@ jobs:
         run: |
           python ADX_DI.py
           python GC_MACD_BB.py
-          python main_rsi.py
+          # python main_rsi.py
 
       - name: Upload metrics CSV
         if: always()
