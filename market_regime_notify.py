@@ -62,48 +62,24 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import font_manager as fm
 
-
 # =========================
-# Matplotlib font (Japanese)
+# Font (Japanese) for matplotlib table rendering
+# Put ipaexg.ttf (IPAexGothic) in the same folder as this script to avoid mojibake.
 # =========================
-def _setup_matplotlib_japanese_font() -> None:
-    """Best-effort: set a Japanese-capable font to avoid mojibake in PNG tables."""
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_FONT_PATH = os.path.join(_HERE, "ipaexg.ttf")
+_FONT_PROP = None
+if os.path.exists(_FONT_PATH):
     try:
-        # Try common IPAexGothic locations (local + typical Linux font dirs)
-        candidates = [
-            os.environ.get("JP_FONT_PATH", "").strip(),
-            "./ipaexg.ttf",
-            "./IPAexGothic.ttf",
-            "/usr/share/fonts/truetype/ipaexg.ttf",
-            "/usr/share/fonts/truetype/ipaexg/ipaexg.ttf",
-            "/usr/share/fonts/opentype/ipaexg/ipaexg.ttf",
-            "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
-        ]
-        candidates = [p for p in candidates if p]
-        chosen = None
-        for p in candidates:
-            if os.path.exists(p):
-                chosen = p
-                break
-
-        if chosen:
-            fm.fontManager.addfont(chosen)
-            # Use the font's internal family name when possible
-            try:
-                prop = fm.FontProperties(fname=chosen)
-                family = prop.get_name()
-            except Exception:
-                family = "IPAexGothic"
-            plt.rcParams["font.family"] = family
-
-        # Ensure minus sign renders correctly with JP fonts
+        fm.fontManager.addfont(_FONT_PATH)
+        plt.rcParams["font.family"] = "IPAexGothic"
         plt.rcParams["axes.unicode_minus"] = False
-    except Exception:
-        # If anything goes wrong, keep matplotlib defaults.
-        pass
-
-
-_setup_matplotlib_japanese_font()
+        _FONT_PROP = fm.FontProperties(fname=_FONT_PATH)
+        print(f"[FONT OK] {_FONT_PATH}")
+    except Exception as _e:
+        print(f"[WARN] failed to load font: {_FONT_PATH} ({_e})")
+else:
+    print(f"[WARN] font not found: {_FONT_PATH}")
 
 
 # =========================
@@ -313,8 +289,7 @@ def build_features() -> pd.DataFrame:
         chg5 = (daily["close"].pct_change(5).iloc[-1] * 100.0) if len(daily) >= 6 else None
         z20 = zscore(daily["close"], Z_WINDOW).iloc[-1] if len(daily) >= Z_WINDOW else None
 
-        intra_close, intra_chg_15m = None, None
-        intra_delta_15m = None
+        intra_close, intra_chg_15m, intra_delta_15m = None, None, None
         intra_chg_lb, intra_delta_lb = None, None
         if not intra.empty and "close" in intra.columns and len(intra) >= 2:
             intra_close = intra["close"].iloc[-1]
@@ -341,23 +316,19 @@ def build_features() -> pd.DataFrame:
 def eval_regime(feat: pd.DataFrame) -> Tuple[str, str]:
     vix_row = feat.loc[feat["symbol"] == "VIX"].iloc[0].to_dict()
     vix = safe_float(vix_row.get("daily_close"))
-    vix15 = safe_float(vix_row.get("intraday_%chg_last15m"))
+    vix15_pct = safe_float(vix_row.get("intraday_%chg_last15m"))
     vix15_delta = safe_float(vix_row.get("intraday_delta_last15m"))
 
     if vix is None:
         return "NORMAL", "VIX data missing"
 
     reason = f"VIX={vix:.2f}"
-    # Display VIX short-term move as absolute points (Δ), not percent.
     if vix15_delta is not None:
         reason += f" | VIX15mΔ{vix15_delta:+.2f}"
-    elif vix15 is not None:
-        # Fallback to percent when delta is missing.
-        reason += f" | VIX15m{vix15:+.2f}%"
 
-    if (vix >= 25) or (vix15 is not None and vix15 >= 10):
+    if (vix >= 25) or (vix15_pct is not None and vix15_pct >= 10):
         return "CRISIS", reason
-    if (vix >= 18) or (vix15 is not None and vix15 >= 6):
+    if (vix >= 18) or (vix15_pct is not None and vix15_pct >= 6):
         return "ALERT", reason
     return "NORMAL", reason
 
@@ -445,36 +416,34 @@ def render_table_png(feat: pd.DataFrame, title: str, out_path: str) -> None:
     ]
     df = df[display_cols]
     df = df.rename(columns={
-        "daily_%chg_1d": "1d%",
-        "daily_%chg_5d": "5d%",
-        "intraday_close_15m": "intra_close",
-        "intraday_%chg_last15m": "15m%",
-        "intraday_%chg_lookback": f"{SHOCK_LOOKBACK_BARS}bars%",
-        "zscore_20d": "z20",
-    })
-    for c in df.columns:
-        if c != "symbol":
-            df[c] = df[c].apply(fmt_val)
-
-    # ---- display labels (Japanese) ----
-    # Keep internal column names for computation; only the table display is translated here.
-    df = df.rename(columns={
         "symbol": "指標",
         "daily_close": "終値",
-        "1d%": "前日比%",
-        "5d%": "5日%",
-        "intra_close": "直近15分値",
-        "15m%": "15分変化%",
-        f"{SHOCK_LOOKBACK_BARS}bars%": "直近6時間%",
-        "z20": "Zスコア(20日)",
+        "daily_%chg_1d": "前日比%",
+        "daily_%chg_5d": "5日%",
+        "intraday_close_15m": "直近15分値",
+        "intraday_%chg_last15m": "15分変化%",
+        "intraday_%chg_lookback": f"直近{int(SHOCK_LOOKBACK_BARS*15/60)}時間%",
+        "zscore_20d": "Zスコア(20日)",
     })
+    for c in df.columns:
+        if c != "指標":
+            df[c] = df[c].apply(fmt_val)
+
+    # FontProperties (best-effort) to avoid mojibake in headless environments
+    fp = _FONT_PROP
 
     fig_w = 10
     fig_h = 2.0 + 0.35 * (len(df) + 1)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     ax.axis("off")
-    ax.set_title(title, fontsize=14, pad=12)
+    ax.set_title(title, fontsize=14, pad=12, fontproperties=fp)
     table = ax.table(cellText=df.values, colLabels=df.columns, cellLoc="center", loc="center")
+    if fp is not None:
+        for cell in table.get_celld().values():
+            try:
+                cell.get_text().set_fontproperties(fp)
+            except Exception:
+                pass
     table.auto_set_font_size(False)
     table.set_fontsize(11)
     table.scale(1, 1.4)
@@ -843,7 +812,6 @@ def ai_build_messages_default(
             "chg1": safe_float(row.get("daily_%chg_1d")),
             "chg5": safe_float(row.get("daily_%chg_5d")),
             "chg15": safe_float(row.get("intraday_%chg_last15m")),
-            "delta15": safe_float(row.get("intraday_delta_last15m")),
             "chgLB": safe_float(row.get("intraday_%chg_lookback")),
             "deltaLB": safe_float(row.get("intraday_delta_lookback")),
         }
@@ -873,11 +841,16 @@ reason: {reason}
 lookback: 15m×{SHOCK_LOOKBACK_BARS}bars
 market: {json.dumps(market, ensure_ascii=False)}
 
+【表記ルール（厳守）】
+- USDJPY：変化は「円（Δ）」で書く（例：+0.15円）。水準も併記（例：154.99円）
+- VIX：変化は「ポイント（Δ）」で書く（例：-0.96pt）。水準も併記（例：19.08）
+- SPX：変化は「%」で書く（例：+0.65%）。水準も併記（例：6910.22）
+- 日経先物（NIKKEI_FUT）：変化は「%」で書く（例：-0.03%）。水準も併記（例：57110）
+
 【要件】
 (1) 1通目：結論＋解釈（短い）
 - Regime（NORMAL/ALERT/CRISIS）
 - なぜそう見えるか（VIX/円/日経先物/米株の変化を日本語で1〜3行）
-  - **VIXの短期変化は「%」ではなく「ポイント（Δ）」で書く**（market.VIX.delta15 を使う）
 - 監視ポイント（次の1〜2時間で見るべき指標）
 
 (2) 2通目：ニュース（最大3本）
@@ -954,13 +927,18 @@ def ai_build_messages_shock(
 【市場変化（数値）】
 {json.dumps(chg, ensure_ascii=False)}
 
+【表記ルール（厳守）】
+- USDJPY：変化は「円（Δ）」で書く（例：+0.15円）。水準も併記（例：154.99円）
+- VIX：変化は「ポイント（Δ）」で書く（例：-0.96pt）。水準も併記（例：19.08）
+- SPX：変化は「%」で書く（例：+0.65%）。水準も併記（例：6910.22）
+- 日経先物（NIKKEI_FUT）：変化は「%」で書く（例：-0.03%）。水準も併記（例：57110）
+
 【やってほしいこと】
 市場変化を引き起こした可能性が高いニュースを探して、要約しつつ、市場変化の理由と今後の市場動向を予測して
 
 【出力要件（2メッセージ、区切り厳守）】
 (1) 1通目：原因と状況（短く）
 - 何が起きたか（USDJPY/VIX/SPX/日経先物の変化）
-  - **VIXの短期変化は「%」ではなく「ポイント（Δ）」で書く**（市場変化（数値）の VIX.delta を使う）
 - 可能性が高い原因（ニュース要約を混ぜて）
 - 次に見るポイント（具体的に）
 
