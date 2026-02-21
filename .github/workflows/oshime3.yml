@@ -3,13 +3,14 @@ name: swing-metrics
 on:
   schedule:
     - cron: "0 23 * * *"   # JST 8:00（UTC 23:00）
-workflow_dispatch:
-  inputs:
-    force:
-      description: "Force run even if market is closed"
-      type: boolean
-      required: false
-      default: false
+
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force run even if market is closed"
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}
