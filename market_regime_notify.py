@@ -60,6 +60,50 @@ from openai import OpenAI
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import font_manager as fm
+
+
+# =========================
+# Matplotlib font (Japanese)
+# =========================
+def _setup_matplotlib_japanese_font() -> None:
+    """Best-effort: set a Japanese-capable font to avoid mojibake in PNG tables."""
+    try:
+        # Try common IPAexGothic locations (local + typical Linux font dirs)
+        candidates = [
+            os.environ.get("JP_FONT_PATH", "").strip(),
+            "./ipaexg.ttf",
+            "./IPAexGothic.ttf",
+            "/usr/share/fonts/truetype/ipaexg.ttf",
+            "/usr/share/fonts/truetype/ipaexg/ipaexg.ttf",
+            "/usr/share/fonts/opentype/ipaexg/ipaexg.ttf",
+            "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+        ]
+        candidates = [p for p in candidates if p]
+        chosen = None
+        for p in candidates:
+            if os.path.exists(p):
+                chosen = p
+                break
+
+        if chosen:
+            fm.fontManager.addfont(chosen)
+            # Use the font's internal family name when possible
+            try:
+                prop = fm.FontProperties(fname=chosen)
+                family = prop.get_name()
+            except Exception:
+                family = "IPAexGothic"
+            plt.rcParams["font.family"] = family
+
+        # Ensure minus sign renders correctly with JP fonts
+        plt.rcParams["axes.unicode_minus"] = False
+    except Exception:
+        # If anything goes wrong, keep matplotlib defaults.
+        pass
+
+
+_setup_matplotlib_japanese_font()
 
 
 # =========================
@@ -257,6 +301,7 @@ def build_features() -> pd.DataFrame:
                 "daily_%chg_5d": None,
                 "intraday_close_15m": None,
                 "intraday_%chg_last15m": None,
+                "intraday_delta_last15m": None,
                 "intraday_%chg_lookback": None,
                 "intraday_delta_lookback": None,
                 "zscore_20d": None,
@@ -269,10 +314,12 @@ def build_features() -> pd.DataFrame:
         z20 = zscore(daily["close"], Z_WINDOW).iloc[-1] if len(daily) >= Z_WINDOW else None
 
         intra_close, intra_chg_15m = None, None
+        intra_delta_15m = None
         intra_chg_lb, intra_delta_lb = None, None
         if not intra.empty and "close" in intra.columns and len(intra) >= 2:
             intra_close = intra["close"].iloc[-1]
             intra_chg_15m = intra["close"].pct_change(1).iloc[-1] * 100.0
+            intra_delta_15m = _delta_over_bars(intra["close"], 1)
             intra_chg_lb = _pct_change_over_bars(intra["close"], SHOCK_LOOKBACK_BARS)
             intra_delta_lb = _delta_over_bars(intra["close"], SHOCK_LOOKBACK_BARS)
 
@@ -284,6 +331,7 @@ def build_features() -> pd.DataFrame:
             "daily_%chg_5d": float(chg5) if chg5 is not None and pd.notna(chg5) else None,
             "intraday_close_15m": float(intra_close) if intra_close is not None and pd.notna(intra_close) else None,
             "intraday_%chg_last15m": float(intra_chg_15m) if intra_chg_15m is not None and pd.notna(intra_chg_15m) else None,
+            "intraday_delta_last15m": float(intra_delta_15m) if intra_delta_15m is not None and pd.notna(intra_delta_15m) else None,
             "intraday_%chg_lookback": float(intra_chg_lb) if intra_chg_lb is not None and pd.notna(intra_chg_lb) else None,
             "intraday_delta_lookback": float(intra_delta_lb) if intra_delta_lb is not None and pd.notna(intra_delta_lb) else None,
             "zscore_20d": float(z20) if z20 is not None and pd.notna(z20) else None,
@@ -294,12 +342,17 @@ def eval_regime(feat: pd.DataFrame) -> Tuple[str, str]:
     vix_row = feat.loc[feat["symbol"] == "VIX"].iloc[0].to_dict()
     vix = safe_float(vix_row.get("daily_close"))
     vix15 = safe_float(vix_row.get("intraday_%chg_last15m"))
+    vix15_delta = safe_float(vix_row.get("intraday_delta_last15m"))
 
     if vix is None:
         return "NORMAL", "VIX data missing"
 
     reason = f"VIX={vix:.2f}"
-    if vix15 is not None:
+    # Display VIX short-term move as absolute points (Δ), not percent.
+    if vix15_delta is not None:
+        reason += f" | VIX15mΔ{vix15_delta:+.2f}"
+    elif vix15 is not None:
+        # Fallback to percent when delta is missing.
         reason += f" | VIX15m{vix15:+.2f}%"
 
     if (vix >= 25) or (vix15 is not None and vix15 >= 10):
@@ -696,6 +749,7 @@ def ai_propose_rss_queries_default(feat: pd.DataFrame, regime: str, reason: str)
 
     vix = safe_float(feat.loc[feat["symbol"] == "VIX", "daily_close"].iloc[0])
     vix15 = safe_float(feat.loc[feat["symbol"] == "VIX", "intraday_%chg_last15m"].iloc[0])
+    vix15_delta = safe_float(feat.loc[feat["symbol"] == "VIX", "intraday_delta_last15m"].iloc[0])
     usdjpy = safe_float(feat.loc[feat["symbol"] == "USDJPY", "daily_close"].iloc[0])
 
     system = "You are a markets+geopolitics assistant. Follow the output format strictly."
@@ -712,7 +766,7 @@ def ai_propose_rss_queries_default(feat: pd.DataFrame, regime: str, reason: str)
 
 Regime: {regime}
 Reason: {reason}
-VIX: {vix}  VIX15m%: {vix15}  USDJPY: {usdjpy}
+VIX: {vix}  VIX15mΔ: {vix15_delta}  USDJPY: {usdjpy}
 
 出力は必ずこの形式（各行1件、合計{MAX_RSS_QUERIES}行）:
 lang|label|query
@@ -789,6 +843,7 @@ def ai_build_messages_default(
             "chg1": safe_float(row.get("daily_%chg_1d")),
             "chg5": safe_float(row.get("daily_%chg_5d")),
             "chg15": safe_float(row.get("intraday_%chg_last15m")),
+            "delta15": safe_float(row.get("intraday_delta_last15m")),
             "chgLB": safe_float(row.get("intraday_%chg_lookback")),
             "deltaLB": safe_float(row.get("intraday_delta_lookback")),
         }
@@ -822,6 +877,7 @@ market: {json.dumps(market, ensure_ascii=False)}
 (1) 1通目：結論＋解釈（短い）
 - Regime（NORMAL/ALERT/CRISIS）
 - なぜそう見えるか（VIX/円/日経先物/米株の変化を日本語で1〜3行）
+  - **VIXの短期変化は「%」ではなく「ポイント（Δ）」で書く**（market.VIX.delta15 を使う）
 - 監視ポイント（次の1〜2時間で見るべき指標）
 
 (2) 2通目：ニュース（最大3本）
@@ -904,6 +960,7 @@ def ai_build_messages_shock(
 【出力要件（2メッセージ、区切り厳守）】
 (1) 1通目：原因と状況（短く）
 - 何が起きたか（USDJPY/VIX/SPX/日経先物の変化）
+  - **VIXの短期変化は「%」ではなく「ポイント（Δ）」で書く**（市場変化（数値）の VIX.delta を使う）
 - 可能性が高い原因（ニュース要約を混ぜて）
 - 次に見るポイント（具体的に）
 
