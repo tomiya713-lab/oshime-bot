@@ -403,6 +403,19 @@ def render_table_png(feat: pd.DataFrame, title: str, out_path: str) -> None:
         if c != "symbol":
             df[c] = df[c].apply(fmt_val)
 
+    # ---- display labels (Japanese) ----
+    # Keep internal column names for computation; only the table display is translated here.
+    df = df.rename(columns={
+        "symbol": "指標",
+        "daily_close": "終値",
+        "1d%": "前日比%",
+        "5d%": "5日%",
+        "intra_close": "直近15分値",
+        "15m%": "15分変化%",
+        f"{SHOCK_LOOKBACK_BARS}bars%": "直近6時間%",
+        "z20": "Zスコア(20日)",
+    })
+
     fig_w = 10
     fig_h = 2.0 + 0.35 * (len(df) + 1)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
