@@ -1007,152 +1007,33 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
     if "Expected_Up_pct" in df.columns:
         df = df.sort_values("Expected_Up_pct", ascending=False).reset_index(drop=True)
 
-    # --- Enrich PER/PBR for all tickers in Nikkei225 (for sector medians) ---
-    per_pbr_all: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
-    for t in nikkei225_tickers:
-        per_pbr_all[t] = fetch_per_pbr_from_info(t)
-
-    sector_map, sector_medians, overall_medians = build_sector_map_and_medians(nikkei225_tickers, per_pbr_all)
-
-    # --- Candidate enrich: PER/PBR + JQ + sector medians ---
-    candidates: List[Dict[str, Any]] = []
-    for _, r in df.iterrows():
-        t = r["Ticker"]
-        per, pbr = per_pbr_all.get(t, (None, None))
-        code4 = to_jq_code(t)
-        jq_row, jq_prev = jq_fetch_fins_summary(code4)
-        earn = build_earnings_summary(jq_row, jq_prev)
-
-        
-        s33 = sector_map.get(t, "")
-        med = sector_medians.get(s33, {})
-        per_med = med.get("per_median", float("nan"))
-        pbr_med = med.get("pbr_median", float("nan"))
-
-        median_source = "sector"
-        if (not np.isfinite(per_med)) or (not np.isfinite(pbr_med)):
-            # fallback to overall median if sector median is unavailable
-            per_med = overall_medians.get("per_median", float("nan"))
-            pbr_med = overall_medians.get("pbr_median", float("nan"))
-            median_source = "overall"
-
-        cand = {
-            "ticker": t,
-            "name": ticker_name_map.get(t, ""),
-            "price": float(r.get("Close", float("nan"))),
-            "per": per,
-            "pbr": pbr,
-            "sector33": s33,
-            "sector_per_median": None if math.isnan(per_med) else per_med,
-            "sector_pbr_median": None if math.isnan(pbr_med) else pbr_med,
-            "median_source": median_source,
-            "roe": earn.get("ROE_proxy"),
-            "earnings": {
-                "disc_date": earn.get("DiscDate"),
-                "period": earn.get("CurPerType"),
-                "sales": earn.get("Sales"),
-                "op": earn.get("OP"),
-                "np": earn.get("NP"),
-                "eps": earn.get("EPS"),
-                "bps": earn.get("BPS_approx"),
-                "yoy_sales": (earn.get("YoY", {}) or {}).get("Sales"),
-                "yoy_op": (earn.get("YoY", {}) or {}).get("OP"),
-                "yoy_np": (earn.get("YoY", {}) or {}).get("NP"),
-                "forecast": earn.get("Forecast", {}),
-            },
-            "tech": {
-                "atr_pct": float(r.get("ATR_pct", float("nan"))),
-                "adx": float(r.get("ADX", float("nan"))),
-                "di_diff": float(r.get("DI_diff", float("nan"))),
-                "bb_touches": int(r.get("BB_touches", 0)),
-                "sma_slope_pct": float(r.get("SMA_slope_pct", float("nan"))),
-            },
-        }
-        candidates.append(cand)
-        time.sleep(JQ_SLEEP_SEC)
-
-    # --- AI comment batch (only for hits) ---
-    ai_map: Dict[str, Dict[str, str]] = {}
-    if candidates and ENABLE_AI and (not AI_ONLY_ON_ALERT or True):
-        ai_map = ai_build_valuation_comments(candidates)
-
-    # --- Text summary message (compact; no duplicated table section) ---
+    # --- Text summary message (minimal) ---
     lines = [f"{title} {ts}", f"件数: {len(df)}"]
     for i, r in enumerate(df.head(20).itertuples(index=False), start=1):
         t = getattr(r, "Ticker")
         name = ticker_name_map.get(t, "")
-        per, pbr = per_pbr_all.get(t, (None, None))
-        ai = ai_map.get(t, {})
-        label = ai.get("label", "")
         lines.append(
             f"{i}. {t} {name}  "
-            f"BB2σタッチ:{fp(getattr(r,'Touch_Close',None),0)}  "
-            f"MA25:{fp(getattr(r,'SMA25',None),0)}  "
-            f"最新:{fp(getattr(r,'Close',None),0)}  "
+            f"BB2σタッチ:{fp(getattr(r,'Touch_Close',None),0)}円  "
+            f"MA25:{fp(getattr(r,'SMA25',None),0)}円  "
+            f"最新:{fp(getattr(r,'Close',None),0)}円  "
             f"期待上昇率(BB2σ÷最新):{fp(getattr(r,'Expected_Ratio',None),3)} ({fp(getattr(r,'Expected_Up_pct',None),2)}%)"
         )
     for msg in chunk_text("\n".join(lines)):
         discord_send_text(msg)
 
-    # --- Send charts with rich description (includes AI reason + fundamentals) ---
+    # --- Send charts (top N) with minimal description ---
     top = df.head(CHART_TOP_N)
     for _, rr in top.iterrows():
         t = rr["Ticker"]
         name = ticker_name_map.get(t, "")
-        per, pbr = per_pbr_all.get(t, (None, None))
 
-        # build desc
-        ai = ai_map.get(t, {})
-        label = ai.get("label", "")
-        reason = ai.get("reason", "")
-
-        # find candidate enriched
-        c = next((x for x in candidates if x["ticker"] == t), None) or {}
-        sector_per = c.get("sector_per_median")
-        sector_pbr = c.get("sector_pbr_median")
-        median_label = "業種中央値" if c.get("median_source") != "overall" else "全体中央値"
-        roe = c.get("roe")
-        ed = (c.get("earnings") or {})
-        disc = ed.get("disc_date") or "-"
-        period = ed.get("period") or "-"
-        sales = ed.get("sales")
-        op = ed.get("op")
-        np_ = ed.get("np")
-        yoy_sales = ed.get("yoy_sales")
-        yoy_op = ed.get("yoy_op")
-        yoy_np = ed.get("yoy_np")
-        price = float(rr.get("Close", float("nan")))
-
-        desc_lines = []
-        if label:
-            desc_lines.append(f"【評価】{label}  {reason}".strip())
-        # --- fair value (sector median based) ---
-        eps = (ed.get("eps") if isinstance(ed, dict) else None)
-        bps = (ed.get("bps") if isinstance(ed, dict) else None)
-        fair_pbr = fair_price(bps, sector_pbr)
-        fair_per = fair_price(eps, sector_per)
-
-        desc_lines.append(fmt_fair("理論株価(PBR基準)", price, fair_pbr))
-        desc_lines.append(fmt_fair("理論株価(PER基準)", price, fair_per))
-
-        # --- kabuyoho-style ranges (stock's own 75d PER/PBR distribution) ---
-        closes_75 = _series_from_raw(raw_df, "Close", t)
-        ranges = compute_valuation_ranges_75d(closes_75, eps, bps, window=75)
-        desc_lines.append(fmt_price_range("レンジ(PBR/75日)", ranges.get("price_pbr_low"), ranges.get("price_pbr_high")))
-        desc_lines.append(fmt_price_range("レンジ(PER/75日)", ranges.get("price_per_low"), ranges.get("price_per_high")))
-
-        desc_lines.append(
-            f"{fmt_vs_median('PBR', pbr, sector_pbr, 2, 2, median_label=median_label)} / {fmt_vs_median('PER', per, sector_per, 2, 2, median_label=median_label)} / ROE(簡易):{fp(roe*100 if roe is not None else None,1)}%"
+        desc = (
+            f"BB2σタッチ: {fp(rr.get('Touch_Close'),0)}円 / "
+            f"MA25: {fp(rr.get('SMA25'),0)}円 / "
+            f"最新: {fp(rr.get('Close'),0)}円 / "
+            f"期待上昇率(BB2σ÷最新): {fp(rr.get('Expected_Ratio'),3)} ({fp(rr.get('Expected_Up_pct'),2)}%)"
         )
-        desc_lines.append(
-            f"決算:{disc} {period}  売上:{fp(sales/1e8 if sales else None,1)}億({fmt_yoy(yoy_sales)})  営業益:{fp(op/1e8 if op else None,1)}億({fmt_yoy(yoy_op)})  純益:{fp(np_/1e8 if np_ else None,1)}億({fmt_yoy(yoy_np)})"
-        )
-
-        desc_lines.append(
-            f"BB2σタッチ: {fp(rr.get('Touch_Close'),0)}円 / MA25: {fp(rr.get('SMA25'),0)}円 / 最新: {fp(rr.get('Close'),0)}円 / 期待上昇率(BB2σ÷最新): {fp(rr.get('Expected_Ratio'),3)} ({fp(rr.get('Expected_Up_pct'),2)}%)"
-        )
-
-        desc = "\n".join([s for s in desc_lines if s.strip()])
 
         img = save_chart_image_with_bb1sigma(raw_df, t, out_dir=CHART_OUT_DIR)
         if img:
