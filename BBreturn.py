@@ -1003,6 +1003,10 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
         discord_send_text(f"{title} {ts}\n該当なし")
         return
 
+    # Sort by expected upside (BB2σ ÷ latest) desc so both list and charts follow this order
+    if "Expected_Up_pct" in df.columns:
+        df = df.sort_values("Expected_Up_pct", ascending=False).reset_index(drop=True)
+
     # --- Enrich PER/PBR for all tickers in Nikkei225 (for sector medians) ---
     per_pbr_all: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
     for t in nikkei225_tickers:
