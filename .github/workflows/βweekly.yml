@@ -1,17 +1,24 @@
-name: Weekly Beta (Nikkei225)
+name: Weekly Beta (beta_weekly)
 
 on:
-  # 手動実行（強制実行ボタン）
   workflow_dispatch:
+    inputs:
+      force:
+        description: "強制実行（スケジュール無視で手動実行）"
+        type: boolean
+        default: false
 
-  # 毎週 金曜 20:00 JST（= 11:00 UTC）
   schedule:
+    # Fri 20:00 JST == Fri 11:00 UTC
     - cron: '0 11 * * 5'
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: oshime-bot-beta-weekly
+      cancel-in-progress: true
 
     steps:
       - uses: actions/checkout@v4
@@ -32,9 +39,15 @@ jobs:
         run: |
           test -n "${{ secrets.JQUANTS_API_KEY }}" || (echo "Missing JQUANTS_API_KEY" && exit 1)
 
-      - name: Run beta weekly
+      - name: Run beta_weekly
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+
+          # 手動実行でチェックONなら FORCE_RUN=1（beta_weekly.py側で使わなくてもOK）
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force && '1' || '' }}
+
+          # 任意：出力先を変えたいなら（デフォルト reports/beta）
+          # BETA_OUT_DIR: reports/beta
         run: python beta_weekly.py
 
       - name: Upload beta CSV
