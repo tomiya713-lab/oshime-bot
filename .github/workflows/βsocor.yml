@@ -1,10 +1,11 @@
 name: Weekly Beta (Nikkei225)
 
 on:
+  # 手動実行（強制実行ボタン）
   workflow_dispatch:
 
+  # 毎週 金曜 20:00 JST（= 11:00 UTC）
   schedule:
-    # Fri 20:00 JST == Fri 11:00 UTC
     - cron: '0 11 * * 5'
 
 jobs:
@@ -34,8 +35,6 @@ jobs:
       - name: Run beta weekly
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
-          # 任意：出力先を変えたいなら
-          # BETA_OUT_DIR: reports/beta
         run: python beta_weekly.py
 
       - name: Upload beta CSV
