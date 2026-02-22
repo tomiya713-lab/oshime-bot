@@ -436,6 +436,7 @@ def calc_latest_metrics(raw_df: pd.DataFrame, ticker: str) -> Optional[Dict[str,
         lower_dist_pct = ((last_close / bb_dn_1) - 1.0) * 100.0 if (not math.isnan(bb_dn_1) and bb_dn_1 != 0) else float("nan")
         bottom_rise_ratio = (bb_up_1 / bb_dn_1) if (not math.isnan(bb_up_1) and not math.isnan(bb_dn_1) and bb_dn_1 != 0) else float("nan")
 
+
         # --- Condition (user-defined) ---
         # ① Within the last ~2 weeks (last 10 trading days, excluding today),
         #    Close >= (SMA25 Bollinger +2σ) * 0.98 at least once.
@@ -444,15 +445,43 @@ def calc_latest_metrics(raw_df: pd.DataFrame, ticker: str) -> Optional[Dict[str,
         recent_bb2 = bb_up_2.iloc[-11:-1]
 
         touched_2w = False
+        touch_close = float("nan")
+        touch_bb2 = float("nan")
+        touch_date = None
+
         if (recent_close is not None) and (recent_bb2 is not None) and (len(recent_close) > 0) and (len(recent_bb2) > 0):
             # align by index to be safe
             recent_bb2 = recent_bb2.reindex(recent_close.index)
-            touched_2w = bool((recent_close >= recent_bb2 * 0.98).fillna(False).any())
+            touch_mask = (recent_close >= recent_bb2 * 0.98).fillna(False)
+
+            if bool(touch_mask.any()):
+                touched_2w = True
+                # pick the most recent touch within the window
+                last_idx = touch_mask[touch_mask].index[-1]
+                try:
+                    touch_close = float(recent_close.loc[last_idx])
+                except Exception:
+                    touch_close = float("nan")
+                try:
+                    touch_bb2 = float(recent_bb2.loc[last_idx])
+                except Exception:
+                    touch_bb2 = float("nan")
+                # index is usually DatetimeIndex
+                try:
+                    touch_date = str(pd.to_datetime(last_idx).date())
+                except Exception:
+                    touch_date = str(last_idx)
 
         sma25_last = float(sma25.iloc[-1]) if not pd.isna(sma25.iloc[-1]) else float("nan")
+        bb2_today = float(bb_up_2.iloc[-1]) if not pd.isna(bb_up_2.iloc[-1]) else float("nan")
+
         near_sma_today = (not math.isnan(sma25_last)) and (last_close <= sma25_last * 1.02)
 
         passed = touched_2w and near_sma_today
+
+        expected_ratio = (bb2_today / last_close) if (not math.isnan(bb2_today) and last_close != 0) else float("nan")
+        expected_up_pct = (expected_ratio - 1.0) * 100.0 if not math.isnan(expected_ratio) else float("nan")
+
 
 
         return {
@@ -469,6 +498,13 @@ def calc_latest_metrics(raw_df: pd.DataFrame, ticker: str) -> Optional[Dict[str,
             "BB_up1": bb_up_1,
             "Bottom_Rise_Ratio": bottom_rise_ratio,
             "SMA_slope_pct": sma_slope,
+            "Touch_Date": touch_date,
+            "Touch_Close": touch_close,
+            "Touch_BB2": touch_bb2,
+            "SMA25": sma25_last,
+            "BB2_today": bb2_today,
+            "Expected_Ratio": expected_ratio,
+            "Expected_Up_pct": expected_up_pct,
             "Pass": bool(passed),
         }
     except Exception:
@@ -921,13 +957,25 @@ def save_chart_image_with_bb1sigma(raw_df: pd.DataFrame, ticker: str, out_dir: s
         df = pd.DataFrame({"Open": open_, "High": high, "Low": low, "Close": close, "Volume": vol}).dropna()
         df = df.tail(CHART_LOOKBACK_DAYS)
 
-        # BB ±1σ
-        ma, up, dn = calc_bb(df["Close"], 20, sigma=1.0)
+        # BB: add 1σ / 2σ / 3σ lines
+        ma, up1, dn1 = calc_bb(df["Close"], 20, sigma=1.0)
+
+        std20 = df["Close"].rolling(20, min_periods=20).std()
+        up2 = ma + 2.0 * std20
+        dn2 = ma - 2.0 * std20
+        up3 = ma + 3.0 * std20
+        dn3 = ma - 3.0 * std20
+
         apds = [
             mpf.make_addplot(ma, panel=0),
-            mpf.make_addplot(up, panel=0),
-            mpf.make_addplot(dn, panel=0),
+            mpf.make_addplot(up1, panel=0),
+            mpf.make_addplot(dn1, panel=0),
+            mpf.make_addplot(up2, panel=0),
+            mpf.make_addplot(dn2, panel=0),
+            mpf.make_addplot(up3, panel=0),
+            mpf.make_addplot(dn3, panel=0),
         ]
+
 
         path = os.path.join(out_dir, f"{ticker.replace('.','_')}_bb1s.png")
         mpf.plot(
@@ -1092,9 +1140,11 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
         desc_lines.append(
             f"決算:{disc} {period}  売上:{fp(sales/1e8 if sales else None,1)}億({fmt_yoy(yoy_sales)})  営業益:{fp(op/1e8 if op else None,1)}億({fmt_yoy(yoy_op)})  純益:{fp(np_/1e8 if np_ else None,1)}億({fmt_yoy(yoy_np)})"
         )
+
         desc_lines.append(
-            f"ATR%:{fp(rr.get('ATR_pct'),2)} ADX:{fp(rr.get('ADX'),1)} DIΔ:{fp(rr.get('DI_diff'),1)} SMA傾き%:{fp(rr.get('SMA_slope_pct'),2)}"
+            f"BB2σタッチ: {fp(rr.get('Touch_Close'),0)}円 / MA25: {fp(rr.get('SMA25'),0)}円 / 最新: {fp(rr.get('Close'),0)}円 / 期待上昇率(BB2σ÷最新): {fp(rr.get('Expected_Ratio'),3)} ({fp(rr.get('Expected_Up_pct'),2)}%)"
         )
+
         desc = "\n".join([s for s in desc_lines if s.strip()])
 
         img = save_chart_image_with_bb1sigma(raw_df, t, out_dir=CHART_OUT_DIR)
