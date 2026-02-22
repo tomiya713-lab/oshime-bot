@@ -967,13 +967,13 @@ def save_chart_image_with_bb1sigma(raw_df: pd.DataFrame, ticker: str, out_dir: s
         dn3 = ma - 3.0 * std20
 
         apds = [
-            mpf.make_addplot(ma, panel=0),
-            mpf.make_addplot(up1, panel=0),
-            mpf.make_addplot(dn1, panel=0),
-            mpf.make_addplot(up2, panel=0),
-            mpf.make_addplot(dn2, panel=0),
-            mpf.make_addplot(up3, panel=0),
-            mpf.make_addplot(dn3, panel=0),
+            mpf.make_addplot(ma, panel=0, color="blue"),
+            mpf.make_addplot(up1, panel=0, color="orange"),
+            mpf.make_addplot(dn1, panel=0, color="orange"),
+            mpf.make_addplot(up2, panel=0, color="red"),
+            mpf.make_addplot(dn2, panel=0, color="red"),
+            mpf.make_addplot(up3, panel=0, color="purple"),
+            mpf.make_addplot(dn3, panel=0, color="purple"),
         ]
 
 
@@ -998,7 +998,7 @@ def save_chart_image_with_bb1sigma(raw_df: pd.DataFrame, ticker: str, out_dir: s
 # =========================
 def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
     ts = now_jst().strftime("%m/%d %H:%M")
-    title = "【ATRレンジ候補（ADX≤25 × ATR% × BB±1σ × SMA × DI）】"
+    title = "【BB2σタッチ→MA25(+2%以内)】"
     if df is None or df.empty:
         discord_send_text(f"{title} {ts}\n該当なし")
         return
@@ -1081,8 +1081,11 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
         ai = ai_map.get(t, {})
         label = ai.get("label", "")
         lines.append(
-            f"{i}. {t} {name}  価格:{fp(getattr(r,'Close',None),0)}  PER:{fp(per,2)} PBR:{fp(pbr,2)}"
-            f"  {label}"
+            f"{i}. {t} {name}  "
+            f"BB2σタッチ:{fp(getattr(r,'Touch_Close',None),0)}  "
+            f"MA25:{fp(getattr(r,'SMA25',None),0)}  "
+            f"最新:{fp(getattr(r,'Close',None),0)}  "
+            f"期待上昇率(BB2σ÷最新):{fp(getattr(r,'Expected_Ratio',None),3)} ({fp(getattr(r,'Expected_Up_pct',None),2)}%)"
         )
     for msg in chunk_text("\n".join(lines)):
         discord_send_text(msg)
