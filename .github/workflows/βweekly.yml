@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: "強制実行（スケジュール無視で手動実行）"
+        description: "強制実行（手動実行で即時更新）"
         type: boolean
         default: false
 
@@ -42,15 +42,39 @@ jobs:
       - name: Run beta_weekly
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
-
-          # 手動実行でチェックONなら FORCE_RUN=1（beta_weekly.py側で使わなくてもOK）
+          # 手動実行でチェックONなら FORCE_RUN=1（beta_weekly.py側で未使用でもOK）
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force && '1' || '' }}
-
           # 任意：出力先を変えたいなら（デフォルト reports/beta）
           # BETA_OUT_DIR: reports/beta
         run: python beta_weekly.py
 
-      - name: Upload beta CSV
+      - name: Debug - list output files
+        if: always()
+        run: |
+          echo "pwd=$(pwd)"
+          echo "---- reports ----"
+          ls -la reports || true
+          echo "---- reports/beta ----"
+          ls -la reports/beta || true
+          echo "---- find reports ----"
+          find reports -type f -maxdepth 3 || true
+
+      - name: Commit and push beta reports
+        if: always()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          # add generated files
+          git add reports/beta/*.csv || true
+
+          # commit only if changed
+          git commit -m "Update beta reports" || echo "No changes to commit"
+
+          # push back to repo
+          git push
+
+      - name: Upload beta CSV (artifact)
         if: always()
         uses: actions/upload-artifact@v4
         with:
