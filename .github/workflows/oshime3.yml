@@ -57,7 +57,7 @@ jobs:
           # OPENAI_MODEL: "gpt-4.1-mini"
           # OPENAI_MAX_OUTPUT_TOKENS: "450"
         run: |
-         # python ADX_DI.py
+          python ADX_DI.py
           python BBreturn.py
          # python main_rsi.py
 
