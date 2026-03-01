@@ -996,6 +996,64 @@ def save_chart_image_with_bb1sigma(raw_df: pd.DataFrame, ticker: str, out_dir: s
 # =========================
 # Notify
 # =========================
+# --- Beta CSV (from repo) ---
+BETA_STOCK_CSV = os.getenv("BETA_STOCK_CSV", os.path.join("reports", "beta", "beta_by_stock.csv"))
+BETA_SECTOR_CSV = os.getenv("BETA_SECTOR_CSV", os.path.join("reports", "beta", "beta_by_sector.csv"))
+
+def load_beta_maps() -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
+    """Load beta metrics saved by beta_weekly.py.
+    Returns:
+      stock_map: {Ticker: {"Beta":..., "BetaScore":..., "S17Nm":...}}
+      sector_map:{S17Nm: {"SectorBeta":..., "SectorBetaScore":...}}
+    """
+    stock_map: Dict[str, Dict[str, float]] = {}
+    sector_map: Dict[str, Dict[str, float]] = {}
+
+    # Stock beta
+    try:
+        if os.path.exists(BETA_STOCK_CSV):
+            dfb = pd.read_csv(BETA_STOCK_CSV)
+            # expected cols: Ticker, Beta, S17Nm, BetaScore (others ignored)
+            for _, r in dfb.iterrows():
+                t = str(r.get("Ticker", "")).strip()
+                if not t:
+                    continue
+                try:
+                    b = float(r.get("Beta")) if pd.notna(r.get("Beta")) else float("nan")
+                except Exception:
+                    b = float("nan")
+                try:
+                    bs = float(r.get("BetaScore")) if pd.notna(r.get("BetaScore")) else float("nan")
+                except Exception:
+                    bs = float("nan")
+                s17 = str(r.get("S17Nm", "")).strip()
+                stock_map[t] = {"Beta": b, "BetaScore": bs, "S17Nm": s17}
+    except Exception as e:
+        print(f"[WARN] failed to load stock beta csv: {e}", file=sys.stderr)
+
+    # Sector beta
+    try:
+        if os.path.exists(BETA_SECTOR_CSV):
+            dfs = pd.read_csv(BETA_SECTOR_CSV)
+            # expected cols: S17Nm, SectorBeta, SectorBetaScore (others ignored)
+            for _, r in dfs.iterrows():
+                s17 = str(r.get("S17Nm", "")).strip()
+                if not s17:
+                    continue
+                try:
+                    sb = float(r.get("SectorBeta")) if pd.notna(r.get("SectorBeta")) else float("nan")
+                except Exception:
+                    sb = float("nan")
+                try:
+                    sbs = float(r.get("SectorBetaScore")) if pd.notna(r.get("SectorBetaScore")) else float("nan")
+                except Exception:
+                    sbs = float("nan")
+                sector_map[s17] = {"SectorBeta": sb, "SectorBetaScore": sbs}
+    except Exception as e:
+        print(f"[WARN] failed to load sector beta csv: {e}", file=sys.stderr)
+
+    return stock_map, sector_map
+
 def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
     ts = now_jst().strftime("%m/%d %H:%M")
     title = "【BB2σタッチ→MA25(+2%以内)】"
@@ -1007,17 +1065,29 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
     if "Expected_Up_pct" in df.columns:
         df = df.sort_values("Expected_Up_pct", ascending=False).reset_index(drop=True)
 
+    # --- Load beta metrics (weekly, saved in repo) ---
+    stock_beta_map, sector_beta_map = load_beta_maps()
+
     # --- Text summary message (minimal) ---
     lines = [f"{title} {ts}", f"件数: {len(df)}"]
     for i, r in enumerate(df.head(20).itertuples(index=False), start=1):
         t = getattr(r, "Ticker")
         name = ticker_name_map.get(t, "")
+        # beta info (from weekly CSV)
+        binfo = stock_beta_map.get(t, {})
+        s17 = (binfo.get("S17Nm") or "").strip()
+        sinfo = sector_beta_map.get(s17, {})
+        sector_beta = sinfo.get("SectorBeta", float("nan"))
+        beta = binfo.get("Beta", float("nan"))
+        beta_score = binfo.get("BetaScore", float("nan"))
+        beta_tail = f"  セクターβ:{fp(sector_beta,3)}  β:{fp(beta,3)}  βスコア:{fp(beta_score,2)}"
         lines.append(
             f"{i}. {t} {name}  "
             f"BB2σタッチ:{fp(getattr(r,'Touch_Close',None),0)}円  "
             f"MA25:{fp(getattr(r,'SMA25',None),0)}円  "
             f"最新:{fp(getattr(r,'Close',None),0)}円  "
             f"期待上昇率(BB2σ÷最新):{fp(getattr(r,'Expected_Ratio',None),3)} ({fp(getattr(r,'Expected_Up_pct',None),2)}%)"
+            f"{beta_tail}"
         )
     for msg in chunk_text("\n".join(lines)):
         discord_send_text(msg)
@@ -1027,12 +1097,21 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame) -> None:
     for _, rr in top.iterrows():
         t = rr["Ticker"]
         name = ticker_name_map.get(t, "")
+        # beta info (from weekly CSV)
+        binfo = stock_beta_map.get(t, {})
+        s17 = (binfo.get("S17Nm") or "").strip()
+        sinfo = sector_beta_map.get(s17, {})
+        sector_beta = sinfo.get("SectorBeta", float("nan"))
+        beta = binfo.get("Beta", float("nan"))
+        beta_score = binfo.get("BetaScore", float("nan"))
+        beta_tail = f" / セクターβ:{fp(sector_beta,3)} / β:{fp(beta,3)} / βスコア:{fp(beta_score,2)}"
 
         desc = (
             f"BB2σタッチ: {fp(rr.get('Touch_Close'),0)}円 / "
             f"MA25: {fp(rr.get('SMA25'),0)}円 / "
             f"最新: {fp(rr.get('Close'),0)}円 / "
             f"期待上昇率(BB2σ÷最新): {fp(rr.get('Expected_Ratio'),3)} ({fp(rr.get('Expected_Up_pct'),2)}%)"
+            f"{beta_tail}"
         )
 
         img = save_chart_image_with_bb1sigma(raw_df, t, out_dir=CHART_OUT_DIR)
