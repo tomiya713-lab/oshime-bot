@@ -25,16 +25,22 @@ DISCORD_ENABLED = bool(DISCORD_WEBHOOK_URL)
 
 FORCE_RUN = os.getenv("FORCE_RUN", "0") == "1"
 
-# ===== 押し目抽出パラメータ（前回コードの抽出条件） =====
-DROP_MAX = 15.0               # ピークから最新値までの許容下落率 ≤ 15%
-EXPECTED_RISE_MIN = 3.0       # Return_%（ピークまでの上昇余地）≥ 3%
-WITHIN_UPPER = 1.02           # 押し目安値の +2%（帯上限）
-EXP_OR = 5.0                  # OR条件：Return_% ≥ 5% で通過
-WEEKLY_MA2_FILTER = True      # 週足MA(2)が下向きなら除外
-WEEKLY_RESAMPLE = "W-FRI"     # 週足は金曜終値でリサンプル
-SCREEN_WINDOWS = (60, 30)     # 60日・30日で抽出し、同一銘柄はReturn_%が大きい方を採用
+# ===== 押し目抽出パラメータ（厳格版） =====
+DROP_MAX = 15.0                 # ピークから最新値までの許容下落率 ≤ 15%
+EXPECTED_RISE_MIN = 3.0         # Return_%（ピークまでの上昇余地）≥ 3%
+PULLBACK_BAND_PCT = 2.0         # 最新終値が押し目安値の +2%以内なら押し目帯
+WITHIN_UPPER = 1.0 + PULLBACK_BAND_PCT / 100.0
 
-PASS_REASON_BAND = "帯内合致"
+# 以前の「Return_% ≥ 5% なら通過」は、押し目から大きく反発済みの銘柄も拾うためデフォルトOFF。
+# どうしても戻り余地重視の候補も拾いたい場合だけ、環境変数 USE_RETURN_OR=1 を指定する。
+USE_RETURN_OR = os.getenv("USE_RETURN_OR", "0") == "1"
+EXP_OR = 5.0                    # USE_RETURN_OR=1 のときだけ使う
+
+WEEKLY_MA2_FILTER = True        # 週足MA(2)が下向きなら除外
+WEEKLY_RESAMPLE = "W-FRI"       # 週足は金曜終値でリサンプル
+SCREEN_WINDOWS = (60, 30)       # 60日・30日で抽出し、同一銘柄はReturn_%が大きい方を採用
+
+PASS_REASON_BAND = "押し目帯"
 PASS_REASON_EXP = "Return_≥5%"
 
 # チャート説明用（選定条件には使わない）
@@ -313,11 +319,16 @@ def _weekly_ma2_is_down(close_s: pd.Series) -> bool:
 
 def compute_one_ticker(close_s: pd.Series, high_s: pd.Series, low_s: pd.Series, window_days=60):
     """
-    前回コードのSTEP4最終ロジック。
+    厳格版の押し目抽出ロジック。
       ベース: Drop≤15%, Return_%≥3%
       除外   : latest == pull_low
-      採用   : (pull_low < latest ≤ pull_low*WITHIN_UPPER) or (Return_% ≥ EXP_OR)
+      採用   : pull_low < latest ≤ pull_low*(1 + PULLBACK_BAND_PCT%)
+      任意   : USE_RETURN_OR=1 の場合のみ Return_% ≥ EXP_OR でも通過
       週足   : 2週SMAが下向きなら除外
+
+    注意:
+      USE_RETURN_OR=0 がデフォルト。
+      これにより、押し目安値から大きく反発済みの“戻り売りっぽい銘柄”を除外する。
     """
     ticker = getattr(close_s, "name", "")
     try:
@@ -364,15 +375,17 @@ def compute_one_ticker(close_s: pd.Series, high_s: pd.Series, low_s: pd.Series, 
         if np.isclose(latest_val, pull_val, rtol=0.0, atol=1e-6):
             return None
 
-        # OR条件
+        # 押し目帯条件
         within_band = (latest_val > pull_val) and (latest_val <= pull_val * WITHIN_UPPER)
+
         pass_reason = None
         if within_band:
             pass_reason = PASS_REASON_BAND
-        elif expected_rise_pct >= EXP_OR:
+        elif USE_RETURN_OR and expected_rise_pct >= EXP_OR:
+            # デフォルトではOFF。戻り余地重視の候補も拾いたい場合だけ使う。
             pass_reason = PASS_REASON_EXP
 
-        # ベース条件 + OR成立
+        # ベース条件 + 押し目帯成立
         if not (
             drop_pct <= DROP_MAX
             and expected_rise_pct >= EXPECTED_RISE_MIN
@@ -397,7 +410,7 @@ def compute_one_ticker(close_s: pd.Series, high_s: pd.Series, low_s: pd.Series, 
             "Drop_From_Peak_%": round(drop_pct, 2),
             "Delta_from_Pull_%": round(delta_from_pull_pct, 2),
             "Within_(pull, +2%]": within_band,
-            "OR_Return_ge_5%": expected_rise_pct >= EXP_OR,
+            "OR_Return_ge_5%": USE_RETURN_OR and expected_rise_pct >= EXP_OR,
             "Pass_Reason": pass_reason,
             "Window": window_days,
         }
@@ -504,7 +517,8 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
         msg = (
             f"【押し目スクリーニング】{now_jst():%m/%d %H:%M}\n"
             f"条件: Drop≤{DROP_MAX:.0f}%・Return≥{EXPECTED_RISE_MIN:.0f}%・"
-            f"（押し目安値+2%以内 or Return≥{EXP_OR:.0f}%）・"
+            f"押し目安値+{PULLBACK_BAND_PCT:.0f}%以内"
+            f"{' or Return≥' + str(int(EXP_OR)) + '%' if USE_RETURN_OR else ''}・"
             f"週足MA(2)下向き除外\n"
             f"該当銘柄はありませんでした。"
         )
@@ -514,7 +528,8 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
     header = (
         f"【押し目スクリーニング】{now_jst():%m/%d %H:%M}\n"
         f"条件: Drop≤{DROP_MAX:.0f}%・Return≥{EXPECTED_RISE_MIN:.0f}%・"
-        f"（押し目安値+2%以内 or Return≥{EXP_OR:.0f}%）・"
+        f"押し目安値+{PULLBACK_BAND_PCT:.0f}%以内"
+        f"{' or Return≥' + str(int(EXP_OR)) + '%' if USE_RETURN_OR else ''}・"
         f"週足MA(2)下向き除外\n"
         f"抽出: {len(df)} 銘柄\n"
         f"------------------------------"
