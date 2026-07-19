@@ -1,4 +1,4 @@
-"""main3.py の押し目判定を厳格化し、診断CSVも保存する本番エントリーポイント。"""
+"""押し目候補を黄色/緑の2段階で判定し、診断・OHLCVを保存する本番エントリーポイント。"""
 
 import os
 import sys
@@ -12,23 +12,31 @@ import main3 as core
 SMA_SHORT_PERIOD = 25
 SMA_LONG_PERIOD = 75
 SMA_LONG_SLOPE_DAYS = 10
-PASS_REASON = "押し目反発"
+
+APPROACH_BAND_PCT = float(os.getenv("APPROACH_BAND_PCT", "2.0"))
+CONFIRMED_BAND_PCT = float(os.getenv("CONFIRMED_BAND_PCT", "5.0"))
+OHLCV_LOOKBACK_DAYS = int(os.getenv("OHLCV_LOOKBACK_DAYS", "90"))
+
+SIGNAL_YELLOW = "YELLOW"
+SIGNAL_GREEN = "GREEN"
+PASS_REASON_YELLOW = "🟡押し目接近"
+PASS_REASON_GREEN = "🟢反発確認"
 
 REPORT_DIR = os.getenv("PULLBACK_REPORT_DIR", "reports")
 DIAGNOSTICS_CSV = os.path.join(REPORT_DIR, "pullback_diagnostics_latest.csv")
 CANDIDATES_CSV = os.path.join(REPORT_DIR, "pullback_candidates_latest.csv")
 REJECTION_SUMMARY_CSV = os.path.join(REPORT_DIR, "pullback_rejection_summary_latest.csv")
 NEAR_MISS_CSV = os.path.join(REPORT_DIR, "pullback_near_miss_latest.csv")
+OHLCV_CSV = os.path.join(REPORT_DIR, "pullback_ohlcv_latest.csv")
 
 CONDITION_COLUMNS = [
-    "Pull_Before_Latest",
-    "Rebound_Confirmed",
     "SMA25_Above_SMA75",
     "SMA75_Up",
     "Drop_OK",
     "Return_OK",
-    "Band_OK",
-    "Weekly_MA2_OK",
+    "Green_Band_OK",
+    "Pull_Before_Latest",
+    "Rebound_Confirmed",
 ]
 
 
@@ -38,12 +46,18 @@ def _empty_row(ticker: str, window_days: int) -> Dict:
         "Name": core.TICKER_NAME_MAP.get(ticker, ""),
         "Window": window_days,
         "Passed": False,
+        "Signal_Level": "",
+        "Signal_Rank": 0,
+        "Pass_Reason": "",
         "Reject_Reason": "",
         "Failed_Conditions": "",
         "Conditions_Passed": 0,
+        "Weekly_MA2_Warning": False,
     }
     for col in CONDITION_COLUMNS:
         row[col] = False
+    row["Yellow_Band_OK"] = False
+    row["Weekly_MA2_OK"] = True
     return row
 
 
@@ -53,7 +67,7 @@ def evaluate_one_ticker(
     low_s: pd.Series,
     window_days: int = 60,
 ) -> Dict:
-    """1銘柄・1期間を評価し、通過・不通過を問わず診断行を返す。"""
+    """1銘柄・1期間を評価し、黄色・緑・除外のいずれでも診断行を返す。"""
     ticker = str(getattr(close_s, "name", "") or "")
     row = _empty_row(ticker, window_days)
 
@@ -130,18 +144,48 @@ def evaluate_one_ticker(
         )
         drop_ok = bool(drop_pct <= core.DROP_MAX)
         return_ok = bool(expected_rise_pct >= core.EXPECTED_RISE_MIN)
-        within_band = bool(
-            latest_val > pull_val
-            and latest_val <= pull_val * core.WITHIN_UPPER
+
+        yellow_upper = 1.0 + APPROACH_BAND_PCT / 100.0
+        green_upper = 1.0 + CONFIRMED_BAND_PCT / 100.0
+        yellow_band_ok = bool(
+            latest_val > pull_val and latest_val <= pull_val * yellow_upper
         )
-        return_or_ok = bool(
-            core.USE_RETURN_OR and expected_rise_pct >= core.EXP_OR
+        green_band_ok = bool(
+            latest_val > pull_val and latest_val <= pull_val * green_upper
         )
-        band_ok = bool(within_band or return_or_ok)
-        weekly_ma2_ok = bool(
-            not core.WEEKLY_MA2_FILTER
-            or not core._weekly_ma2_is_down(close_all)
+
+        weekly_ma2_ok = bool(not core._weekly_ma2_is_down(close_all))
+        weekly_warning = not weekly_ma2_ok
+
+        trend_ok = sma25_above_sma75 and sma75_up
+        base_ok = drop_ok and return_ok
+
+        green_signal = bool(
+            trend_ok
+            and base_ok
+            and green_band_ok
+            and pull_before_latest
+            and rebound_confirmed
         )
+        yellow_signal = bool(
+            not green_signal
+            and trend_ok
+            and base_ok
+            and yellow_band_ok
+        )
+
+        if green_signal:
+            signal_level = SIGNAL_GREEN
+            signal_rank = 2
+            pass_reason = PASS_REASON_GREEN
+        elif yellow_signal:
+            signal_level = SIGNAL_YELLOW
+            signal_rank = 1
+            pass_reason = PASS_REASON_YELLOW
+        else:
+            signal_level = ""
+            signal_rank = 0
+            pass_reason = ""
 
         row.update(
             {
@@ -164,33 +208,47 @@ def evaluate_one_ticker(
                 "SMA75_Up": sma75_up,
                 "Drop_OK": drop_ok,
                 "Return_OK": return_ok,
-                "Band_OK": band_ok,
+                "Yellow_Band_OK": yellow_band_ok,
+                "Green_Band_OK": green_band_ok,
                 "Weekly_MA2_OK": weekly_ma2_ok,
-                "Within_(pull, +2%]": within_band,
-                "OR_Return_ge_5%": return_or_ok,
+                "Weekly_MA2_Warning": weekly_warning,
+                f"Within_(pull, +{APPROACH_BAND_PCT:g}%]": yellow_band_ok,
+                f"Within_(pull, +{CONFIRMED_BAND_PCT:g}%]": green_band_ok,
+                "Signal_Level": signal_level,
+                "Signal_Rank": signal_rank,
+                "Passed": bool(signal_level),
+                "Pass_Reason": pass_reason,
             }
         )
 
         failed_labels: List[str] = []
-        checks = [
-            ("Pull_Before_Latest", "押し目日が最新日"),
-            ("Rebound_Confirmed", "前日終値超えなし"),
-            ("SMA25_Above_SMA75", "SMA25<=SMA75"),
-            ("SMA75_Up", "SMA75下向き"),
-            ("Drop_OK", f"Drop>{core.DROP_MAX:.0f}%"),
-            ("Return_OK", f"Return<{core.EXPECTED_RISE_MIN:.0f}%"),
-            ("Band_OK", f"押し目安値+{core.PULLBACK_BAND_PCT:.0f}%外"),
-            ("Weekly_MA2_OK", "週足MA2下向き"),
-        ]
-        for col, label in checks:
-            if not bool(row[col]):
-                failed_labels.append(label)
+        if not sma25_above_sma75:
+            failed_labels.append("SMA25<=SMA75")
+        if not sma75_up:
+            failed_labels.append("SMA75下向き")
+        if not drop_ok:
+            failed_labels.append(f"Drop>{core.DROP_MAX:.0f}%")
+        if not return_ok:
+            failed_labels.append(f"Return<{core.EXPECTED_RISE_MIN:.0f}%")
+        if not green_band_ok:
+            failed_labels.append(f"押し目安値+{CONFIRMED_BAND_PCT:g}%外")
+        elif not yellow_band_ok and not (pull_before_latest and rebound_confirmed):
+            failed_labels.append(
+                f"反発未確認かつ押し目安値+{APPROACH_BAND_PCT:g}%外"
+            )
+        if green_band_ok and not pull_before_latest:
+            failed_labels.append("押し目日が最新日")
+        if green_band_ok and not rebound_confirmed:
+            failed_labels.append("前日終値超えなし")
 
         row["Conditions_Passed"] = sum(bool(row[c]) for c in CONDITION_COLUMNS)
         row["Failed_Conditions"] = " | ".join(failed_labels)
         row["Reject_Reason"] = failed_labels[0] if failed_labels else ""
-        row["Passed"] = not failed_labels
-        row["Pass_Reason"] = PASS_REASON if row["Passed"] else ""
+
+        if row["Passed"]:
+            row["Reject_Reason"] = ""
+            row["Failed_Conditions"] = ""
+
         return row
 
     except Exception as exc:
@@ -209,7 +267,7 @@ def compute_one_ticker(
     low_s: pd.Series,
     window_days: int = 60,
 ) -> Optional[Dict]:
-    """既存スクリーナー互換。通過した場合だけ辞書を返す。"""
+    """既存スクリーナー互換。黄色または緑の場合だけ辞書を返す。"""
     row = evaluate_one_ticker(close_s, high_s, low_s, window_days)
     return row if row.get("Passed") else None
 
@@ -248,20 +306,108 @@ def select_candidates(diagnostics: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     passed["Return_%"] = pd.to_numeric(passed["Return_%"], errors="coerce")
-    return (
-        passed.sort_values(["Ticker", "Return_%"], ascending=[True, False])
-        .groupby("Ticker", as_index=False)
-        .first()
-        .sort_values("Return_%", ascending=False)
-        .reset_index(drop=True)
+    passed["Signal_Rank"] = pd.to_numeric(
+        passed["Signal_Rank"], errors="coerce"
+    ).fillna(0)
+    passed["Pullback_Date_Sort"] = pd.to_datetime(
+        passed["Pullback_Date"], errors="coerce"
     )
 
+    best = (
+        passed.sort_values(
+            ["Ticker", "Signal_Rank", "Pullback_Date_Sort", "Return_%"],
+            ascending=[True, False, False, False],
+        )
+        .groupby("Ticker", as_index=False)
+        .first()
+        .sort_values(
+            ["Signal_Rank", "Return_%"],
+            ascending=[False, False],
+        )
+        .reset_index(drop=True)
+    )
+    return best.drop(columns=["Pullback_Date_Sort"], errors="ignore")
 
-def save_reports(diagnostics: pd.DataFrame, candidates: pd.DataFrame) -> None:
+
+def build_ohlcv_history(
+    raw_df: pd.DataFrame,
+    tickers,
+    lookback_days: int = OHLCV_LOOKBACK_DAYS,
+) -> pd.DataFrame:
+    """全銘柄の最新OHLCVを縦持ちCSV用に整形する。"""
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame()
+
+    fields = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+    frames = []
+
+    for ticker in tickers:
+        try:
+            if isinstance(raw_df.columns, pd.MultiIndex):
+                available = [
+                    field for field in fields if (field, ticker) in raw_df.columns
+                ]
+                if not available:
+                    continue
+                frame = raw_df.loc[:, [(field, ticker) for field in available]].copy()
+                frame.columns = available
+            else:
+                available = [field for field in fields if field in raw_df.columns]
+                if not available:
+                    continue
+                frame = raw_df[available].copy()
+
+            required_ohlc = [
+                field for field in ["Open", "High", "Low", "Close"]
+                if field in frame.columns
+            ]
+            frame = frame.dropna(subset=required_ohlc)
+            if frame.empty:
+                continue
+
+            frame = frame.tail(lookback_days).reset_index()
+            date_col = frame.columns[0]
+            frame = frame.rename(
+                columns={
+                    date_col: "Date",
+                    "Adj Close": "Adj_Close",
+                }
+            )
+            frame.insert(1, "Ticker", ticker)
+            frame.insert(2, "Name", core.TICKER_NAME_MAP.get(ticker, ""))
+            frames.append(frame)
+        except Exception as exc:
+            print(f"[WARN] OHLCV build failed for {ticker}: {exc}", file=sys.stderr)
+
+    if not frames:
+        return pd.DataFrame()
+
+    out = pd.concat(frames, ignore_index=True)
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.date
+    preferred = [
+        "Date",
+        "Ticker",
+        "Name",
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Adj_Close",
+        "Volume",
+    ]
+    return out[[col for col in preferred if col in out.columns]]
+
+
+def save_reports(
+    diagnostics: pd.DataFrame,
+    candidates: pd.DataFrame,
+    ohlcv: pd.DataFrame,
+) -> None:
     os.makedirs(REPORT_DIR, exist_ok=True)
 
     diagnostics.to_csv(DIAGNOSTICS_CSV, index=False, encoding="utf-8-sig")
     candidates.to_csv(CANDIDATES_CSV, index=False, encoding="utf-8-sig")
+    ohlcv.to_csv(OHLCV_CSV, index=False, encoding="utf-8-sig")
 
     if diagnostics.empty:
         summary = pd.DataFrame(columns=["Reject_Reason", "Count"])
@@ -296,63 +442,77 @@ def save_reports(diagnostics: pd.DataFrame, candidates: pd.DataFrame) -> None:
     print(f"[INFO] candidates saved: {CANDIDATES_CSV}")
     print(f"[INFO] rejection summary saved: {REJECTION_SUMMARY_CSV}")
     print(f"[INFO] near misses saved: {NEAR_MISS_CSV}")
+    print(f"[INFO] OHLCV saved: {OHLCV_CSV} ({len(ohlcv)} rows)")
+
+
+def _fp(value, digits=1) -> str:
+    try:
+        if pd.isna(value):
+            return "-"
+        return f"{float(value):.{digits}f}"
+    except Exception:
+        return "-"
+
+
+def _fdate(value) -> str:
+    try:
+        if hasattr(value, "strftime"):
+            return value.strftime("%m/%d")
+        return pd.to_datetime(value).strftime("%m/%d")
+    except Exception:
+        return "-"
+
+
+def _signal_lines(df: pd.DataFrame, level: str, title: str) -> List[str]:
+    subset = df[df["Signal_Level"] == level].copy()
+    if subset.empty:
+        return [f"{title}: 0銘柄"]
+
+    lines = [f"{title}: {len(subset)}銘柄"]
+    for _, row in subset.iterrows():
+        ticker = row["Ticker"]
+        name = core.TICKER_NAME_MAP.get(ticker, "")
+        weekly_note = " ⚠週足MA2↓" if bool(row.get("Weekly_MA2_Warning")) else ""
+        lines.append(
+            f"{ticker:<8} {name:<8} "
+            f"Return:{_fp(row.get('Return_%'), 1):>5}% "
+            f"Drop:{_fp(row.get('Drop_From_Peak_%'), 1):>5}% "
+            f"ΔPull:{_fp(row.get('Delta_from_Pull_%'), 1):>5}% "
+            f"Win:{int(row.get('Window') or 0):>2}d "
+            f"Pull:{_fdate(row.get('Pullback_Date'))}"
+            f"{weekly_note}"
+        )
+    return lines
 
 
 def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
-    """追加フィルターとSMA値が分かる形でDiscord通知する。"""
+    """黄色（接近）と緑（反発確認）を分けてDiscord通知する。"""
     condition_text = (
-        f"Drop≤{core.DROP_MAX:.0f}%・Return≥{core.EXPECTED_RISE_MIN:.0f}%・"
-        f"押し目安値+{core.PULLBACK_BAND_PCT:.0f}%以内"
-        f"{' or Return≥' + str(int(core.EXP_OR)) + '%' if core.USE_RETURN_OR else ''}・"
-        "押し目日は前営業日以前・前日終値超え・"
-        "SMA25>SMA75・SMA75上向き・週足MA(2)下向き除外"
+        f"共通: Drop≤{core.DROP_MAX:.0f}%・Return≥{core.EXPECTED_RISE_MIN:.0f}%・"
+        "SMA25>SMA75・SMA75上向き\n"
+        f"🟡 接近: 押し目安値+{APPROACH_BAND_PCT:g}%以内（反発未確認も対象）\n"
+        f"🟢 確認: 押し目安値+{CONFIRMED_BAND_PCT:g}%以内・"
+        "押し目日は前営業日以前・前日終値超え\n"
+        "※週足MA2下向きは除外せず⚠表示"
     )
 
     if df is None or df.empty:
         core.send_long_text(
             f"【押し目スクリーニング】{core.now_jst():%m/%d %H:%M}\n"
-            f"条件: {condition_text}\n"
-            "該当銘柄はありませんでした。\n"
+            f"{condition_text}\n"
+            "黄色・緑ともに該当銘柄はありませんでした。\n"
             "診断CSV: pullback_diagnostics_latest.csv"
         )
         return
 
     lines = [
-        f"【押し目スクリーニング】{core.now_jst():%m/%d %H:%M}\n"
-        f"条件: {condition_text}\n"
-        f"抽出: {len(df)} 銘柄\n"
-        "------------------------------"
+        f"【押し目スクリーニング】{core.now_jst():%m/%d %H:%M}",
+        condition_text,
+        "------------------------------",
     ]
-
-    def fp(value, digits=1):
-        try:
-            if pd.isna(value):
-                return "-"
-            return f"{float(value):.{digits}f}"
-        except Exception:
-            return "-"
-
-    def fdate(value):
-        try:
-            if hasattr(value, "strftime"):
-                return value.strftime("%m/%d")
-            return pd.to_datetime(value).strftime("%m/%d")
-        except Exception:
-            return "-"
-
-    for _, row in df.iterrows():
-        ticker = row["Ticker"]
-        name = core.TICKER_NAME_MAP.get(ticker, "")
-        reason = str(row.get("Pass_Reason", "")) or "-"
-        lines.append(
-            f"{ticker:<8} {name:<8} [{reason}]  "
-            f"Return: {fp(row.get('Return_%'), 1):>5}%  "
-            f"Drop: {fp(row.get('Drop_From_Peak_%'), 1):>5}%  "
-            f"ΔPull: {fp(row.get('Delta_from_Pull_%'), 1):>5}%  "
-            f"Win: {int(row.get('Window') or 0):>2}d  "
-            f"Pull: {fdate(row.get('Pullback_Date'))}"
-        )
-
+    lines.extend(_signal_lines(df, SIGNAL_GREEN, "🟢 反発確認"))
+    lines.append("------------------------------")
+    lines.extend(_signal_lines(df, SIGNAL_YELLOW, "🟡 押し目接近"))
     core.send_long_text("\n".join(lines))
 
     if not core.MPF_AVAILABLE:
@@ -362,31 +522,37 @@ def notify(df: pd.DataFrame, raw_df: pd.DataFrame):
         )
         return
 
-    for _, row in df.head(core.CHART_TOP_N).iterrows():
+    ordered = df.sort_values(
+        ["Signal_Rank", "Return_%"],
+        ascending=[False, False],
+    ).head(core.CHART_TOP_N)
+
+    for _, row in ordered.iterrows():
         ticker = row["Ticker"]
         name = core.TICKER_NAME_MAP.get(ticker, "")
         reason = str(row.get("Pass_Reason", "")) or "-"
 
         rsi = core.latest_rsi_from_raw(raw_df, ticker, period=core.RSI_PERIOD)
         rsi_text = "-" if rsi is None or not np.isfinite(rsi) else f"{rsi:.0f}"
+        weekly_note = " / ⚠週足MA2↓" if bool(row.get("Weekly_MA2_Warning")) else ""
         description = (
-            f"Return: {fp(row.get('Return_%'), 1)}%  "
-            f"Drop: {fp(row.get('Drop_From_Peak_%'), 1)}%  "
-            f"ΔPull: {fp(row.get('Delta_from_Pull_%'), 1)}%  "
+            f"Return: {_fp(row.get('Return_%'), 1)}%  "
+            f"Drop: {_fp(row.get('Drop_From_Peak_%'), 1)}%  "
+            f"ΔPull: {_fp(row.get('Delta_from_Pull_%'), 1)}%  "
             f"Win: {int(row.get('Window') or 0)}d  "
-            f"RSI14: {rsi_text}\n"
-            f"Latest: {fp(row.get('Latest_Close'), 0)}  "
-            f"PullLow: {fp(row.get('Pullback_Low'), 0)}  "
-            f"Peak: {fp(row.get('Peak_High'), 0)}\n"
-            f"SMA25: {fp(row.get('SMA25'), 0)}  "
-            f"SMA75: {fp(row.get('SMA75'), 0)}"
+            f"RSI14: {rsi_text}{weekly_note}\n"
+            f"Latest: {_fp(row.get('Latest_Close'), 0)}  "
+            f"PullLow: {_fp(row.get('Pullback_Low'), 0)}  "
+            f"Peak: {_fp(row.get('Peak_High'), 0)}\n"
+            f"SMA25: {_fp(row.get('SMA25'), 0)}  "
+            f"SMA75: {_fp(row.get('SMA75'), 0)}"
         )
 
         image_path = core.save_chart_image_from_raw(raw_df, ticker)
         if image_path:
             core.discord_send_image_file(
                 image_path,
-                title=f"{ticker} {name} [{reason}]".strip(),
+                title=f"{reason} {ticker} {name}".strip(),
                 description=description,
             )
 
@@ -408,7 +574,8 @@ def main():
 
     diagnostics = build_diagnostics(raw, tickers)
     candidates = select_candidates(diagnostics)
-    save_reports(diagnostics, candidates)
+    ohlcv = build_ohlcv_history(raw, tickers)
+    save_reports(diagnostics, candidates, ohlcv)
     notify(candidates, raw)
 
 
