@@ -1,1 +1,0 @@
-SMA25 image-only notification test succeeded
