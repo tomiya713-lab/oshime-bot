@@ -63,7 +63,7 @@ jobs:
           # OPENAI_MAX_OUTPUT_TOKENS: "450"
         run: |
           python main3_japanese.py
-          python BBreturn.py
+          python BBreturn_discord.py
          # python main_rsi.py
 
       - name: Upload metrics CSV
