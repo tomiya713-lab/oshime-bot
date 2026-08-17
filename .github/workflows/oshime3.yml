@@ -8,11 +8,6 @@ on:
         type: boolean
         default: false
 
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/oshime3.yml'
-
   schedule:
     # JST 9:02–15:32 を 30分おき（混雑回避の4分/34分）
     - cron: '4,34 0-6 * * 1-5'
@@ -67,12 +62,8 @@ jobs:
           # OPENAI_MODEL: "gpt-4.1-mini"
           # OPENAI_MAX_OUTPUT_TOKENS: "450"
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            python BBreturn_discord.py
-          else
-            python main3_japanese.py
-            python BBreturn_discord.py
-          fi
+          python main3_japanese.py
+          python BBreturn_discord.py
          # python main_rsi.py
 
       - name: Upload metrics CSV
